@@ -1,187 +1,183 @@
+```perl
 #!/usr/bin/perl
+#
+# ospf_flap_monitor.pl - OSPF Neighbor Flap Detection and State Monitor
+#
+# Purpose:
+#   Polls one or more routers repeatedly and alerts when OSPF neighbor
+#   adjacencies change state (flap detection). Useful for troubleshooting
+#   unstable links or during maintenance windows to catch unintended drops.
+#
+# Usage:
+#   ospf_flap_monitor.pl -h <host> [-u <user>] [-p <pass>] [-i <interval>]
+#                        [-c <count>] [-l <logfile>]
+#   ospf_flap_monitor.pl -f <device_file> [-u <user>] [-p <pass>]
+#
+#   -h  Target router IP or hostname
+#   -f  File with one IP/hostname per line
+#   -u  SSH username (default: $USER env var)
+#   -p  SSH password (prompted if omitted)
+#   -i  Poll interval in seconds (default: 30)
+#   -c  Poll count before exit; 0 = run forever (default: 0)
+#   -l  Optional log file path
+#
+# Prerequisites:
+#   cpan install Net::SSH::Expect Getopt::Long Term::ReadKey
+#
+# Supported platforms:
+#   Cisco IOS/IOS-XE (parses 'show ip ospf neighbor')
+#
+# Exit codes: 0 = clean exit, 1 = usage error, 2 = all hosts failed
+
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case);
 use POSIX qw(strftime);
 
-# =============================================================================
-# ospf_neighbor_detail.pl - OSPF Neighbor Detail & Mismatch Diagnostics
-#
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE routers and runs 'show ip ospf neighbor detail'
-#   to surface timer mismatches, MTU issues, dead-interval drift, and area
-#   misconfigurations.  Complements basic neighbor-state checks by examining
-#   the per-neighbor parameters that cause adjacency failures.
-#
-# Usage:
-#   Single device:    ./ospf_neighbor_detail.pl -h 192.168.1.1
-#   Device list:      ./ospf_neighbor_detail.pl -f routers.txt
-#   With log:         ./ospf_neighbor_detail.pl -f routers.txt -l detail.log
-#   Custom creds:     ./ospf_neighbor_detail.pl -h 10.0.0.1 -u admin -p s3cr3t
-#   Filter by area:   ./ospf_neighbor_detail.pl -h 10.0.0.1 -a 0
-#
-# Device file format (one IP/hostname per line, # = comment):
-#   192.168.1.1
-#   core-rtr.example.com
-#   # 10.0.0.5  disabled
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH read access to target routers (privilege 1 sufficient)
-#   Cisco IOS 12.4+ / IOS-XE 3.x+ / NX-OS 5.x+
-#
-# Exit codes:
-#   0 - No mismatches or warnings found
-#   1 - One or more parameter mismatches detected
-#   2 - Script error (bad args, all connections failed)
-# =============================================================================
-
-my ($host, $device_file, $log_file, $username, $password, $filter_area, $timeout, $help);
-$username    = $ENV{NET_USER} // 'admin';
-$password    = $ENV{NET_PASS} // '';
-$timeout     = 20;
-$filter_area = undef;
+my ($host, $device_file, $username, $password, $logfile);
+my $interval = 30;
+my $count    = 0;
 
 GetOptions(
-    'h|host=s'    => \$host,
-    'f|file=s'    => \$device_file,
-    'l|log=s'     => \$log_file,
-    'u|user=s'    => \$username,
-    'p|pass=s'    => \$password,
-    'a|area=s'    => \$filter_area,
-    't|timeout=i' => \$timeout,
-    'help'        => \$help,
-) or die "Error parsing options. Use --help for usage.\n";
+    'h=s' => \$host,
+    'f=s' => \$device_file,
+    'u=s' => \$username,
+    'p=s' => \$password,
+    'i=i' => \$interval,
+    'c=i' => \$count,
+    'l=s' => \$logfile,
+) or usage();
 
-if ($help) {
-    open(my $fh, '<', $0) or die "Cannot read self: $!\n";
-    while (<$fh>) { last unless /^#/; s/^# ?//; print }
-    close $fh;
-    exit 0;
-}
+usage() unless $host || $device_file;
 
-die "Error: specify -h <host> or -f <device_file>\n" unless $host || $device_file;
+$username //= $ENV{USER} // 'admin';
 
 unless ($password) {
-    print "Password for $username: ";
-    system('stty -echo');
-    chomp($password = <STDIN>);
-    system('stty echo');
-    print "\n";
+    eval { require Term::ReadKey; Term::ReadKey->import('ReadMode') };
+    print "SSH password: ";
+    if ($@) {
+        chomp($password = <STDIN>);
+    } else {
+        ReadMode('noecho');
+        chomp($password = <STDIN>);
+        ReadMode('restore');
+        print "\n";
+    }
 }
 
-my @devices;
-push @devices, $host if $host;
-if ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; next if /^\s*[#]/ || /^\s*$/; push @devices, $_ }
-    close $fh;
-}
+my @devices = $host ? ($host) : do {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    map { chomp; $_ } grep { /\S/ && !/^#/ } <$fh>;
+};
+
+die "No devices to monitor.\n" unless @devices;
 
 my $log_fh;
-if ($log_file) {
-    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
+if ($logfile) {
+    open $log_fh, '>>', $logfile or die "Cannot open log $logfile: $!\n";
+    $log_fh->autoflush(1);
 }
 
+sub ts { strftime('%Y-%m-%d %H:%M:%S', localtime) }
+
 sub emit {
-    my ($msg) = @_;
+    my $msg = sprintf("[%s] %s\n", ts(), $_[0]);
     print $msg;
     print $log_fh $msg if $log_fh;
 }
 
-my $ts       = strftime('%Y-%m-%d %H:%M:%S', localtime);
-my $warnings = 0;
-my $failed   = 0;
-
-emit("=" x 72 . "\n");
-emit("OSPF Neighbor Detail Diagnostics  |  $ts\n");
-emit(defined $filter_area ? "Filtering to area: $filter_area\n" : "");
-emit("=" x 72 . "\n");
-
-for my $device (@devices) {
-    emit("\n[ $device ]\n");
-
+sub get_neighbors {
+    my ($dev) = @_;
     my $ssh = Net::SSH::Expect->new(
-        host     => $device,
-        user     => $username,
-        password => $password,
-        raw_pty  => 1,
-        timeout  => $timeout,
+        host       => $dev,
+        user       => $username,
+        password   => $password,
+        raw_pty    => 1,
+        timeout    => 15,
     );
-
-    my $login;
-    eval { $login = $ssh->login() };
-    if ($@ || !defined $login) {
-        emit("  ERROR: SSH login failed" . ($@ ? " - $@" : "") . "\n");
-        $failed++;
-        next;
+    eval { $ssh->login() };
+    if ($@ || !defined $ssh) {
+        emit("ERROR $dev: SSH login failed - $@");
+        return undef;
     }
-
-    $ssh->send('terminal length 0');
-    $ssh->waitfor('\$|#|>', 5);
-
-    $ssh->send('show ip ospf neighbor detail');
-    my $raw = $ssh->waitfor('\$|#|>', $timeout);
-
-    unless (defined $raw && length($raw) > 20) {
-        emit("  ERROR: No output received (timeout or unsupported platform)\n");
-        $failed++;
-        $ssh->close();
-        next;
-    }
-
-    # Parse neighbor blocks separated by blank lines
-    my @blocks = split /\n(?=Neighbor\s+\d+\.\d+\.\d+\.\d+)/, $raw;
-    my $nbr_count = 0;
-
-    for my $block (@blocks) {
-        next unless $block =~ /Neighbor\s+(\d+\.\d+\.\d+\.\d+)/;
-        my $nbr_id = $1;
-
-        my ($area)      = $block =~ /in the area\s+([\d.]+)/i;
-        my ($state)     = $block =~ /Neighbor is\s+(\S+)/i;
-        my ($iface)     = $block =~ /interface address.*?(?:on|,)\s*(\S+)/i
-                       || $block =~ /Address\s+[\d.]+.*?Interface\s+(\S+)/i;
-        my ($dead_time) = $block =~ /Dead timer due in\s+(\S+)/i;
-        my ($hello)     = $block =~ /Hello due in\s+(\S+)/i;
-        my ($priority)  = $block =~ /Neighbor priority is\s+(\d+)/i;
-        my ($retrans)   = $block =~ /Number of DBD retrans during last exchange\s+(\d+)/i;
-        my ($options)   = $block =~ /Options is\s+(0x[0-9A-Fa-f]+)/i;
-
-        next if defined $filter_area && defined $area && $area ne $filter_area;
-
-        $nbr_count++;
-        emit(sprintf("  Neighbor %-16s  Area: %-10s  State: %s\n",
-                     $nbr_id, $area // 'unknown', $state // 'unknown'));
-        emit(sprintf("    Interface: %-18s  Priority: %s\n",
-                     $iface // 'unknown', $priority // 'n/a'));
-        emit(sprintf("    Dead timer: %-16s  Hello: %s\n",
-                     $dead_time // 'n/a', $hello // 'n/a'));
-
-        # Flag retransmit storms - sign of MTU mismatch or congestion
-        if (defined $retrans && $retrans > 5) {
-            emit("    WARN: High DBD retransmissions ($retrans) - possible MTU mismatch\n");
-            $warnings++;
-        }
-
-        # Flag non-converged adjacencies
-        if (defined $state && $state !~ /^FULL|2WAY/) {
-            emit("    WARN: Adjacency not converged (state: $state)\n");
-            $warnings++;
-        }
-    }
-
-    emit("  No OSPF neighbors found" . (defined $filter_area ? " in area $filter_area" : "") . "\n")
-        if $nbr_count == 0;
-
+    $ssh->exec('terminal length 0');
+    my $out = $ssh->exec('show ip ospf neighbor');
     $ssh->close();
+
+    my %neighbors;
+    for my $line (split /\n/, $out) {
+        # Match: NeighborID  Pri  State  DeadTime  Address  Interface
+        if ($line =~ /^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\S+)\s+\S+\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)/) {
+            my ($nbr_id, $state, $nbr_addr, $iface) = ($1, $2, $3, $4);
+            $neighbors{$nbr_id} = { state => $state, addr => $nbr_addr, iface => $iface };
+        }
+    }
+    return \%neighbors;
 }
 
-emit("\n" . "=" x 72 . "\n");
-emit(sprintf("Devices: %d  |  Failures: %d  |  Warnings: %d\n",
-             scalar(@devices), $failed, $warnings));
-emit("=" x 72 . "\n");
+my %prev_state;   # $prev_state{dev}{neighbor_id} = state string
+my %flap_count;   # $prev_state{dev}{neighbor_id} = count
 
-close $log_fh if $log_fh;
-exit( ($failed == scalar(@devices)) ? 2 : ($warnings ? 1 : 0) );
+emit("Starting OSPF flap monitor: " . scalar(@devices) . " device(s), poll every ${interval}s" .
+     ($count ? ", $count iterations" : ", continuous"));
+
+my $iteration  = 0;
+my $all_failed = 1;
+
+while (1) {
+    $iteration++;
+    for my $dev (@devices) {
+        my $neighbors = get_neighbors($dev);
+        unless (defined $neighbors) {
+            next;
+        }
+        $all_failed = 0;
+
+        if (!exists $prev_state{$dev}) {
+            # First poll - baseline
+            my $n = scalar keys %$neighbors;
+            emit("BASELINE $dev: $n OSPF neighbor(s) found");
+            for my $id (sort keys %$neighbors) {
+                my $r = $neighbors->{$id};
+                emit("  $id  state=$r->{state}  addr=$r->{addr}  iface=$r->{iface}");
+            }
+            $prev_state{$dev} = { map { $_ => $neighbors->{$_}{state} } keys %$neighbors };
+            next;
+        }
+
+        my $prev = $prev_state{$dev};
+
+        # Detect new neighbors
+        for my $id (sort keys %$neighbors) {
+            unless (exists $prev->{$id}) {
+                emit("NEW $dev: neighbor $id APPEARED  state=$neighbors->{$id}{state}  iface=$neighbors->{$id}{iface}");
+            }
+        }
+
+        # Detect gone or state-changed neighbors
+        for my $id (sort keys %$prev) {
+            if (!exists $neighbors->{$id}) {
+                $flap_count{$dev}{$id}++;
+                emit("ALERT $dev: neighbor $id LOST (was $prev->{$id})  flaps=$flap_count{$dev}{$id}");
+            } elsif ($neighbors->{$id}{state} ne $prev->{$id}) {
+                $flap_count{$dev}{$id}++;
+                emit("CHANGE $dev: neighbor $id  $prev->{$id} -> $neighbors->{$id}{state}  flaps=$flap_count{$dev}{$id}");
+            }
+        }
+
+        $prev_state{$dev} = { map { $_ => $neighbors->{$_}{state} } keys %$neighbors };
+    }
+
+    last if $count && $iteration >= $count;
+    sleep $interval;
+}
+
+emit("Monitor stopped after $iteration iteration(s).");
+exit($all_failed ? 2 : 0);
+
+sub usage {
+    print "Usage: $0 -h <host>|-f <file> [-u user] [-p pass] [-i secs] [-c count] [-l logfile]\n";
+    exit 1;
+}
+```
