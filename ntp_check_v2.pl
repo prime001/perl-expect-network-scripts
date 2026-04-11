@@ -1,199 +1,170 @@
-```perl
 #!/usr/bin/perl
-# =============================================================================
-# ntp_check_v2.pl - Enhanced NTP Stratum & Drift Analysis Tool
-# =============================================================================
+#
+# ntp_check_v2.pl - Advanced NTP Compliance and Drift Analyzer
+#
 # Purpose:
-#   Connects to one or more Cisco IOS/IOS-XE devices via SSH and performs
-#   detailed NTP health analysis: stratum validation, clock drift, offset
-#   thresholds, and peer comparison across a fleet. Flags devices with
-#   excessive drift, high stratum, or no sync.
+#   Connects to Cisco IOS/IOS-XE devices via SSH and performs a comprehensive
+#   NTP health check: verifies clock synchronization, evaluates stratum level,
+#   measures offset/drift against configurable thresholds, and checks peer count.
+#   Outputs a pass/warn/fail compliance summary per device.
 #
 # Usage:
-#   Single device:  ./ntp_check_v2.pl -h 192.168.1.1 [-u admin] [-p pass]
-#   Device file:    ./ntp_check_v2.pl -f devices.txt [-u admin] [-p pass]
-#   With log:       ./ntp_check_v2.pl -f devices.txt -l ntp_report.log
+#   Single device:  perl ntp_check_v2.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:    perl ntp_check_v2.pl -f devices.txt -u admin -p secret
+#   With log file:  perl ntp_check_v2.pl -f devices.txt -u admin -p secret -l ntp_report.log
 #
-# Device file format (one per line, optionally tab-separated host:user:pass):
+# Device file format (one IP/hostname per line, # for comments):
 #   192.168.1.1
-#   192.168.1.2  netadmin  s3cr3t
+#   192.168.1.2  # core-sw-01
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH key auth recommended; passwords via CLI prompt if not in device file
+#   cpan install Net::SSH::Expect
+#   SSH key-based auth or password auth must be available
+#   User account needs privilege level 1 (show commands only)
 #
-# Exit codes: 0=all OK, 1=warnings, 2=critical failures
-# =============================================================================
+# Thresholds (adjust to match your NTP policy):
+#   MAX_STRATUM   - highest acceptable stratum (default: 4)
+#   MAX_OFFSET_MS - max clock offset in milliseconds (default: 500)
+#   MIN_PEERS     - minimum synced peer count (default: 1)
+#
+# Author: Erik Anderson
+# Version: 2.0
+#
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
-use Term::ReadKey qw(ReadMode ReadLine);
 
-my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_log);
-my $TIMEOUT       = 20;
-my $MAX_OFFSET_MS = 500;   # warn if NTP offset > 500ms
-my $MAX_STRATUM   = 5;     # warn if stratum > 5
-my $exit_code     = 0;
+# --- Thresholds ---
+use constant MAX_STRATUM   => 4;
+use constant MAX_OFFSET_MS => 500;
+use constant MIN_PEERS     => 1;
 
+# --- Argument Parsing ---
+my ($host, $device_file, $username, $password, $log_file);
 GetOptions(
-    'h|host=s'     => \$opt_host,
-    'f|file=s'     => \$opt_file,
-    'u|user=s'     => \$opt_user,
-    'p|pass=s'     => \$opt_pass,
-    'l|log=s'      => \$opt_log,
-) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-l logfile]\n";
+    'h|host=s'     => \$host,
+    'f|file=s'     => \$device_file,
+    'u|user=s'     => \$username,
+    'p|pass=s'     => \$password,
+    'l|log=s'      => \$log_file,
+) or die "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-l <logfile>]\n";
 
-die "Specify -h <host> or -f <file>\n" unless $opt_host || $opt_file;
+die "Provide -h or -f\n"  unless $host || $device_file;
+die "Username required\n" unless $username;
+die "Password required\n" unless $password;
 
-$opt_user //= $ENV{NET_USER} // 'admin';
-
-unless ($opt_pass) {
-    print "Password: ";
-    ReadMode('noecho');
-    chomp($opt_pass = ReadLine(0));
-    ReadMode('restore');
-    print "\n";
-}
-
-my $LOG;
-if ($opt_log) {
-    open($LOG, '>>', $opt_log) or die "Cannot open log $opt_log: $!";
-    $LOG->autoflush(1);
-}
-
-sub log_out {
-    my ($msg) = @_;
-    my $ts = strftime("[%Y-%m-%d %H:%M:%S]", localtime);
-    print "$ts $msg\n";
-    print $LOG "$ts $msg\n" if $LOG;
-}
-
-sub load_devices {
-    my @devs;
-    if ($opt_host) {
-        push @devs, { host => $opt_host, user => $opt_user, pass => $opt_pass };
-    } else {
-        open(my $fh, '<', $opt_file) or die "Cannot open $opt_file: $!";
-        while (<$fh>) {
-            chomp; s/^\s+|\s+$//g; next if /^#/ || /^$/;
-            my ($h, $u, $p) = split /[\t,]+/;
-            push @devs, {
-                host => $h,
-                user => $u // $opt_user,
-                pass => $p // $opt_pass,
-            };
-        }
-        close $fh;
+my @devices;
+if ($host) {
+    push @devices, $host;
+} else {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+    while (<$fh>) {
+        chomp;
+        s/#.*//;   # strip comments
+        s/\s+.*//; # strip inline notes
+        push @devices, $_ if /\S/;
     }
-    return @devs;
+    close $fh;
 }
 
-sub check_device {
-    my ($dev) = @_;
-    my $host = $dev->{host};
+# --- Logging Setup ---
+my $log_fh;
+if ($log_file) {
+    open($log_fh, '>', $log_file) or die "Cannot open log $log_file: $!\n";
+}
 
-    log_out("[$host] Connecting...");
+my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+output("NTP Compliance Report - $timestamp");
+output("=" x 60);
+
+# --- Process Each Device ---
+my ($pass_count, $warn_count, $fail_count) = (0, 0, 0);
+
+for my $device (@devices) {
+    output("\nDevice: $device");
+    output("-" x 40);
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $host,
-        user        => $dev->{user},
-        password    => $dev->{pass},
-        raw_pty     => 1,
-        timeout     => $TIMEOUT,
-        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+        host     => $device,
+        user     => $username,
+        password => $password,
+        raw_pty  => 1,
+        timeout  => 15,
     );
 
-    my $login;
-    eval { $login = $ssh->login() };
-    if ($@ || !defined $login) {
-        log_out("[$host] ERROR: Connection/auth failed - $@");
-        return 2;
-    }
-
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('\$|#', 5);
-
-    # Collect NTP status
-    $ssh->send("show ntp status\n");
-    my $ntp_status = $ssh->waitfor('\$|#', $TIMEOUT) // '';
-
-    $ssh->send("show ntp associations detail\n");
-    my $ntp_detail = $ssh->waitfor('\$|#', $TIMEOUT) // '';
-
-    $ssh->send("show clock detail\n");
-    my $clock_out = $ssh->waitfor('\$|#', $TIMEOUT) // '';
-
-    $ssh->close();
-
-    # --- Parse NTP status ---
-    my $synced   = ($ntp_status =~ /Clock is synchronized/i) ? 1 : 0;
-    my $stratum  = ($ntp_status =~ /stratum\s+(\d+)/i)       ? $1 : 'N/A';
-    my $ref_ip   = ($ntp_status =~ /reference is\s+([\d.]+)/i) ? $1 : 'unknown';
-    my $offset   = ($ntp_status =~ /offset\s+is\s+([\d.-]+)\s+msec/i) ? $1 : undef;
-    my $freq_err = ($ntp_status =~ /frequency\s+error\s+is\s+([\d.-]+)\s+ppm/i) ? $1 : undef;
-
-    # --- Parse clock source ---
-    my $auth_ntp = ($clock_out =~ /NTP synchronized/i) ? 'NTP' :
-                   ($clock_out =~ /\.authoritative/i)   ? 'authoritative' : 'unknown';
-
-    my $dev_status = 0;
-
-    if (!$synced) {
-        log_out("[$host] CRITICAL: NTP NOT synchronized");
-        $dev_status = 2;
-    } else {
-        log_out("[$host] OK: Synchronized to $ref_ip (stratum $stratum)");
-
-        if ($stratum ne 'N/A' && $stratum > $MAX_STRATUM) {
-            log_out("[$host] WARNING: High stratum $stratum (threshold: $MAX_STRATUM)");
-            $dev_status = 1 if $dev_status < 1;
+    eval {
+        my $login = $ssh->login();
+        if ($login !~ /[>#]/) {
+            die "Authentication failed or unexpected prompt\n";
         }
 
-        if (defined $offset && abs($offset) > $MAX_OFFSET_MS) {
-            log_out("[$host] WARNING: Offset ${offset}ms exceeds threshold ${MAX_OFFSET_MS}ms");
-            $dev_status = 1 if $dev_status < 1;
-        } elsif (defined $offset) {
-            log_out("[$host] Offset: ${offset}ms  Freq error: " . ($freq_err // 'N/A') . " ppm");
+        # Disable paging
+        $ssh->exec("terminal length 0");
+
+        # Gather NTP status
+        my $ntp_status = $ssh->exec("show ntp status");
+        my $ntp_assoc  = $ssh->exec("show ntp associations");
+
+        # Parse synchronization state
+        my $synced  = ($ntp_status =~ /Clock is synchronized/i)  ? 1 : 0;
+        my $stratum = ($ntp_status =~ /stratum\s+(\d+)/i)        ? $1 : 99;
+        my $offset  = ($ntp_status =~ /offset\s+([-\d.]+)/i)     ? $1 : 9999;
+        $offset = abs($offset);
+
+        # Count synced peers (lines starting with '*' or '+' in associations)
+        my $peer_count = () = ($ntp_assoc =~ /^[*+]/mg);
+
+        # Evaluate compliance
+        my @issues;
+        push @issues, "NOT SYNCHRONIZED"           unless $synced;
+        push @issues, "Stratum $stratum > " . MAX_STRATUM  if $stratum > MAX_STRATUM;
+        push @issues, "Offset ${offset}ms > " . MAX_OFFSET_MS . "ms" if $offset > MAX_OFFSET_MS;
+        push @issues, "Only $peer_count synced peer(s), min " . MIN_PEERS if $peer_count < MIN_PEERS;
+
+        my $status;
+        if (!$synced || @issues >= 2) {
+            $status = "FAIL";
+            $fail_count++;
+        } elsif (@issues) {
+            $status = "WARN";
+            $warn_count++;
+        } else {
+            $status = "PASS";
+            $pass_count++;
         }
+
+        output(sprintf("  Status   : %s", $status));
+        output(sprintf("  Synced   : %s", $synced ? "Yes" : "No"));
+        output(sprintf("  Stratum  : %s", $stratum == 99 ? "unknown" : $stratum));
+        output(sprintf("  Offset   : %.2f ms", $offset));
+        output(sprintf("  Peers    : %d synced", $peer_count));
+        output("  Issues   : " . join(", ", @issues)) if @issues;
+
+        $ssh->close();
+    };
+
+    if ($@) {
+        my $err = $@;
+        $err =~ s/\n/ /g;
+        output("  ERROR: $err");
+        $fail_count++;
     }
-
-    # Count reachable vs unreachable peers
-    my @peers = ($ntp_detail =~ /address:\s+([\d.]+)/gi);
-    my @reach  = ($ntp_detail =~ /reachability=(\d+)/gi);
-    my $reach_count = grep { $_ > 0 } @reach;
-    log_out("[$host] Peers: " . scalar(@peers) . " configured, $reach_count reachable");
-
-    if (@peers && $reach_count == 0) {
-        log_out("[$host] CRITICAL: No NTP peers are reachable");
-        $dev_status = 2;
-    } elsif (@peers && $reach_count < scalar(@peers)) {
-        log_out("[$host] WARNING: " . (scalar(@peers) - $reach_count) . " peer(s) unreachable");
-        $dev_status = 1 if $dev_status < 1;
-    }
-
-    return $dev_status;
 }
 
-# --- Main ---
-log_out("NTP stratum/drift analysis starting");
-log_out("Thresholds: offset>${MAX_OFFSET_MS}ms = WARN, stratum>${MAX_STRATUM} = WARN");
+# --- Summary ---
+output("\n" . "=" x 60);
+output(sprintf("Summary: %d PASS  %d WARN  %d FAIL  (of %d devices)",
+    $pass_count, $warn_count, $fail_count, scalar @devices));
+output("Report generated: $timestamp");
 
-my @devices = load_devices();
-log_out("Loaded " . scalar(@devices) . " device(s)");
+close $log_fh if $log_fh;
+exit($fail_count > 0 ? 2 : $warn_count > 0 ? 1 : 0);
 
-for my $dev (@devices) {
-    my $rc = check_device($dev);
-    $exit_code = $rc if $rc > $exit_code;
+sub output {
+    my ($line) = @_;
+    print "$line\n";
+    print $log_fh "$line\n" if $log_fh;
 }
-
-my $summary = $exit_code == 0 ? 'ALL OK'
-            : $exit_code == 1 ? 'WARNINGS present'
-            : 'CRITICAL failures';
-log_out("Done. Status: $summary");
-
-close $LOG if $LOG;
-exit $exit_code;
-```
