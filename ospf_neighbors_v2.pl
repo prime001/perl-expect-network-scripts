@@ -1,183 +1,172 @@
 ```perl
 #!/usr/bin/perl
-#
-# ospf_flap_monitor.pl - OSPF Neighbor Flap Detection and State Monitor
-#
+# =============================================================================
+# ospf_neighbor_detail.pl - OSPF Neighbor Detail Collector with State Analysis
+# =============================================================================
 # Purpose:
-#   Polls one or more routers repeatedly and alerts when OSPF neighbor
-#   adjacencies change state (flap detection). Useful for troubleshooting
-#   unstable links or during maintenance windows to catch unintended drops.
+#   Connects to Cisco IOS/IOS-XE routers via SSH and collects detailed OSPF
+#   neighbor information, flagging adjacencies stuck in non-Full states and
+#   reporting DR/BDR election status, dead timers, and interface costs.
+#   Complements ospf_neighbors.pl (basic state) with deep adjacency analysis.
 #
 # Usage:
-#   ospf_flap_monitor.pl -h <host> [-u <user>] [-p <pass>] [-i <interval>]
-#                        [-c <count>] [-l <logfile>]
-#   ospf_flap_monitor.pl -f <device_file> [-u <user>] [-p <pass>]
-#
-#   -h  Target router IP or hostname
-#   -f  File with one IP/hostname per line
-#   -u  SSH username (default: $USER env var)
-#   -p  SSH password (prompted if omitted)
-#   -i  Poll interval in seconds (default: 30)
-#   -c  Poll count before exit; 0 = run forever (default: 0)
-#   -l  Optional log file path
+#   Single device:  ./ospf_neighbor_detail.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:    ./ospf_neighbor_detail.pl -f devices.txt -u admin -p secret
+#   With logging:   ./ospf_neighbor_detail.pl -h 10.0.0.1 -u admin -p secret -l ospf_detail.log
 #
 # Prerequisites:
-#   cpan install Net::SSH::Expect Getopt::Long Term::ReadKey
+#   cpan install Net::SSH::Expect
+#   SSH key auth or password auth to target devices
+#   Read-only access (show commands only)
 #
-# Supported platforms:
-#   Cisco IOS/IOS-XE (parses 'show ip ospf neighbor')
-#
-# Exit codes: 0 = clean exit, 1 = usage error, 2 = all hosts failed
+# Device file format: one IP or hostname per line, # for comments
+# =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
+use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $device_file, $username, $password, $logfile);
-my $interval = 30;
-my $count    = 0;
+my ($host, $device_file, $username, $password, $log_file, $help);
+my $timeout = 30;
 
 GetOptions(
-    'h=s' => \$host,
-    'f=s' => \$device_file,
-    'u=s' => \$username,
-    'p=s' => \$password,
-    'i=i' => \$interval,
-    'c=i' => \$count,
-    'l=s' => \$logfile,
-) or usage();
+    'h|host=s'     => \$host,
+    'f|file=s'     => \$device_file,
+    'u|user=s'     => \$username,
+    'p|pass=s'     => \$password,
+    'l|log=s'      => \$log_file,
+    't|timeout=i'  => \$timeout,
+    'help'         => \$help,
+) or die "Error in arguments. Use --help for usage.\n";
 
-usage() unless $host || $device_file;
-
-$username //= $ENV{USER} // 'admin';
-
-unless ($password) {
-    eval { require Term::ReadKey; Term::ReadKey->import('ReadMode') };
-    print "SSH password: ";
-    if ($@) {
-        chomp($password = <STDIN>);
-    } else {
-        ReadMode('noecho');
-        chomp($password = <STDIN>);
-        ReadMode('restore');
-        print "\n";
-    }
+if ($help || (!$host && !$device_file) || !$username || !$password) {
+    print "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOGFILE] [-t TIMEOUT]\n";
+    exit 1;
 }
 
-my @devices = $host ? ($host) : do {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    map { chomp; $_ } grep { /\S/ && !/^#/ } <$fh>;
-};
-
-die "No devices to monitor.\n" unless @devices;
+my @devices = $host ? ($host) : load_devices($device_file);
+die "No devices to process.\n" unless @devices;
 
 my $log_fh;
-if ($logfile) {
-    open $log_fh, '>>', $logfile or die "Cannot open log $logfile: $!\n";
-    $log_fh->autoflush(1);
+if ($log_file) {
+    open($log_fh, '>>', $log_file) or die "Cannot open log file $log_file: $!\n";
 }
 
-sub ts { strftime('%Y-%m-%d %H:%M:%S', localtime) }
+my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+log_output("=" x 70);
+log_output("OSPF Neighbor Detail Report - $timestamp");
+log_output("=" x 70);
 
-sub emit {
-    my $msg = sprintf("[%s] %s\n", ts(), $_[0]);
-    print $msg;
-    print $log_fh $msg if $log_fh;
+for my $device (@devices) {
+    process_device($device, $username, $password, $timeout);
 }
 
-sub get_neighbors {
-    my ($dev) = @_;
+close($log_fh) if $log_fh;
+
+sub process_device {
+    my ($device, $user, $pass, $to) = @_;
+
+    log_output("\n--- Device: $device ---");
+
     my $ssh = Net::SSH::Expect->new(
-        host       => $dev,
-        user       => $username,
-        password   => $password,
-        raw_pty    => 1,
-        timeout    => 15,
+        host        => $device,
+        user        => $user,
+        password     => $pass,
+        raw_pty     => 1,
+        timeout     => $to,
     );
-    eval { $ssh->login() };
-    if ($@ || !defined $ssh) {
-        emit("ERROR $dev: SSH login failed - $@");
-        return undef;
+
+    eval {
+        my $login_output = $ssh->login();
+        if ($login_output !~ /[>#]/) {
+            die "Authentication failed or unexpected prompt on $device\n";
+        }
+    };
+    if ($@) {
+        log_output("ERROR: Cannot connect to $device - $@");
+        return;
     }
-    $ssh->exec('terminal length 0');
-    my $out = $ssh->exec('show ip ospf neighbor');
+
+    $ssh->exec("terminal length 0");
+
+    my $output = $ssh->exec("show ip ospf neighbor detail");
+    unless (defined $output) {
+        log_output("ERROR: No response from $device (timeout after ${to}s)");
+        $ssh->close();
+        return;
+    }
+
+    parse_ospf_detail($device, $output);
+
+    $ssh->exec("exit");
     $ssh->close();
-
-    my %neighbors;
-    for my $line (split /\n/, $out) {
-        # Match: NeighborID  Pri  State  DeadTime  Address  Interface
-        if ($line =~ /^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\S+)\s+\S+\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)/) {
-            my ($nbr_id, $state, $nbr_addr, $iface) = ($1, $2, $3, $4);
-            $neighbors{$nbr_id} = { state => $state, addr => $nbr_addr, iface => $iface };
-        }
-    }
-    return \%neighbors;
 }
 
-my %prev_state;   # $prev_state{dev}{neighbor_id} = state string
-my %flap_count;   # $prev_state{dev}{neighbor_id} = count
+sub parse_ospf_detail {
+    my ($device, $output) = @_;
 
-emit("Starting OSPF flap monitor: " . scalar(@devices) . " device(s), poll every ${interval}s" .
-     ($count ? ", $count iterations" : ", continuous"));
-
-my $iteration  = 0;
-my $all_failed = 1;
-
-while (1) {
-    $iteration++;
-    for my $dev (@devices) {
-        my $neighbors = get_neighbors($dev);
-        unless (defined $neighbors) {
-            next;
-        }
-        $all_failed = 0;
-
-        if (!exists $prev_state{$dev}) {
-            # First poll - baseline
-            my $n = scalar keys %$neighbors;
-            emit("BASELINE $dev: $n OSPF neighbor(s) found");
-            for my $id (sort keys %$neighbors) {
-                my $r = $neighbors->{$id};
-                emit("  $id  state=$r->{state}  addr=$r->{addr}  iface=$r->{iface}");
-            }
-            $prev_state{$dev} = { map { $_ => $neighbors->{$_}{state} } keys %$neighbors };
-            next;
-        }
-
-        my $prev = $prev_state{$dev};
-
-        # Detect new neighbors
-        for my $id (sort keys %$neighbors) {
-            unless (exists $prev->{$id}) {
-                emit("NEW $dev: neighbor $id APPEARED  state=$neighbors->{$id}{state}  iface=$neighbors->{$id}{iface}");
-            }
-        }
-
-        # Detect gone or state-changed neighbors
-        for my $id (sort keys %$prev) {
-            if (!exists $neighbors->{$id}) {
-                $flap_count{$dev}{$id}++;
-                emit("ALERT $dev: neighbor $id LOST (was $prev->{$id})  flaps=$flap_count{$dev}{$id}");
-            } elsif ($neighbors->{$id}{state} ne $prev->{$id}) {
-                $flap_count{$dev}{$id}++;
-                emit("CHANGE $dev: neighbor $id  $prev->{$id} -> $neighbors->{$id}{state}  flaps=$flap_count{$dev}{$id}");
-            }
-        }
-
-        $prev_state{$dev} = { map { $_ => $neighbors->{$_}{state} } keys %$neighbors };
+    if ($output =~ /OSPF not enabled|% OSPF: No such process|no neighbor/i) {
+        log_output("  INFO: OSPF not configured or no neighbors on $device");
+        return;
     }
 
-    last if $count && $iteration >= $count;
-    sleep $interval;
+    my @blocks = split(/(?=Neighbor \d+\.\d+\.\d+\.\d+,)/, $output);
+    my $neighbor_count = 0;
+    my @warnings;
+
+    for my $block (@blocks) {
+        next unless $block =~ /Neighbor (\d+\.\d+\.\d+\.\d+)/;
+        my $neighbor_id = $1;
+        $neighbor_count++;
+
+        my $state       = $block =~ /State is (\S+)/          ? $1 : 'Unknown';
+        my $interface   = $block =~ /interface address (\S+)/i ? $1 : 'Unknown';
+        my $area        = $block =~ /in the area (\S+)/        ? $1 : 'Unknown';
+        my $priority    = $block =~ /Neighbor priority is (\d+)/ ? $1 : '?';
+        my $dr          = $block =~ /DR is (\S+)/              ? $1 : 'None';
+        my $bdr         = $block =~ /BDR is (\S+)/             ? $1 : 'None';
+        my $dead_timer  = $block =~ /Dead timer due in ([\d:]+)/ ? $1 : '?';
+        my $hello_int   = $block =~ /Hello due in ([\d:]+)/    ? $1 : '?';
+        my $uptime      = $block =~ /Neighbor is up for ([\dhms:]+)/ ? $1 : '?';
+
+        my $status = ($state eq 'FULL') ? 'OK' : 'WARN';
+        log_output(sprintf("  [%s] Neighbor: %-16s  State: %-14s  Area: %s", $status, $neighbor_id, $state, $area));
+        log_output(sprintf("       Interface: %-16s  Priority: %-3s  Uptime: %s", $interface, $priority, $uptime));
+        log_output(sprintf("       DR: %-18s  BDR: %-18s  Dead: %s", $dr, $bdr, $dead_timer));
+
+        push @warnings, "Neighbor $neighbor_id on $device stuck in state: $state"
+            if $state !~ /^(FULL|2WAY)$/i;
+
+        if ($dead_timer =~ /^0:0:0(\d+)$/ && $1 < 10) {
+            push @warnings, "Neighbor $neighbor_id dead timer critically low: ${dead_timer}s";
+        }
+    }
+
+    if ($neighbor_count == 0) {
+        log_output("  INFO: No OSPF neighbors found on $device");
+    } else {
+        log_output("  Total neighbors: $neighbor_count");
+    }
+
+    if (@warnings) {
+        log_output("  WARNINGS:");
+        log_output("    ! $_") for @warnings;
+    }
 }
 
-emit("Monitor stopped after $iteration iteration(s).");
-exit($all_failed ? 2 : 0);
+sub load_devices {
+    my ($file) = @_;
+    open(my $fh, '<', $file) or die "Cannot open device file $file: $!\n";
+    my @list = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
+    close($fh);
+    return @list;
+}
 
-sub usage {
-    print "Usage: $0 -h <host>|-f <file> [-u user] [-p pass] [-i secs] [-c count] [-l logfile]\n";
-    exit 1;
+sub log_output {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $log_fh "$msg\n" if $log_fh;
 }
 ```
