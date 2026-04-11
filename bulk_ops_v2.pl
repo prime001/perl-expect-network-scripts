@@ -1,142 +1,147 @@
 ```perl
 #!/usr/bin/perl
 # =============================================================================
-# cpu_memory_health.pl - Network Device CPU/Memory Health Check
+# cpu_mem_health.pl - Network Device CPU & Memory Health Collector
 # =============================================================================
 # Purpose:
-#   Polls CPU utilization and memory usage across one or more Cisco IOS/IOS-XE
-#   devices via SSH. Flags devices exceeding configurable thresholds. Useful
-#   for NOC health sweeps, pre/post-change baseline captures, and incident triage.
+#   Polls CPU utilization and memory usage from Cisco IOS/IOS-XE devices
+#   via SSH. Useful for capacity planning, incident triage, and scheduled
+#   health checks across a fleet of network devices.
 #
 # Usage:
-#   Single device:   ./cpu_memory_health.pl -h 192.168.1.1 -u admin -p secret
-#   Device list:     ./cpu_memory_health.pl -f devices.txt -u admin -p secret
-#   With log file:   ./cpu_memory_health.pl -f devices.txt -u admin -p secret -l health.log
-#   Custom thresh:   ./cpu_memory_health.pl -h 10.0.0.1 -u admin -p secret --cpu 70 --mem 85
+#   Single device:   ./cpu_mem_health.pl -h 192.168.1.1
+#   Device list:     ./cpu_mem_health.pl -f devices.txt
+#   With logging:    ./cpu_mem_health.pl -f devices.txt -l health.log
 #
 # Prerequisites:
-#   cpan install Net::SSH::Expect Getopt::Long
+#   cpan Net::SSH::Expect
+#   SSH key auth or plaintext credentials via environment variables:
+#     NET_USER, NET_PASS, NET_ENABLE (optional)
 #
-# Device file format: one IP/hostname per line, blank lines and # comments ok
+# Device file format: one IP or hostname per line, # for comments
 # =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
+use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_log);
-my $cpu_thresh = 80;
-my $mem_thresh = 90;
-my $timeout    = 15;
-
+my ($host_arg, $device_file, $log_file);
 GetOptions(
-    'h|host=s'     => \$opt_host,
-    'f|file=s'     => \$opt_file,
-    'u|user=s'     => \$opt_user,
-    'p|pass=s'     => \$opt_pass,
-    'l|log=s'      => \$opt_log,
-    'cpu=i'        => \$cpu_thresh,
-    'mem=i'        => \$mem_thresh,
-) or die "Usage: $0 -h HOST | -f FILE -u USER -p PASS [-l LOGFILE] [--cpu N] [--mem N]\n";
+    'h=s' => \$host_arg,
+    'f=s' => \$device_file,
+    'l=s' => \$log_file,
+) or die "Usage: $0 [-h host] [-f device_file] [-l log_file]\n";
 
-die "Specify -h HOST or -f FILE\n"    unless $opt_host || $opt_file;
-die "Username required (-u)\n"        unless $opt_user;
-die "Password required (-p)\n"        unless $opt_pass;
+die "Specify -h HOST or -f FILE\n" unless $host_arg || $device_file;
+
+my $username = $ENV{NET_USER} or die "Set NET_USER environment variable\n";
+my $password = $ENV{NET_PASS} or die "Set NET_PASS environment variable\n";
+my $enable   = $ENV{NET_ENABLE} || $password;
+my $timeout  = 15;
 
 my @devices;
-if ($opt_host) {
-    push @devices, $opt_host;
+if ($host_arg) {
+    push @devices, $host_arg;
 } else {
-    open(my $fh, '<', $opt_file) or die "Cannot open $opt_file: $!\n";
-    while (<$fh>) { chomp; next if /^\s*$/ || /^\s*#/; push @devices, $_; }
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) {
+        chomp; s/#.*//; s/^\s+|\s+$//g;
+        push @devices, $_ if $_;
+    }
     close $fh;
 }
 
 my $log_fh;
-if ($opt_log) {
-    open($log_fh, '>>', $opt_log) or die "Cannot open log $opt_log: $!\n";
+if ($log_file) {
+    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
+}
+
+sub log_output {
+    my $msg = shift;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
 
 my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-output("=" x 70);
-output("CPU/Memory Health Check  |  $ts");
-output(sprintf("Thresholds: CPU >%d%%  Memory >%d%%", $cpu_thresh, $mem_thresh));
-output("=" x 70);
-
-my ($ok_count, $warn_count, $err_count) = (0, 0, 0);
+log_output("=" x 70 . "\n");
+log_output("CPU/Memory Health Check  |  $ts\n");
+log_output("=" x 70 . "\n\n");
 
 for my $device (@devices) {
-    my $result = check_device($device);
-    if    ($result->{status} eq 'ERROR') { $err_count++ }
-    elsif ($result->{status} eq 'WARN')  { $warn_count++ }
-    else                                  { $ok_count++ }
+    log_output("Device: $device\n");
+    log_output("-" x 50 . "\n");
+
+    my $ssh;
+    eval {
+        $ssh = Net::SSH::Expect->new(
+            host        => $device,
+            user        => $username,
+            password    => $password,
+            raw_pty     => 1,
+            timeout     => $timeout,
+        );
+        $ssh->login();
+    };
+    if ($@) {
+        log_output("  ERROR: Connection failed - $@\n\n");
+        next;
+    }
+
+    eval {
+        $ssh->send("terminal length 0");
+        $ssh->waitfor('\$\s*$|#\s*$', $timeout);
+
+        if ($ssh->waitfor('>\s*$', 1)) {
+            $ssh->send("enable");
+            $ssh->waitfor('[Pp]assword', $timeout);
+            $ssh->send($enable);
+            $ssh->waitfor('#\s*$', $timeout);
+        }
+
+        # CPU utilization
+        $ssh->send("show processes cpu | include CPU utilization");
+        my $cpu_out = $ssh->waitfor('#\s*$', $timeout);
+        if ($cpu_out =~ /CPU utilization[^:]*:\s*(\d+%[^,]*,\s*\d+%[^,]*,\s*\d+%\s+average)/i) {
+            log_output("  CPU  : $1\n");
+        } elsif ($cpu_out =~ /(CPU utilization.+)/i) {
+            log_output("  CPU  : $1\n");
+        } else {
+            log_output("  CPU  : (parse failed)\n");
+        }
+
+        # Memory
+        $ssh->send("show processes memory | include Processor");
+        my $mem_out = $ssh->waitfor('#\s*$', $timeout);
+        if ($mem_out =~ /Processor\s+(\S+)\s+(\S+)\s+(\S+)/i) {
+            my ($total, $used, $free) = ($1, $2, $3);
+            my $pct = ($total > 0) ? int(($used / $total) * 100) : 0;
+            log_output(sprintf("  MEM  : total=%-10s used=%-10s free=%-10s (%d%% used)\n",
+                $total, $used, $free, $pct));
+        } else {
+            log_output("  MEM  : (parse failed)\n");
+        }
+
+        # Environment status (power/fans/temp) - best-effort
+        $ssh->send("show environment all | include FAIL|Critical|Warning|OK");
+        my $env_out = $ssh->waitfor('#\s*$', $timeout);
+        my @env_issues = grep { /FAIL|Critical|Warning/i } split(/\n/, $env_out);
+        if (@env_issues) {
+            log_output("  ENV  : ALERTS: " . join("; ", map { s/^\s+|\s+$//gr } @env_issues) . "\n");
+        } else {
+            log_output("  ENV  : OK\n");
+        }
+
+        $ssh->send("exit");
+    };
+    if ($@) {
+        log_output("  ERROR: Session error - $@\n");
+    }
+
+    log_output("\n");
 }
 
-output("-" x 70);
-output(sprintf("Summary: %d OK  %d WARN  %d ERROR  (%d devices)",
-    $ok_count, $warn_count, $err_count, scalar @devices));
+log_output("Collection complete.\n");
 close $log_fh if $log_fh;
-
-# ------------------------------------------------------------------ #
-
-sub check_device {
-    my ($host) = @_;
-    my %result = (host => $host, status => 'OK');
-
-    my $ssh = Net::SSH::Expect->new(
-        host        => $host,
-        user        => $opt_user,
-        password    => $opt_pass,
-        raw_pty     => 1,
-        timeout     => $timeout,
-        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
-    );
-
-    eval { $ssh->login() };
-    if ($@ || !$ssh->is_connected()) {
-        output(sprintf("%-20s  [ERROR] Connection/auth failed: %s", $host, $@));
-        return { %result, status => 'ERROR' };
-    }
-
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('\$|\#', 5);
-
-    # CPU utilization
-    $ssh->send("show processes cpu | include CPU utilization");
-    my $cpu_out = $ssh->waitfor('\$|\#', 10) // '';
-    my ($cpu5s, $cpu1m, $cpu5m) = ('?', '?', '?');
-    if ($cpu_out =~ /CPU utilization.*?:\s*(\d+)%\/\S+;\s*one minute:\s*(\d+)%;\s*five minutes:\s*(\d+)%/) {
-        ($cpu5s, $cpu1m, $cpu5m) = ($1, $2, $3);
-    }
-
-    # Memory utilization
-    $ssh->send("show processes memory | include Processor");
-    my $mem_out = $ssh->waitfor('\$|\#', 10) // '';
-    my ($mem_used, $mem_free, $mem_pct) = (0, 0, 0);
-    if ($mem_out =~ /Processor\s+\S+\s+(\d+)\s+(\d+)/) {
-        $mem_used = $1; $mem_free = $2;
-        my $total = $mem_used + $mem_free;
-        $mem_pct  = $total > 0 ? int(($mem_used / $total) * 100) : 0;
-    }
-
-    $ssh->close();
-
-    my $warn = ($cpu1m ne '?' && $cpu1m >= $cpu_thresh) ||
-               ($mem_pct > 0  && $mem_pct >= $mem_thresh);
-    $result{status} = 'WARN' if $warn;
-
-    my $flag = $warn ? '** WARN **' : 'OK';
-    output(sprintf("%-20s  %-10s  CPU: %3s%% (1m) %3s%% (5m)  MEM: %3s%% used",
-        $host, $flag, $cpu1m, $cpu5m, $mem_pct > 0 ? $mem_pct : '?'));
-
-    return \%result;
-}
-
-sub output {
-    my ($line) = @_;
-    print "$line\n";
-    print $log_fh "$line\n" if $log_fh;
-}
 ```
