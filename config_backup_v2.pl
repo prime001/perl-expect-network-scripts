@@ -1,34 +1,27 @@
 ```perl
 #!/usr/bin/perl
 # =============================================================================
-# running_vs_startup.pl - Unsaved Config Change Detector
+# cdp_lldp_neighbors.pl - CDP/LLDP Neighbor Discovery and Topology Mapper
 # =============================================================================
 # Purpose:
-#   Connects to one or more Cisco IOS/IOS-XE devices and compares the running
-#   configuration against the startup configuration. Flags any device where
-#   changes have been made but not saved with 'write memory'. Useful for
-#   compliance checks, change window audits, and pre-maintenance validation.
+#   Connects to one or more network devices via SSH and collects CDP and LLDP
+#   neighbor information. Useful for topology discovery, documentation, and
+#   verifying adjacencies after network changes.
 #
 # Usage:
-#   Single device:   ./running_vs_startup.pl -h 192.168.1.1
-#   Device file:     ./running_vs_startup.pl -f devices.txt
-#   With logging:    ./running_vs_startup.pl -f devices.txt -l audit.log
-#   Custom creds:    ./running_vs_startup.pl -h 10.0.0.1 -u admin -p secret
-#
-# Device file format (one IP or hostname per line, # for comments):
-#   192.168.1.1
-#   192.168.1.2
-#   # core-switch.example.com
+#   Single device:  ./cdp_lldp_neighbors.pl -h 192.168.1.1 -u admin -p secret
+#   Device list:    ./cdp_lldp_neighbors.pl -f devices.txt -u admin -p secret
+#   With log file:  ./cdp_lldp_neighbors.pl -h 10.0.0.1 -u admin -p secret -l neighbors.log
+#   Enable mode:    ./cdp_lldp_neighbors.pl -h 10.0.0.1 -u admin -p cisco -e enablepass
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH key-based auth recommended; password auth supported via -p flag
-#   Devices must allow 'show archive config differences' or fallback method
+#   cpan install Net::SSH::Expect
+#   SSH access to target devices (Cisco IOS/IOS-XE/NX-OS)
+#   CDP and/or LLDP enabled on target devices
 #
-# Exit codes:
-#   0 = All devices in sync (running == startup)
-#   1 = One or more devices have unsaved changes
-#   2 = Script error (bad args, unreadable file, etc.)
+# Device file format (one per line, lines starting with # ignored):
+#   192.168.1.1
+#   router-core-01.example.com
 # =============================================================================
 
 use strict;
@@ -37,154 +30,170 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $device_file, $log_file, $username, $password, $help);
+my ($host, $file, $username, $password, $enable_pass, $logfile, $help);
 my $timeout = 30;
 
 GetOptions(
     'h|host=s'     => \$host,
-    'f|file=s'     => \$device_file,
-    'l|log=s'      => \$log_file,
+    'f|file=s'     => \$file,
     'u|user=s'     => \$username,
     'p|pass=s'     => \$password,
+    'e|enable=s'   => \$enable_pass,
+    'l|log=s'      => \$logfile,
     't|timeout=i'  => \$timeout,
     'help'         => \$help,
-) or die "Error parsing arguments. Use --help for usage.\n";
+) or die "Error parsing options. Use --help for usage.\n";
 
-if ($help) {
-    system("grep '^#' $0 | head -30 | sed 's/^# //; s/^#//'");
-    exit 0;
+if ($help || (!$host && !$file) || !$username || !$password) {
+    print "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-e <enable>] [-l <logfile>] [-t <timeout>]\n";
+    exit 1;
 }
-
-unless ($host || $device_file) {
-    print STDERR "Error: specify -h <host> or -f <device_file>\n";
-    exit 2;
-}
-
-$username //= $ENV{NET_USER} // 'admin';
-$password //= $ENV{NET_PASS} // '';
 
 my @devices;
 if ($host) {
     push @devices, $host;
-}
-if ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+} elsif ($file) {
+    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
     while (<$fh>) {
         chomp;
-        s/\s+$//;
-        next if /^\s*#/ || /^\s*$/;
+        next if /^\s*$/ || /^\s*#/;
         push @devices, $_;
     }
     close $fh;
 }
 
+die "No devices to process.\n" unless @devices;
+
 my $log_fh;
-if ($log_file) {
-    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
+if ($logfile) {
+    open($log_fh, '>', $logfile) or die "Cannot open log file '$logfile': $!\n";
 }
 
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-my $header = "=" x 60 . "\nUnsaved Config Audit - $timestamp\n" . "=" x 60;
-output($header);
-
-my $overall_exit = 0;
+my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+output("=" x 70);
+output("CDP/LLDP Neighbor Discovery Report");
+output("Generated: $timestamp");
+output("=" x 70);
 
 for my $device (@devices) {
-    output("\n[$device] Connecting...");
+    output("\n[*] Connecting to $device...");
+    eval { process_device($device) };
+    if ($@) {
+        output("[!] ERROR on $device: $@");
+    }
+}
+
+output("\n" . "=" x 70);
+output("Scan complete.");
+close $log_fh if $log_fh;
+
+sub process_device {
+    my ($dev) = @_;
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $device,
+        host        => $dev,
         user        => $username,
         password    => $password,
         raw_pty     => 1,
         timeout     => $timeout,
-        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
     );
 
-    my $login_output;
-    eval {
-        $login_output = $ssh->login();
-    };
-    if ($@ || !defined $login_output) {
-        output("[$device] FAIL: Connection error - $@");
-        $overall_exit = 1;
-        next;
-    }
-    if ($login_output =~ /Permission denied|Authentication failed/i) {
-        output("[$device] FAIL: Authentication failed");
-        $overall_exit = 1;
-        next;
+    my $login = eval { $ssh->login() };
+    if ($@ || !defined $login) {
+        die "SSH login failed (check credentials or reachability)\n";
     }
 
-    # Disable paging
+    if ($login =~ /Password:\s*$/i || $login =~ /authentication failed/i) {
+        die "Authentication failed\n";
+    }
+
+    # Disable pagination
     $ssh->send("terminal length 0\n");
-    $ssh->waitfor('\$|#', 5);
+    $ssh->waitfor('\$\s*$|#\s*$|>\s*$', $timeout);
 
-    # Try 'show archive config differences' first (IOS 12.3+)
-    $ssh->send("show archive config differences\n");
-    my $diff_output = $ssh->waitfor('\$|#', $timeout);
-
-    if (!defined $diff_output) {
-        output("[$device] WARN: Timeout waiting for diff output");
-        $overall_exit = 1;
-        $ssh->close();
-        next;
+    # Enter enable mode if password provided
+    if ($enable_pass && $login =~ />\s*$/) {
+        $ssh->send("enable\n");
+        $ssh->waitfor('Password:', 5);
+        $ssh->send("$enable_pass\n");
+        my $resp = $ssh->waitfor('#\s*$', 5);
+        die "Enable authentication failed\n" unless defined $resp;
     }
 
-    # Fallback: check if archive is configured; if not, use show running vs startup checksum approach
-    my $has_unsaved = 0;
-    my $method_used = 'archive';
+    output("\n--- Device: $dev ---");
 
-    if ($diff_output =~ /not configured|invalid input|error/i) {
-        # Fallback: compare MD5 of running vs startup isn't native; instead check 'show startup-config'
-        # to see if it's absent or compare modification time via 'show version' build info
-        $ssh->send("show startup-config | include Last configuration\n");
-        my $startup_info = $ssh->waitfor('\$|#', 15);
-        $ssh->send("show running-config | include Last configuration\n");
-        my $running_info = $ssh->waitfor('\$|#', 15);
-        $method_used = 'timestamp';
+    # Collect CDP neighbors
+    $ssh->send("show cdp neighbors detail\n");
+    my $cdp_output = $ssh->waitfor('#\s*$|>\s*$', $timeout);
+    parse_cdp($cdp_output) if defined $cdp_output;
 
-        # Simple heuristic: if no startup config exists, device is definitely out of sync
-        if (!defined $startup_info || $startup_info =~ /startup.*not.*present|nvram.*not.*configured/i) {
-            $has_unsaved = 1;
-        } else {
-            # Cannot definitively compare without archive; report as unknown
-            output("[$device] INFO: 'archive' not configured - cannot perform diff. Enable 'archive' for full support.");
-            $ssh->close();
-            next;
-        }
-    } elsif ($diff_output =~ /no changes|identical|Contextual Config Diffs:\s*\n\s*\n/si) {
-        $has_unsaved = 0;
-    } elsif ($diff_output =~ /^\+|^-/m) {
-        $has_unsaved = 1;
-    }
-
-    if ($has_unsaved) {
-        output("[$device] *** UNSAVED CHANGES DETECTED (method: $method_used) ***");
-        if ($method_used eq 'archive' && $diff_output =~ /((?:^[+-].*\n)+)/m) {
-            my $changes = $1;
-            $changes =~ s/^/  /mg;
-            output("[$device] Changed lines:\n$changes");
-        }
-        $overall_exit = 1;
-    } else {
-        output("[$device] OK: running-config matches startup-config");
-    }
+    # Collect LLDP neighbors
+    $ssh->send("show lldp neighbors detail\n");
+    my $lldp_output = $ssh->waitfor('#\s*$|>\s*$', $timeout);
+    parse_lldp($lldp_output) if defined $lldp_output;
 
     $ssh->send("exit\n");
     $ssh->close();
 }
 
-output("\n" . "=" x 60);
-output($overall_exit ? "RESULT: Unsaved changes found on one or more devices" : "RESULT: All devices in sync");
-output("=" x 60);
+sub parse_cdp {
+    my ($raw) = @_;
+    my @entries = split(/[-]{5,}/, $raw);
+    my $count = 0;
 
-close $log_fh if $log_fh;
-exit $overall_exit;
+    for my $entry (@entries) {
+        next unless $entry =~ /Device ID/i;
+        my %nbr;
+        ($nbr{device_id})   = $entry =~ /Device ID:\s*(\S+)/i;
+        ($nbr{platform})    = $entry =~ /Platform:\s*([^,]+)/i;
+        ($nbr{local_intf})  = $entry =~ /Interface:\s*(\S+)/i;
+        ($nbr{remote_intf}) = $entry =~ /Port ID \(outgoing port\):\s*(\S+)/i;
+        ($nbr{ip_addr})     = $entry =~ /IP(?:v4)? address:\s*(\S+)/i;
+        ($nbr{version})     = $entry =~ /Version\s*:\s*\n\s*(.+)/i;
+
+        next unless $nbr{device_id};
+        $count++;
+        output(sprintf("  [CDP] %-30s  local:%-20s remote:%-20s ip:%s",
+            $nbr{device_id} // 'unknown',
+            $nbr{local_intf} // '?',
+            $nbr{remote_intf} // '?',
+            $nbr{ip_addr} // 'n/a'));
+        output(sprintf("        Platform: %s", $nbr{platform} // 'unknown')) if $nbr{platform};
+    }
+    output("  [CDP] No neighbors found.") if $count == 0 && $raw !~ /Total cdp entries/i;
+    output("  [CDP] CDP not enabled or no neighbors.") if $raw =~ /not enabled|CDP is not|% Invalid/i;
+}
+
+sub parse_lldp {
+    my ($raw) = @_;
+    return if $raw =~ /not enabled|LLDP is not|% Invalid|% LLDP/i;
+
+    my @entries = split(/[-]{5,}/, $raw);
+    my $count = 0;
+
+    for my $entry (@entries) {
+        next unless $entry =~ /System Name|Chassis id|Port Description/i;
+        my %nbr;
+        ($nbr{system_name}) = $entry =~ /System Name:\s*(\S+)/i;
+        ($nbr{chassis_id})  = $entry =~ /Chassis id:\s*(\S+)/i;
+        ($nbr{local_intf})  = $entry =~ /Local Intf:\s*(\S+)/i;
+        ($nbr{port_id})     = $entry =~ /Port id:\s*(\S+)/i;
+        ($nbr{mgmt_addr})   = $entry =~ /Management Addresses[^:]*:\s*\n\s*IP:\s*(\S+)/i;
+
+        next unless ($nbr{system_name} || $nbr{chassis_id});
+        $count++;
+        output(sprintf("  [LLDP] %-30s  local:%-20s remote:%-20s ip:%s",
+            $nbr{system_name} // $nbr{chassis_id} // 'unknown',
+            $nbr{local_intf} // '?',
+            $nbr{port_id} // '?',
+            $nbr{mgmt_addr} // 'n/a'));
+    }
+    output("  [LLDP] No LLDP neighbors found.") if $count == 0;
+}
 
 sub output {
-    my ($msg) = @_;
-    print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
+    my ($line) = @_;
+    print "$line\n";
+    print $log_fh "$line\n" if $log_fh;
 }
 ```
