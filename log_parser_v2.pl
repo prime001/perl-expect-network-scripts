@@ -1,197 +1,127 @@
-```perl
 #!/usr/bin/perl
-# =============================================================================
-# syslog_analyzer.pl - Network Device Syslog Buffer Analyzer
-# =============================================================================
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE devices via SSH, retrieves the syslog buffer
-#   (show logging), and parses entries by severity level, facility, and time.
-#   Produces a summary report highlighting critical/error conditions suitable
-#   for NOC review or post-incident analysis.
-#
-# Usage:
-#   Single device:  ./syslog_analyzer.pl -h 192.168.1.1 -u admin -p secret
-#   Device list:    ./syslog_analyzer.pl -f devices.txt -u admin -p secret
-#   With log file:  ./syslog_analyzer.pl -h 192.168.1.1 -u admin -p secret -o report.log
-#   Filter severity:./syslog_analyzer.pl -h 192.168.1.1 -u admin -p secret -s 3
-#
-# Options:
-#   -h <host>      Target device IP or hostname
-#   -f <file>      File containing one device IP/hostname per line
-#   -u <user>      SSH username
-#   -p <pass>      SSH password (prompted if omitted)
-#   -e <enable>    Enable password (optional)
-#   -o <file>      Output log file (default: syslog_report_YYYYMMDD.log)
-#   -s <level>     Minimum severity to report (0=emerg..7=debug, default 4)
-#   -n <count>     Max log lines to retrieve (default 500)
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect Term::ReadKey
-#
-# Tested on: Cisco IOS 15.x, IOS-XE 16.x/17.x
-# =============================================================================
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Std;
+use Getopt::Long;
 use POSIX qw(strftime);
-use Term::ReadKey;
 
-our %opts;
-getopts('h:f:u:p:e:o:s:n:', \%opts);
+# =============================================================================
+# syslog_security_audit.pl
+#
+# Purpose:
+#   SSH into Cisco IOS/IOS-XE devices and parse buffered syslog for
+#   security-relevant events: authentication failures, ACL denies,
+#   port-security violations, and login anomalies.  Suitable for
+#   scheduled auditing or incident triage.
+#
+# Usage:
+#   perl syslog_security_audit.pl -h 192.0.2.1 -u admin -p secret
+#   perl syslog_security_audit.pl --file devices.txt -u admin -p secret -o report.txt
+#   perl syslog_security_audit.pl -h 192.0.2.1 -u admin -p secret --last 200
+#
+# Prerequisites:
+#   cpan Net::SSH::Expect
+#   SSH access to target device(s); 'logging buffered' must be enabled
+#
+# Output:
+#   Prints flagged log lines to STDOUT (and optionally a file) grouped by
+#   category: AUTH_FAIL, ACL_DENY, PORT_SEC, LOGIN_ANOMALY
+# =============================================================================
 
-my $username    = $opts{u} or die "Usage: $0 -h <host>|-f <file> -u <user> [-p pass] [-e enable] [-o logfile] [-s severity] [-n lines]\n";
-my $password    = $opts{p} || prompt_password("SSH password for $username: ");
-my $enable_pass = $opts{e} || '';
-my $min_sev     = defined $opts{s} ? $opts{s} : 4;
-my $max_lines   = $opts{n} || 500;
-my $datestamp   = strftime("%Y%m%d_%H%M%S", localtime);
-my $logfile     = $opts{o} || "syslog_report_${datestamp}.log";
+my ($host, $user, $pass, $device_file, $out_file, $last_lines, $timeout);
+$last_lines = 500;
+$timeout    = 15;
 
-my @severity_names = qw(EMERGENCY ALERT CRITICAL ERROR WARNING NOTICE INFORMATIONAL DEBUG);
+GetOptions(
+    'h|host=s'     => \$host,
+    'u|user=s'     => \$user,
+    'p|pass=s'     => \$pass,
+    'f|file=s'     => \$device_file,
+    'o|output=s'   => \$out_file,
+    'l|last=i'     => \$last_lines,
+    't|timeout=i'  => \$timeout,
+) or die "Usage: $0 -h <host> -u <user> -p <pass> [-f <file>] [-o <outfile>] [-l <lines>]\n";
 
-my @devices;
-if ($opts{h}) {
-    push @devices, $opts{h};
-} elsif ($opts{f}) {
-    open my $fh, '<', $opts{f} or die "Cannot open device file $opts{f}: $!";
-    while (<$fh>) {
-        chomp;
-        next if /^\s*$/ || /^#/;
-        push @devices, $_;
-    }
+die "Username required (-u)\n" unless $user;
+die "Password required (-p)\n" unless $pass;
+die "Provide -h <host> or -f <file>\n" unless $host || $device_file;
+
+my @targets;
+if ($device_file) {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) { chomp; push @targets, $_ if /\S/ && !/^#/; }
     close $fh;
 } else {
-    die "Specify -h <host> or -f <file>\n";
+    push @targets, $host;
 }
 
-open my $LOG, '>', $logfile or die "Cannot open log file $logfile: $!";
-
-output($LOG, "=" x 70);
-output($LOG, "Syslog Buffer Analysis Report");
-output($LOG, "Generated: " . strftime("%Y-%m-%d %H:%M:%S", localtime));
-output($LOG, "Minimum severity reported: $min_sev ($severity_names[$min_sev])");
-output($LOG, "=" x 70 . "\n");
-
-for my $host (@devices) {
-    analyze_device($host, $username, $password, $enable_pass, $min_sev, $max_lines, $LOG);
+my $out_fh;
+if ($out_file) {
+    open $out_fh, '>', $out_file or die "Cannot open $out_file for writing: $!\n";
 }
 
-close $LOG;
-print "\nReport written to: $logfile\n";
+my %patterns = (
+    AUTH_FAIL    => qr/LOGIN_FAILED|Authentication failed|Bad passwords|%SEC_LOGIN-[45]-LOGIN_FAILED/i,
+    ACL_DENY     => qr/%SEC-6-IPACCESSLOG|%SEC-6-IPACCESSLOGP|list \S+ denied/i,
+    PORT_SEC     => qr/%PORT_SECURITY-2-PSECURE_VIOLATION|security violation/i,
+    LOGIN_ANOMALY => qr/%SYS-5-CONFIG_I|%AAA-[345]-|%SSH-[34]-/i,
+);
 
-# -----------------------------------------------------------------------------
-sub analyze_device {
-    my ($host, $user, $pass, $enable, $min_sev, $max_lines, $log) = @_;
+sub emit {
+    my ($line) = @_;
+    print $line;
+    print $out_fh $line if $out_fh;
+}
 
-    output($log, "\n" . "-" x 70);
-    output($log, "Device: $host");
-    output($log, "-" x 70);
+for my $target (@targets) {
+    my $stamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    emit("\n=== $target  [$stamp] ===\n");
 
-    my $ssh;
-    eval {
-        $ssh = Net::SSH::Expect->new(
-            host        => $host,
-            user        => $user,
-            password    => $pass,
-            raw_pty     => 1,
-            timeout     => 20,
-        );
-        $ssh->login();
-    };
-    if ($@ || !$ssh) {
-        output($log, "ERROR: Connection failed to $host: $@");
-        return;
+    my $ssh = Net::SSH::Expect->new(
+        host        => $target,
+        user        => $user,
+        password    => $pass,
+        raw_pty     => 1,
+        timeout     => $timeout,
+    );
+
+    unless (eval { $ssh->login() }) {
+        emit("  [ERROR] Connection/auth failed: $@\n");
+        next;
     }
 
-    # Enter enable mode if password provided
-    if ($enable) {
-        $ssh->send("enable");
-        my $result = $ssh->waitfor('Password:', 10);
-        if ($result) {
-            $ssh->send($enable);
-            $ssh->waitfor('[#>]', 10);
-        }
-    }
+    $ssh->send('terminal length 0');
+    $ssh->waitfor('\$|#|>', 5);
 
-    # Disable paging and get hostname
-    $ssh->exec("terminal length 0");
-    my $hostname_out = $ssh->exec("show version | include uptime");
-    my $hostname = ($hostname_out =~ /^(\S+)\s+uptime/m) ? $1 : $host;
+    $ssh->send("show logging last $last_lines");
+    my $raw = $ssh->waitfor('\$|#|>', $timeout) // '';
 
-    output($log, "Hostname: $hostname");
-
-    # Retrieve syslog buffer
-    my $log_output = $ssh->exec("show logging | tail $max_lines");
-    unless ($log_output) {
-        $log_output = $ssh->exec("show logging");
-    }
-
+    $ssh->send('exit');
     $ssh->close();
 
-    # Parse logging configuration header
-    if ($log_output =~ /Syslog logging:\s*(\S+)/i) {
-        output($log, "Syslog state: $1");
-    }
-    if ($log_output =~ /Buffer logging:\s*level (\w+),\s*(\d+) messages logged/i) {
-        output($log, "Buffer level: $1, Messages logged: $2");
-    }
-
-    # Parse individual log entries
-    # Cisco format: *Apr  8 14:23:01.456: %FACILITY-SEV-MNEMONIC: message
-    my %sev_counts = map { $_ => 0 } 0..7;
-    my @flagged;
-
-    while ($log_output =~ /^[*.]?(\w+\s+\d+\s+[\d:]+(?:\.\d+)?(?:\s+\w+)?):?\s+%(\w+)-(\d)-(\w+):\s+(.+)$/mg) {
-        my ($timestamp, $facility, $severity, $mnemonic, $message) = ($1, $2, $3, $4, $5);
-        $sev_counts{$severity}++ if exists $sev_counts{$severity};
-        if ($severity <= $min_sev) {
-            push @flagged, {
-                ts       => $timestamp,
-                facility => $facility,
-                sev      => $severity,
-                mnemonic => $mnemonic,
-                msg      => $message,
-            };
+    my %hits;
+    for my $line (split /\n/, $raw) {
+        for my $cat (keys %patterns) {
+            if ($line =~ $patterns{$cat}) {
+                push @{ $hits{$cat} }, $line;
+                last;
+            }
         }
     }
 
-    # Summary table
-    output($log, "\nSeverity Distribution:");
-    for my $s (0..7) {
-        next unless $sev_counts{$s};
-        my $marker = ($s <= 3) ? " <-- ATTENTION" : "";
-        output($log, sprintf("  %-15s (%-2d): %d entries%s", $severity_names[$s], $s, $sev_counts{$s}, $marker));
+    if (!%hits) {
+        emit("  No security events found in last $last_lines log lines.\n");
+        next;
     }
 
-    # Flagged entries
-    if (@flagged) {
-        output($log, "\nFlagged Entries (severity <= $min_sev):");
-        for my $entry (sort { $a->{sev} <=> $b->{sev} } @flagged) {
-            output($log, sprintf("  [%s] %-8s %s-%d-%s: %s",
-                $entry->{ts}, $entry->{facility}, $entry->{facility},
-                $entry->{sev}, $entry->{mnemonic}, $entry->{msg}));
+    for my $cat (sort keys %hits) {
+        emit(sprintf("  [%s] %d event(s):\n", $cat, scalar @{ $hits{$cat} }));
+        for my $entry (@{ $hits{$cat} }) {
+            $entry =~ s/^\s+|\s+$//g;
+            emit("    $entry\n");
         }
-    } else {
-        output($log, "\nNo entries found at or below severity $min_sev ($severity_names[$min_sev]).");
     }
 }
 
-sub output {
-    my ($fh, $msg) = @_;
-    print "$msg\n";
-    print $fh "$msg\n";
-}
-
-sub prompt_password {
-    my ($prompt) = @_;
-    print $prompt;
-    ReadMode('noecho');
-    my $pw = ReadLine(0);
-    ReadMode('restore');
-    chomp $pw;
-    print "\n";
-    return $pw;
-}
-```
+close $out_fh if $out_fh;
+print "\nDone. Output saved to $out_file\n" if $out_file;
