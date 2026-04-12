@@ -1,163 +1,162 @@
-```perl
 #!/usr/bin/perl
-#
-# interface_errors.pl - Interface Error Counter Audit for Cisco IOS/IOS-XE
-#
-# PURPOSE:
-#   Connects to Cisco network devices via SSH and audits interface error counters.
-#   Flags interfaces exceeding configurable thresholds for CRC errors, input errors,
-#   output drops, and resets. Useful for identifying degraded links, duplex mismatches,
-#   and oversubscribed ports before they become outages.
-#
-# USAGE:
-#   Single device:   ./interface_errors.pl -h 192.168.1.1 -u admin [-p password] [-l logfile]
-#   From file:       ./interface_errors.pl -f devices.txt -u admin [-p password] [-l logfile]
-#   With thresholds: ./interface_errors.pl -h 10.0.0.1 -u admin --crc 50 --drops 100
-#
-# PREREQUISITES:
-#   Perl modules: Net::SSH::Expect, Getopt::Long, POSIX
-#   Install: cpanm Net::SSH::Expect
-#
-# THRESHOLDS (defaults):
-#   CRC errors      >= 10  (indicates physical layer issues, bad cable/SFP)
-#   Input errors    >= 25  (frame errors, giants, runts)
-#   Output drops    >= 50  (interface oversubscription/congestion)
-#   Resets          >= 5   (interface flapping or keepalive failures)
-#
-# NOTES:
-#   - Reads password from NETPASS env var if -p not provided (safer for scripting)
-#   - Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x
-#   - Use 'enable' password via NETENABLE env var if privilege escalation needed
-#
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host_arg, $device_file, $username, $password, $logfile);
-my $crc_thresh   = 10;
-my $err_thresh   = 25;
-my $drop_thresh  = 50;
-my $reset_thresh = 5;
-my $timeout      = 15;
+# =============================================================================
+# spanning_tree_audit.pl
+#
+# Purpose:
+#   Audits Spanning Tree Protocol (STP) topology on Cisco IOS/IOS-XE switches.
+#   Collects root bridge status, port roles/states, and flags non-designated
+#   ports and topology change counts that may indicate instability.
+#
+# Usage:
+#   ./spanning_tree_audit.pl --host <ip|hostname> [--user <username>]
+#                            [--pass <password>] [--vlan <vlan_id>]
+#                            [--file <device_list>] [--log <logfile>]
+#
+# Prerequisites:
+#   - Perl modules: Net::SSH::Expect, Getopt::Long
+#   - SSH access to target device(s)
+#   - User account with at minimum 'show' privilege (level 1)
+#
+# Examples:
+#   ./spanning_tree_audit.pl --host 10.1.1.1 --user neteng --pass s3cr3t
+#   ./spanning_tree_audit.pl --file switches.txt --vlan 100 --log stp_audit.log
+# =============================================================================
+
+my ($opt_host, $opt_user, $opt_pass, $opt_vlan, $opt_file, $opt_log);
+$opt_user = 'admin';
+$opt_vlan = '';
 
 GetOptions(
-    'h|host=s'    => \$host_arg,
-    'f|file=s'    => \$device_file,
-    'u|user=s'    => \$username,
-    'p|pass=s'    => \$password,
-    'l|log=s'     => \$logfile,
-    'crc=i'       => \$crc_thresh,
-    'errors=i'    => \$err_thresh,
-    'drops=i'     => \$drop_thresh,
-    'resets=i'    => \$reset_thresh,
-) or die "Usage: $0 -h <host>|-f <file> -u <user> [-p <pass>] [-l <logfile>]\n";
+    'host=s' => \$opt_host,
+    'user=s' => \$opt_user,
+    'pass=s' => \$opt_pass,
+    'vlan=s' => \$opt_vlan,
+    'file=s' => \$opt_file,
+    'log=s'  => \$opt_log,
+) or die "Usage: $0 --host <host> [--user <u>] [--pass <p>] [--vlan <v>] [--file <f>] [--log <l>]\n";
 
-die "Specify -h <host> or -f <file>\n" unless $host_arg || $device_file;
-die "Specify -u <username>\n"           unless $username;
+unless ($opt_pass) {
+    print "Password: ";
+    system('stty', '-echo');
+    chomp($opt_pass = <STDIN>);
+    system('stty', 'echo');
+    print "\n";
+}
 
-$password //= $ENV{NETPASS} or die "Provide password via -p or NETPASS env var\n";
-
-my @devices = $host_arg ? ($host_arg) : do {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
-};
+my @devices;
+if ($opt_file) {
+    open(my $fh, '<', $opt_file) or die "Cannot open device file '$opt_file': $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        push @devices, $_;
+    }
+    close $fh;
+} elsif ($opt_host) {
+    push @devices, $opt_host;
+} else {
+    die "Must specify --host or --file\n";
+}
 
 my $log_fh;
-if ($logfile) {
-    open $log_fh, '>>', $logfile or die "Cannot open logfile $logfile: $!\n";
+if ($opt_log) {
+    open($log_fh, '>>', $opt_log) or die "Cannot open log file '$opt_log': $!\n";
 }
 
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-output("=" x 70);
-output("Interface Error Audit  |  $timestamp");
-output("Thresholds: CRC>=$crc_thresh  InputErr>=$err_thresh  Drops>=$drop_thresh  Resets>=$reset_thresh");
-output("=" x 70);
-
-for my $host (@devices) {
-    audit_device($host);
-}
-
-close $log_fh if $log_fh;
-
-sub audit_device {
-    my ($host) = @_;
-    output("\n[ $host ]");
-
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host        => $host,
-            user        => $username,
-            password    => $password,
-            raw_pty     => 1,
-            timeout     => $timeout,
-        );
-    };
-    if ($@ || !$ssh) {
-        output("  ERROR: Failed to create SSH session - $@");
-        return;
-    }
-
-    my $login = eval { $ssh->login() };
-    if ($@ || !$login) {
-        output("  ERROR: Authentication failed for $host");
-        return;
-    }
-
-    # Disable paging and get interface counters
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('\$|#|>', 5);
-    $ssh->send("show interfaces");
-    my $output = $ssh->waitfor('\$|#|>', $timeout) // '';
-
-    $ssh->send("exit");
-    $ssh->close();
-
-    parse_and_report($host, $output);
-}
-
-sub parse_and_report {
-    my ($host, $raw) = @_;
-    my $found_issues = 0;
-    my $current_intf = '';
-
-    my (%crc, %input_err, %output_drop, %resets, %intf_line);
-
-    for my $line (split /\n/, $raw) {
-        if ($line =~ /^(\S+(?:Ethernet|Serial|Tunnel|Loopback|Vlan)\S*)\s+is\s+(\S+.*)/i) {
-            $current_intf    = $1;
-            $intf_line{$current_intf} = "  $1: $2";
-        }
-        next unless $current_intf;
-
-        $crc{$current_intf}        = $1 if $line =~ /(\d+) CRC/;
-        $input_err{$current_intf}  = $1 if $line =~ /(\d+) input errors/;
-        $output_drop{$current_intf}= $1 if $line =~ /(\d+) output drops/;
-        $resets{$current_intf}     = $1 if $line =~ /(\d+) interface resets/;
-    }
-
-    for my $intf (sort keys %intf_line) {
-        my $c = $crc{$intf}         // 0;
-        my $e = $input_err{$intf}   // 0;
-        my $d = $output_drop{$intf} // 0;
-        my $r = $resets{$intf}      // 0;
-
-        next unless $c >= $crc_thresh || $e >= $err_thresh
-                 || $d >= $drop_thresh || $r >= $reset_thresh;
-
-        output($intf_line{$intf});
-        output("    CRC=$c  InputErr=$e  OutputDrops=$d  Resets=$r");
-        $found_issues = 1;
-    }
-
-    output("  No interfaces exceed thresholds.") unless $found_issues;
-}
+my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
 
 sub output {
     my ($msg) = @_;
-    print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
-```
+
+output("=" x 70 . "\n");
+output("STP Audit Report - $timestamp\n");
+output("=" x 70 . "\n\n");
+
+for my $host (@devices) {
+    output("Host: $host\n");
+    output("-" x 50 . "\n");
+
+    my $ssh = Net::SSH::Expect->new(
+        host        => $host,
+        user        => $opt_user,
+        password    => $opt_pass,
+        raw_pty     => 1,
+        timeout     => 15,
+    );
+
+    my $login_output;
+    eval { $login_output = $ssh->login() };
+    if ($@ || !defined $login_output) {
+        output("  ERROR: SSH login failed - $@\n\n");
+        next;
+    }
+
+    if ($login_output =~ /assword/i) {
+        output("  ERROR: Authentication failed for $host\n\n");
+        next;
+    }
+
+    # Disable paging
+    $ssh->send("terminal length 0");
+    $ssh->waitfor('\$\s*#|\>\s*$', 5);
+
+    my $stp_cmd = $opt_vlan ? "show spanning-tree vlan $opt_vlan" : "show spanning-tree summary";
+    $ssh->send($stp_cmd);
+    my $stp_output = $ssh->waitfor('#\s*$', 20);
+
+    unless (defined $stp_output && $stp_output =~ /\w/) {
+        output("  ERROR: No output received from '$stp_cmd'\n\n");
+        $ssh->close();
+        next;
+    }
+
+    # Parse root bridge status
+    if ($stp_output =~ /This bridge is the root/i) {
+        output("  Root Bridge: YES (this device is root)\n");
+    } elsif ($stp_output =~ /Root ID.*?Address\s+([0-9a-f.]+)/si) {
+        output("  Root Bridge: NO  (Root MAC: $1)\n");
+    }
+
+    # Parse topology changes
+    if ($stp_output =~ /topology change count\s+(\d+)/i) {
+        my $tc = $1;
+        my $flag = $tc > 100 ? "  *** HIGH - possible instability ***" : "";
+        output("  Topology Changes: $tc$flag\n");
+    }
+
+    # Parse port roles and flag non-forwarding ports
+    my @blocking;
+    my @root_ports;
+    my @desg_ports;
+    while ($stp_output =~ /(\S+)\s+(Root|Desg|Altn|Back|BLK|FWD|LIS|LRN)\s+(FWD|BLK|LIS|LRN)/gi) {
+        my ($port, $role, $state) = ($1, $2, $3);
+        push @blocking, $port  if $state =~ /BLK/i || $role =~ /Altn|Back/i;
+        push @root_ports, $port if $role =~ /Root/i;
+        push @desg_ports, $port if $role =~ /Desg/i;
+    }
+
+    output("  Root Ports:        " . (@root_ports ? join(', ', @root_ports) : 'none') . "\n");
+    output("  Designated Ports:  " . (@desg_ports ? join(', ', @desg_ports) : 'none') . "\n");
+    output("  Blocking/Alternate: " . (@blocking ? join(', ', @blocking) : 'none') . "\n");
+
+    # Check for RSTP/PVST mode
+    if ($stp_output =~ /(rapid-pvst|rstp|mstp|pvst)/i) {
+        output("  STP Mode: $1\n");
+    }
+
+    $ssh->send("exit");
+    $ssh->close();
+    output("\n");
+}
+
+output("Audit complete.\n");
+close $log_fh if $log_fh;
