@@ -1,28 +1,28 @@
 ```perl
 #!/usr/bin/perl
-# =============================================================================
-# cdp_lldp_neighbors.pl - CDP/LLDP Neighbor Discovery and Topology Mapper
-# =============================================================================
+#
+# cdp_lldp_neighbors.pl - CDP/LLDP Neighbor Discovery Tool
+#
 # Purpose:
-#   Connects to one or more network devices via SSH and collects CDP and LLDP
-#   neighbor information. Useful for topology discovery, documentation, and
-#   verifying adjacencies after network changes.
+#   Connects to Cisco IOS/IOS-XE devices via SSH and collects CDP and LLDP
+#   neighbor information. Useful for topology documentation, verifying cabling,
+#   and discovering connected devices during audits or incident response.
 #
 # Usage:
-#   Single device:  ./cdp_lldp_neighbors.pl -h 192.168.1.1 -u admin -p secret
-#   Device list:    ./cdp_lldp_neighbors.pl -f devices.txt -u admin -p secret
-#   With log file:  ./cdp_lldp_neighbors.pl -h 10.0.0.1 -u admin -p secret -l neighbors.log
-#   Enable mode:    ./cdp_lldp_neighbors.pl -h 10.0.0.1 -u admin -p cisco -e enablepass
+#   Single device:  ./cdp_lldp_neighbors.pl -h 192.168.1.1
+#   Device file:    ./cdp_lldp_neighbors.pl -f devices.txt
+#   With logging:   ./cdp_lldp_neighbors.pl -f devices.txt -l neighbors.log
+#   Custom creds:   ./cdp_lldp_neighbors.pl -h 192.168.1.1 -u admin -p secret
 #
 # Prerequisites:
-#   cpan install Net::SSH::Expect
-#   SSH access to target devices (Cisco IOS/IOS-XE/NX-OS)
-#   CDP and/or LLDP enabled on target devices
+#   cpan Net::SSH::Expect
+#   SSH access enabled on target devices
+#   Account with 'show cdp neighbors detail' and 'show lldp neighbors detail' privilege
 #
-# Device file format (one per line, lines starting with # ignored):
+# Device file format (one per line, lines starting with # are ignored):
 #   192.168.1.1
-#   router-core-01.example.com
-# =============================================================================
+#   switch-core-01.example.com
+#
 
 use strict;
 use warnings;
@@ -30,30 +30,28 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $file, $username, $password, $enable_pass, $logfile, $help);
-my $timeout = 30;
+my ($host_arg, $device_file, $log_file);
+my $username = $ENV{NET_USER} // 'admin';
+my $password = $ENV{NET_PASS} // 'cisco';
+my $timeout  = 20;
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'f|file=s'     => \$file,
+    'h|host=s'     => \$host_arg,
+    'f|file=s'     => \$device_file,
+    'l|log=s'      => \$log_file,
     'u|user=s'     => \$username,
     'p|pass=s'     => \$password,
-    'e|enable=s'   => \$enable_pass,
-    'l|log=s'      => \$logfile,
     't|timeout=i'  => \$timeout,
-    'help'         => \$help,
-) or die "Error parsing options. Use --help for usage.\n";
+) or die "Usage: $0 [-h host] [-f file] [-l logfile] [-u user] [-p pass]\n";
 
-if ($help || (!$host && !$file) || !$username || !$password) {
-    print "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-e <enable>] [-l <logfile>] [-t <timeout>]\n";
-    exit 1;
-}
+die "Specify -h <host> or -f <file>\n" unless $host_arg || $device_file;
 
 my @devices;
-if ($host) {
-    push @devices, $host;
-} elsif ($file) {
-    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
+if ($host_arg) {
+    push @devices, $host_arg;
+}
+if ($device_file) {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
     while (<$fh>) {
         chomp;
         next if /^\s*$/ || /^\s*#/;
@@ -62,138 +60,102 @@ if ($host) {
     close $fh;
 }
 
-die "No devices to process.\n" unless @devices;
-
 my $log_fh;
-if ($logfile) {
-    open($log_fh, '>', $logfile) or die "Cannot open log file '$logfile': $!\n";
+if ($log_file) {
+    open($log_fh, '>', $log_file) or die "Cannot open log $log_file: $!\n";
 }
 
-my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
-output("=" x 70);
-output("CDP/LLDP Neighbor Discovery Report");
-output("Generated: $timestamp");
-output("=" x 70);
+sub logprint {
+    my $msg = shift;
+    print $msg;
+    print $log_fh $msg if $log_fh;
+}
+
+my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+logprint("=" x 70 . "\n");
+logprint("CDP/LLDP Neighbor Discovery  |  $timestamp\n");
+logprint("=" x 70 . "\n\n");
 
 for my $device (@devices) {
-    output("\n[*] Connecting to $device...");
-    eval { process_device($device) };
-    if ($@) {
-        output("[!] ERROR on $device: $@");
-    }
-}
-
-output("\n" . "=" x 70);
-output("Scan complete.");
-close $log_fh if $log_fh;
-
-sub process_device {
-    my ($dev) = @_;
+    logprint("Device: $device\n");
+    logprint("-" x 50 . "\n");
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $dev,
+        host        => $device,
         user        => $username,
-        password    => $password,
+        password     => $password,
         raw_pty     => 1,
         timeout     => $timeout,
     );
 
-    my $login = eval { $ssh->login() };
-    if ($@ || !defined $login) {
-        die "SSH login failed (check credentials or reachability)\n";
+    my $login_output;
+    eval { $login_output = $ssh->login() };
+    if ($@ || !defined $login_output) {
+        logprint("  [ERROR] SSH connection failed: " . ($@ || 'unknown error') . "\n\n");
+        next;
+    }
+    if ($login_output =~ /[Pp]assword/i || $login_output =~ /[Aa]uth/i) {
+        logprint("  [ERROR] Authentication failed for $device\n\n");
+        next;
     }
 
-    if ($login =~ /Password:\s*$/i || $login =~ /authentication failed/i) {
-        die "Authentication failed\n";
-    }
-
-    # Disable pagination
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('\$\s*$|#\s*$|>\s*$', $timeout);
-
-    # Enter enable mode if password provided
-    if ($enable_pass && $login =~ />\s*$/) {
-        $ssh->send("enable\n");
-        $ssh->waitfor('Password:', 5);
-        $ssh->send("$enable_pass\n");
-        my $resp = $ssh->waitfor('#\s*$', 5);
-        die "Enable authentication failed\n" unless defined $resp;
-    }
-
-    output("\n--- Device: $dev ---");
+    # Disable paging
+    $ssh->exec("terminal length 0");
 
     # Collect CDP neighbors
-    $ssh->send("show cdp neighbors detail\n");
-    my $cdp_output = $ssh->waitfor('#\s*$|>\s*$', $timeout);
-    parse_cdp($cdp_output) if defined $cdp_output;
+    logprint("  CDP Neighbors:\n");
+    my $cdp_output = $ssh->exec("show cdp neighbors detail");
+    if (!defined $cdp_output || $cdp_output =~ /invalid|error|not enabled/i) {
+        logprint("    CDP not available or not enabled\n");
+    } else {
+        my @cdp_entries = split(/[-]{10,}/, $cdp_output);
+        my $found = 0;
+        for my $entry (@cdp_entries) {
+            next unless $entry =~ /Device ID/i;
+            $found = 1;
+            my ($device_id)   = $entry =~ /Device ID:\s*(\S+)/i;
+            my ($ip_addr)     = $entry =~ /IP address:\s*(\S+)/i;
+            my ($platform)    = $entry =~ /Platform:\s*([^,]+)/i;
+            my ($local_intf)  = $entry =~ /Interface:\s*(\S+)/i;
+            my ($remote_intf) = $entry =~ /Port ID.*?:\s*(\S+)/i;
+            logprint(sprintf("    %-30s %-16s %-20s %s -> %s\n",
+                $device_id // 'unknown',
+                $ip_addr   // 'no-ip',
+                $platform  // 'unknown',
+                $local_intf  // '?',
+                $remote_intf // '?'));
+        }
+        logprint("    No CDP neighbors found\n") unless $found;
+    }
 
     # Collect LLDP neighbors
-    $ssh->send("show lldp neighbors detail\n");
-    my $lldp_output = $ssh->waitfor('#\s*$|>\s*$', $timeout);
-    parse_lldp($lldp_output) if defined $lldp_output;
+    logprint("  LLDP Neighbors:\n");
+    my $lldp_output = $ssh->exec("show lldp neighbors detail");
+    if (!defined $lldp_output || $lldp_output =~ /invalid|error|not enabled/i) {
+        logprint("    LLDP not available or not enabled\n");
+    } else {
+        my @lldp_entries = split(/[-]{10,}/, $lldp_output);
+        my $found = 0;
+        for my $entry (@lldp_entries) {
+            next unless $entry =~ /System Name/i;
+            $found = 1;
+            my ($sys_name)   = $entry =~ /System Name:\s*(\S+)/i;
+            my ($mgmt_ip)    = $entry =~ /Management Addresses.*?IP:\s*(\S+)/si;
+            my ($local_intf) = $entry =~ /Local Intf:\s*(\S+)/i;
+            my ($port_id)    = $entry =~ /Port id:\s*(\S+)/i;
+            logprint(sprintf("    %-30s %-16s %s -> %s\n",
+                $sys_name   // 'unknown',
+                $mgmt_ip    // 'no-ip',
+                $local_intf // '?',
+                $port_id    // '?'));
+        }
+        logprint("    No LLDP neighbors found\n") unless $found;
+    }
 
-    $ssh->send("exit\n");
     $ssh->close();
+    logprint("\n");
 }
 
-sub parse_cdp {
-    my ($raw) = @_;
-    my @entries = split(/[-]{5,}/, $raw);
-    my $count = 0;
-
-    for my $entry (@entries) {
-        next unless $entry =~ /Device ID/i;
-        my %nbr;
-        ($nbr{device_id})   = $entry =~ /Device ID:\s*(\S+)/i;
-        ($nbr{platform})    = $entry =~ /Platform:\s*([^,]+)/i;
-        ($nbr{local_intf})  = $entry =~ /Interface:\s*(\S+)/i;
-        ($nbr{remote_intf}) = $entry =~ /Port ID \(outgoing port\):\s*(\S+)/i;
-        ($nbr{ip_addr})     = $entry =~ /IP(?:v4)? address:\s*(\S+)/i;
-        ($nbr{version})     = $entry =~ /Version\s*:\s*\n\s*(.+)/i;
-
-        next unless $nbr{device_id};
-        $count++;
-        output(sprintf("  [CDP] %-30s  local:%-20s remote:%-20s ip:%s",
-            $nbr{device_id} // 'unknown',
-            $nbr{local_intf} // '?',
-            $nbr{remote_intf} // '?',
-            $nbr{ip_addr} // 'n/a'));
-        output(sprintf("        Platform: %s", $nbr{platform} // 'unknown')) if $nbr{platform};
-    }
-    output("  [CDP] No neighbors found.") if $count == 0 && $raw !~ /Total cdp entries/i;
-    output("  [CDP] CDP not enabled or no neighbors.") if $raw =~ /not enabled|CDP is not|% Invalid/i;
-}
-
-sub parse_lldp {
-    my ($raw) = @_;
-    return if $raw =~ /not enabled|LLDP is not|% Invalid|% LLDP/i;
-
-    my @entries = split(/[-]{5,}/, $raw);
-    my $count = 0;
-
-    for my $entry (@entries) {
-        next unless $entry =~ /System Name|Chassis id|Port Description/i;
-        my %nbr;
-        ($nbr{system_name}) = $entry =~ /System Name:\s*(\S+)/i;
-        ($nbr{chassis_id})  = $entry =~ /Chassis id:\s*(\S+)/i;
-        ($nbr{local_intf})  = $entry =~ /Local Intf:\s*(\S+)/i;
-        ($nbr{port_id})     = $entry =~ /Port id:\s*(\S+)/i;
-        ($nbr{mgmt_addr})   = $entry =~ /Management Addresses[^:]*:\s*\n\s*IP:\s*(\S+)/i;
-
-        next unless ($nbr{system_name} || $nbr{chassis_id});
-        $count++;
-        output(sprintf("  [LLDP] %-30s  local:%-20s remote:%-20s ip:%s",
-            $nbr{system_name} // $nbr{chassis_id} // 'unknown',
-            $nbr{local_intf} // '?',
-            $nbr{port_id} // '?',
-            $nbr{mgmt_addr} // 'n/a'));
-    }
-    output("  [LLDP] No LLDP neighbors found.") if $count == 0;
-}
-
-sub output {
-    my ($line) = @_;
-    print "$line\n";
-    print $log_fh "$line\n" if $log_fh;
-}
+logprint("Discovery complete.\n");
+close $log_fh if $log_fh;
 ```
