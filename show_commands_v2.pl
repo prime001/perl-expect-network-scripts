@@ -1,172 +1,167 @@
 #!/usr/bin/perl
-#
-# cdp_lldp_neighbors.pl - Network Topology Discovery via CDP/LLDP
-#
+# =============================================================================
+# qos_stats.pl - QoS Policy-Map Statistics Collector
+# =============================================================================
 # Purpose:
-#   Collects CDP and LLDP neighbor information from Cisco IOS/NX-OS devices
-#   to aid in network topology mapping and documentation. Parses neighbor
-#   details including device ID, local/remote interface, platform, and
-#   IP address for each discovered neighbor.
+#   Connects to one or more Cisco IOS/IOS-XE devices via SSH and collects
+#   QoS policy-map interface statistics. Parses class-map drop counters and
+#   queue depth to surface active congestion and policy violations. Useful
+#   for capacity planning, SLA verification, and performance troubleshooting.
 #
 # Usage:
-#   Single device:  ./cdp_lldp_neighbors.pl -h 192.168.1.1 [-u admin] [-p password] [-l logfile]
-#   Device file:    ./cdp_lldp_neighbors.pl -f devices.txt [-u admin] [-p password] [-l logfile]
+#   Single device:   perl qos_stats.pl -h 192.168.1.1 -u admin -p secret
+#   Device list:     perl qos_stats.pl -f devices.txt -u admin -p secret
+#   With log file:   perl qos_stats.pl -h 192.168.1.1 -u admin -p secret -l qos.log
+#   Drop threshold:  perl qos_stats.pl -h 192.168.1.1 -u admin -p secret -d 1000
 #
 # Prerequisites:
-#   cpan install Net::SSH::Expect
-#   Devices must have 'cdp run' and/or 'lldp run' configured
-#   SSH must be enabled on target devices
+#   cpan install Net::SSH::Expect Getopt::Long
 #
-# Output:
-#   Tabular neighbor summary per device, optionally written to log file
-#
-# Author: Network Engineering
-# Version: 1.0
+# Device file format: one IP/hostname per line, lines starting with # ignored
+# =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Std;
+use Getopt::Long;
 use POSIX qw(strftime);
 
-our %opts;
-getopts('h:f:u:p:l:', \%opts);
+my ($host, $device_file, $username, $password, $logfile, $drop_threshold);
+my $timeout = 30;
+$drop_threshold = 0;
 
-my $username = $opts{u} || $ENV{NET_USER} || 'admin';
-my $password = $opts{p} || $ENV{NET_PASS} || die "Password required: use -p or set NET_PASS\n";
-my $logfile  = $opts{l};
+GetOptions(
+    'h|host=s'      => \$host,
+    'f|file=s'      => \$device_file,
+    'u|user=s'      => \$username,
+    'p|pass=s'      => \$password,
+    'l|log=s'       => \$logfile,
+    'd|drops=i'     => \$drop_threshold,
+    't|timeout=i'   => \$timeout,
+) or die "Usage: $0 -h host|-f file -u user -p pass [-l logfile] [-d drop_threshold]\n";
+
+die "Must specify -h host or -f device_file\n" unless $host || $device_file;
+die "Must specify -u username\n" unless $username;
+die "Must specify -p password\n" unless $password;
+
 my @devices;
-
-if ($opts{h}) {
-    push @devices, $opts{h};
-} elsif ($opts{f}) {
-    open(my $fh, '<', $opts{f}) or die "Cannot open device file '$opts{f}': $!\n";
+if ($device_file) {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
     while (<$fh>) {
         chomp;
-        s/#.*//;
-        s/^\s+|\s+$//g;
-        push @devices, $_ if $_;
+        next if /^\s*#/ || /^\s*$/;
+        push @devices, $_;
     }
     close $fh;
 } else {
-    die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-l logfile]\n";
+    @devices = ($host);
 }
 
 my $log_fh;
 if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log file '$logfile': $!\n";
+    open($log_fh, '>>', $logfile) or die "Cannot open logfile $logfile: $!\n";
 }
 
 my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
 output("=" x 70);
-output("CDP/LLDP Neighbor Discovery  --  $timestamp");
+output("QoS Policy-Map Statistics Report - $timestamp");
+output("Drop threshold filter: $drop_threshold packets");
 output("=" x 70);
 
 for my $device (@devices) {
-    output("\n>>> Device: $device");
-    output("-" x 50);
-
-    my $ssh = Net::SSH::Expect->new(
-        host        => $device,
-        user        => $username,
-        password     => $password,
-        raw_pty     => 1,
-        timeout     => 15,
-    );
-
-    eval {
-        my $login = $ssh->login();
-        unless ($login =~ /[>#]/) {
-            die "Authentication failed or unexpected prompt\n";
-        }
-
-        $ssh->send("terminal length 0");
-        $ssh->waitfor('[>#]', 5);
-
-        # Try CDP first
-        $ssh->send("show cdp neighbors detail");
-        my $cdp_out = $ssh->waitfor('[>#]', 30);
-
-        if ($cdp_out && $cdp_out !~ /CDP is not enabled|Invalid input/) {
-            output("  [CDP Neighbors]");
-            parse_cdp($cdp_out);
-        }
-
-        # Try LLDP
-        $ssh->send("show lldp neighbors detail");
-        my $lldp_out = $ssh->waitfor('[>#]', 30);
-
-        if ($lldp_out && $lldp_out !~ /LLDP is not enabled|Invalid input/) {
-            output("  [LLDP Neighbors]");
-            parse_lldp($lldp_out);
-        }
-
-        $ssh->send("exit");
-        $ssh->close();
-    };
+    output("\n--- Device: $device ---");
+    eval { collect_qos_stats($device) };
     if ($@) {
         my $err = $@;
-        $err =~ s/\n.*//s;
-        output("  ERROR: $err");
+        $err =~ s/\n/ /g;
+        output("ERROR [$device]: $err");
     }
 }
 
-output("\nDone.");
 close $log_fh if $log_fh;
+exit 0;
 
-sub parse_cdp {
-    my ($output) = @_;
-    my ($device_id, $local_intf, $remote_intf, $platform, $ip);
-    my $found = 0;
+sub collect_qos_stats {
+    my ($target) = @_;
 
-    for my $line (split /\n/, $output) {
-        if ($line =~ /^Device ID:\s*(.+)/)          { $device_id   = $1; $found = 1; }
-        if ($line =~ /Interface:\s*([\w\/\.]+)/i)    { $local_intf  = $1; }
-        if ($line =~ /Port ID.*?:\s*([\w\/\.]+)/i)   { $remote_intf = $1; }
-        if ($line =~ /Platform:\s*([^,]+)/)          { $platform    = $1; }
-        if ($line =~ /IP address:\s*([\d\.]+)/i)     { $ip          = $1; }
+    my $ssh = Net::SSH::Expect->new(
+        host        => $target,
+        user        => $username,
+        password    => $password,
+        raw_pty     => 1,
+        timeout     => $timeout,
+    );
 
-        if ($line =~ /^-{3,}/ && $found) {
-            output(sprintf("    %-30s %-18s %-18s %-20s %s",
-                $device_id // 'unknown',
-                $local_intf // '-',
-                $remote_intf // '-',
-                $platform // '-',
-                $ip // '-'));
-            ($device_id, $local_intf, $remote_intf, $platform, $ip) = (undef) x 5;
-            $found = 0;
-        }
+    my $login = eval { $ssh->login() };
+    if (!$login || $login =~ /[Pp]assword|[Dd]enied|[Ff]ailed/) {
+        die "Authentication failed for $target";
     }
-    if ($found && $device_id) {
-        output(sprintf("    %-30s %-18s %-18s %-20s %s",
-            $device_id, $local_intf // '-', $remote_intf // '-',
-            $platform // '-', $ip // '-'));
+
+    $ssh->send("terminal length 0");
+    $ssh->waitfor('>\s*$|#\s*$', 5);
+
+    $ssh->send("show policy-map interface");
+    my $raw = $ssh->waitfor('#\s*$', $timeout);
+
+    $ssh->send("exit");
+    $ssh->close();
+
+    if (!$raw || $raw =~ /Invalid input|% Error/) {
+        output("  No QoS policy-maps applied or command unsupported");
+        return;
     }
+
+    parse_policymap_output($target, $raw);
 }
 
-sub parse_lldp {
-    my ($output) = @_;
-    my ($sys_name, $local_intf, $remote_intf, $sys_desc, $mgmt_ip);
-    my $found = 0;
+sub parse_policymap_output {
+    my ($target, $raw) = @_;
 
-    for my $line (split /\n/, $output) {
-        if ($line =~ /^Local Intf:\s*([\w\/\.]+)/i)       { $local_intf  = $1; $found = 1; }
-        if ($line =~ /System Name:\s*(.+)/i)               { $sys_name    = $1; }
-        if ($line =~ /Port id:\s*([\w\/\.]+)/i)            { $remote_intf = $1; }
-        if ($line =~ /System Description:\s*(.+)/i)        { $sys_desc    = $1; }
-        if ($line =~ /Management Addresses.*?([\d\.]+)/i)  { $mgmt_ip     = $1; }
+    my ($current_iface, $current_policy, $current_class);
+    my %flagged;
+    my $found_any = 0;
 
-        if ($line =~ /^-{3,}/ && $found) {
-            output(sprintf("    %-30s %-18s %-18s %-20s %s",
-                $sys_name // 'unknown',
-                $local_intf // '-',
-                $remote_intf // '-',
-                $sys_desc // '-',
-                $mgmt_ip // '-'));
-            ($sys_name, $local_intf, $remote_intf, $sys_desc, $mgmt_ip) = (undef) x 5;
-            $found = 0;
+    for my $line (split /\n/, $raw) {
+        $line =~ s/\r//g;
+
+        if ($line =~ /^([A-Za-z][A-Za-z0-9\/\.\-]+)\s*$/) {
+            $current_iface = $1;
+        }
+
+        if ($line =~ /Service-policy\s+(?:output|input):\s+(\S+)/) {
+            $current_policy = $1;
+            $found_any = 1;
+        }
+
+        if ($line =~ /Class-map:\s+(\S+)/) {
+            $current_class = $1;
+        }
+
+        if ($line =~ /(\d+)\s+packets.*?(\d+)\s+(?:bytes\s+)?(?:dropped|tail drops)/) {
+            my ($pkts, $bytes) = ($1, $2);
+            if ($pkts > $drop_threshold && $current_class && $current_policy) {
+                my $key = "$current_iface/$current_policy/$current_class";
+                unless ($flagged{$key}++) {
+                    output(sprintf("  DROPS  iface=%-25s policy=%-20s class=%-20s drops=%s pkts",
+                        $current_iface // 'unknown',
+                        $current_policy // 'unknown',
+                        $current_class,
+                        $pkts));
+                }
+            }
+        }
+
+        if ($line =~ /(\d+)\s+packets output.*?(\d+)\s+drops/) {
+            my ($out, $drops) = ($1, $2);
+            if ($drops > $drop_threshold && $current_class) {
+                output(sprintf("  QUEUE  iface=%-25s class=%-20s output=%s drops=%s",
+                    $current_iface // 'unknown', $current_class, $out, $drops));
+            }
         }
     }
+
+    output("  No policy-maps with drops above threshold ($drop_threshold)") unless %flagged;
+    output("  No QoS policy-maps found on this device") unless $found_any;
 }
 
 sub output {
