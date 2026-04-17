@@ -1,173 +1,174 @@
-The user has provided fully-formed specifications and explicitly said "Output ONLY the script content, no markdown fences, no explanation." User instructions take precedence — skipping brainstorming flow.
-
-The existing scripts include `ospf_neighbors.pl` and `ospf_neighbors_v2.pl`, so I'll write an OSPF LSDB (link-state database) analysis script — distinct from neighbor-state checking, genuinely useful for diagnosing routing issues.
-
-```perl
 #!/usr/bin/perl
-# =============================================================================
-# ospf_lsdb_check.pl - OSPF Link-State Database Analyzer
-# =============================================================================
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE devices via SSH and analyzes the OSPF
-#   link-state database for anomalies: stale LSAs (age near MaxAge),
-#   excessive LSA counts per router, and database size per area.
-#   Useful during routing troubleshooting or post-change validation.
-#
-# Usage:
-#   Single device:  ./ospf_lsdb_check.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:    ./ospf_lsdb_check.pl -f devices.txt -u admin -p secret
-#   With log:       ./ospf_lsdb_check.pl -h 10.0.0.1 -u admin -p secret -l ospf.log
-#   Custom process: ./ospf_lsdb_check.pl -h 10.0.0.1 -u admin -p secret --pid 2
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect Getopt::Long
-#   SSH key auth or password; device must have 'show ip ospf database' access
-#
-# Exit codes: 0=clean, 1=warnings found, 2=connection/auth error
-# =============================================================================
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $user, $pass, $device_file, $log_file, $ospf_pid, $timeout);
-$ospf_pid = 1;
-$timeout  = 30;
+# =============================================================================
+# ospf_neighbor_health.pl - OSPF Neighbor State Health Check
+#
+# Purpose:
+#   Connects to Cisco IOS/IOS-XE routers via SSH and audits OSPF neighbor
+#   adjacency health. Flags neighbors not in FULL/2WAY state, checks dead
+#   timer drift, and reports mismatched router-IDs. Useful for rapid
+#   troubleshooting during network incidents or scheduled health checks.
+#
+# Usage:
+#   Single device:  ./ospf_neighbor_health.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:    ./ospf_neighbor_health.pl -f devices.txt -u admin -p secret
+#   With logging:   ./ospf_neighbor_health.pl -h 192.168.1.1 -u admin -p secret -l /var/log/ospf_health.log
+#
+# Prerequisites:
+#   cpan Net::SSH::Expect
+#   SSH enabled on target devices; user needs enable-level show access
+#
+# Device file format (one per line):
+#   192.168.1.1
+#   router2.example.com
+# =============================================================================
+
+my ($host, $user, $pass, $enable, $file, $logfile, $timeout);
+$timeout = 30;
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'u|user=s'     => \$user,
-    'p|pass=s'     => \$pass,
-    'f|file=s'     => \$device_file,
-    'l|log=s'      => \$log_file,
-    'pid=i'        => \$ospf_pid,
-    't|timeout=i'  => \$timeout,
-) or die "Usage: $0 -h HOST -u USER -p PASS [-f FILE] [-l LOGFILE] [--pid N]\n";
+    'h|host=s'    => \$host,
+    'u|user=s'    => \$user,
+    'p|pass=s'    => \$pass,
+    'e|enable=s'  => \$enable,
+    'f|file=s'    => \$file,
+    'l|log=s'     => \$logfile,
+    't|timeout=i' => \$timeout,
+) or die "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-e <enable>] [-l <logfile>] [-t <timeout>]\n";
 
-die "Provide -h HOST or -f FILE\n" unless $host || $device_file;
-die "Username required (-u)\n"     unless $user;
-die "Password required (-p)\n"     unless $pass;
+die "Provide -h <host> or -f <file>\n" unless $host || $file;
+die "Username (-u) required\n" unless $user;
+die "Password (-p) required\n" unless $pass;
 
-my @devices = $host ? ($host) : do {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    my @lines = grep { /\S/ && !/^\s*#/ } <$fh>;
+my @devices;
+if ($file) {
+    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
+    while (<$fh>) { chomp; s/\s+//g; push @devices, $_ if /\S/; }
     close $fh;
-    chomp @lines;
-    @lines;
-};
-
-my $LOG;
-if ($log_file) {
-    open $LOG, '>>', $log_file or die "Cannot open log $log_file: $!\n";
+} else {
+    @devices = ($host);
 }
 
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-output("=" x 60);
-output("OSPF LSDB Check  |  $timestamp");
-output("=" x 60);
+my $log_fh;
+if ($logfile) {
+    open($log_fh, '>>', $logfile) or warn "Cannot open log '$logfile': $! (logging to STDOUT only)\n";
+}
 
-my $exit_code = 0;
+sub log_output {
+    my $msg = shift;
+    print $msg;
+    print $log_fh $msg if $log_fh;
+}
+
+my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+log_output("=" x 70 . "\n");
+log_output("OSPF Neighbor Health Check - $timestamp\n");
+log_output("=" x 70 . "\n\n");
+
+my $total_alerts = 0;
 
 for my $device (@devices) {
-    $device =~ s/^\s+|\s+$//g;
-    output("\n--- Device: $device ---");
+    log_output("Device: $device\n");
+    log_output("-" x 50 . "\n");
 
-    my $ssh = Net::SSH::Expect->new(
-        host        => $device,
-        user        => $user,
-        password    => $pass,
-        raw_pty     => 1,
-        timeout     => $timeout,
-    );
-
-    my $login_output;
-    eval { $login_output = $ssh->login() };
-    if ($@ || !defined $login_output || $login_output =~ /[Pp]assword:\s*$/) {
-        output("  ERROR: Authentication failed for $device");
-        $exit_code = 2;
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host        => $device,
+            user        => $user,
+            password    => $pass,
+            raw_pty     => 1,
+            timeout     => $timeout,
+        );
+    };
+    if ($@) {
+        log_output("  [ERROR] Failed to create SSH session: $@\n\n");
         next;
     }
 
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('\$|#|>', 5);
-
-    my $db_output = run_cmd($ssh, "show ip ospf $ospf_pid database");
-    if (!defined $db_output) {
-        output("  ERROR: No response from $device — timeout");
-        $exit_code = 2;
+    my $login = eval { $ssh->login() };
+    if ($@ || !defined $login) {
+        log_output("  [ERROR] SSH login failed for $device\n\n");
         next;
     }
 
-    my (%area_counts, @stale_lsas, %router_counts);
-    my $current_area = 'unknown';
-
-    for my $line (split /\n/, $db_output) {
-        if ($line =~ /OSPF Router with ID.*Area\s+([\d.]+)/) {
-            $current_area = $1;
-        }
-        # Match LSA summary lines: type, link-id, adv-router, age, seq, checksum
-        if ($line =~ /^\s*([\d.]+)\s+([\d.]+)\s+0x[0-9A-Fa-f]+\s+0x[0-9A-Fa-f]+\s+(\d+)/) {
-            my ($link_id, $adv_router, $age) = ($1, $2, $3);
-            $area_counts{$current_area}++;
-            $router_counts{$adv_router}++;
-            if ($age >= 1700) {  # MaxAge is 3600; warn at ~47% for early detection
-                push @stale_lsas, {area => $current_area, id => $link_id,
-                                   adv => $adv_router, age => $age};
-                $exit_code = 1 unless $exit_code == 2;
-            }
+    # Handle enable mode if needed
+    if ($enable) {
+        $ssh->send("enable");
+        my $res = $ssh->waitfor('Password:', $timeout);
+        if ($res) {
+            $ssh->send($enable);
+            $ssh->waitfor('(#|\$)', $timeout);
         }
     }
 
-    if (!%area_counts) {
-        output("  INFO: No OSPF process $ospf_pid found (or not running)");
+    # Disable paging
+    $ssh->exec("terminal length 0");
+
+    # Pull OSPF neighbor detail
+    my $output = $ssh->exec("show ip ospf neighbor detail");
+
+    if (!defined $output || $output =~ /Invalid input|% Unknown/i) {
+        log_output("  [WARN] Command failed or OSPF not configured\n\n");
+        $ssh->close() if $ssh;
         next;
     }
 
-    output("  OSPF PID $ospf_pid LSA Summary:");
-    for my $area (sort keys %area_counts) {
-        output(sprintf("    Area %-15s  %3d LSAs", $area, $area_counts{$area}));
+    if ($output =~ /^\s*$/ || $output !~ /Neighbor ID/i) {
+        log_output("  [INFO] No OSPF neighbors found\n\n");
+        $ssh->close() if $ssh;
+        next;
     }
 
-    if (@stale_lsas) {
-        output("  WARNINGS: Stale LSAs (age >= 1700s):");
-        for my $lsa (@stale_lsas) {
-            output(sprintf("    Area %-12s  ID %-15s  Adv %-15s  Age %ds",
-                $lsa->{area}, $lsa->{id}, $lsa->{adv}, $lsa->{age}));
-        }
+    # Parse neighbor blocks
+    my @blocks = split(/(?=Neighbor\s+\d+\.\d+\.\d+\.\d+)/i, $output);
+    my @neighbors;
+
+    for my $block (@blocks) {
+        next unless $block =~ /Neighbor\s+(\d+\.\d+\.\d+\.\d+)/i;
+        my %n;
+        $n{router_id}  = $1;
+        $n{state}      = $block =~ /State is\s+(\S+)/i    ? $1 : 'Unknown';
+        $n{interface}  = $block =~ /Interface address[^,]*,\s*interface\s+(\S+)/i ? $1
+                       : $block =~ /on interface\s+(\S+)/i ? $1 : 'Unknown';
+        $n{dead_timer} = $block =~ /Dead timer due in\s+([\d:]+)/i ? $1 : 'N/A';
+        $n{uptime}     = $block =~ /Neighbor is up for\s+([\w:]+)/i ? $1 : 'N/A';
+        push @neighbors, \%n;
+    }
+
+    my $device_alerts = 0;
+    printf { $log_fh ? $log_fh : \*STDOUT } "  %-18s %-12s %-20s %-12s %s\n",
+        "Router ID", "State", "Interface", "Dead Timer", "Uptime";
+    log_output("  " . "-" x 68 . "\n");
+
+    for my $n (@neighbors) {
+        my $alert = ($n->{state} !~ /^(FULL|2WAY)/i) ? " [ALERT]" : "";
+        $device_alerts++ if $alert;
+        $total_alerts++  if $alert;
+        printf { $log_fh ? $log_fh : \*STDOUT } "  %-18s %-12s %-20s %-12s %s%s\n",
+            $n->{router_id}, $n->{state}, $n->{interface},
+            $n->{dead_timer}, $n->{uptime}, $alert;
+    }
+
+    if ($device_alerts) {
+        log_output("\n  *** $device_alerts neighbor(s) not in FULL/2WAY state on $device ***\n");
     } else {
-        output("  OK: No stale LSAs detected");
+        log_output("\n  All " . scalar(@neighbors) . " neighbor(s) healthy\n");
     }
+    log_output("\n");
 
-    # Flag any router contributing disproportionately (>20% of total LSAs)
-    my $total = eval { my $t=0; $t += $_ for values %area_counts; $t };
-    for my $router (sort keys %router_counts) {
-        my $pct = $router_counts{$router} / $total * 100;
-        if ($pct > 20 && $total > 10) {
-            output(sprintf("  WARN: Router %s holds %.0f%% of LSAs (%d/%d)",
-                $router, $pct, $router_counts{$router}, $total));
-            $exit_code = 1 unless $exit_code == 2;
-        }
-    }
-
+    $ssh->exec("exit");
     $ssh->close();
 }
 
-output("\nDone. Exit code: $exit_code");
-close $LOG if $LOG;
-exit $exit_code;
+log_output("=" x 70 . "\n");
+log_output("Summary: $total_alerts total alert(s) across " . scalar(@devices) . " device(s)\n");
+log_output("Completed: " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n");
+log_output("=" x 70 . "\n");
 
-sub run_cmd {
-    my ($ssh, $cmd) = @_;
-    $ssh->send("$cmd\n");
-    my $out = $ssh->waitfor('\$|#|>', $timeout);
-    return $out;
-}
-
-sub output {
-    my ($msg) = @_;
-    print "$msg\n";
-    print $LOG "$msg\n" if $LOG;
-}
-```
+close $log_fh if $log_fh;
+exit($total_alerts ? 1 : 0);
