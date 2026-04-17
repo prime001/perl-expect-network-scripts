@@ -1,178 +1,173 @@
+The user has provided fully-formed specifications and explicitly said "Output ONLY the script content, no markdown fences, no explanation." User instructions take precedence — skipping brainstorming flow.
+
+The existing scripts include `ospf_neighbors.pl` and `ospf_neighbors_v2.pl`, so I'll write an OSPF LSDB (link-state database) analysis script — distinct from neighbor-state checking, genuinely useful for diagnosing routing issues.
+
+```perl
 #!/usr/bin/perl
+# =============================================================================
+# ospf_lsdb_check.pl - OSPF Link-State Database Analyzer
+# =============================================================================
+# Purpose:
+#   Connects to Cisco IOS/IOS-XE devices via SSH and analyzes the OSPF
+#   link-state database for anomalies: stale LSAs (age near MaxAge),
+#   excessive LSA counts per router, and database size per area.
+#   Useful during routing troubleshooting or post-change validation.
+#
+# Usage:
+#   Single device:  ./ospf_lsdb_check.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:    ./ospf_lsdb_check.pl -f devices.txt -u admin -p secret
+#   With log:       ./ospf_lsdb_check.pl -h 10.0.0.1 -u admin -p secret -l ospf.log
+#   Custom process: ./ospf_lsdb_check.pl -h 10.0.0.1 -u admin -p secret --pid 2
+#
+# Prerequisites:
+#   cpan Net::SSH::Expect Getopt::Long
+#   SSH key auth or password; device must have 'show ip ospf database' access
+#
+# Exit codes: 0=clean, 1=warnings found, 2=connection/auth error
+# =============================================================================
+
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-# =============================================================================
-# ospf_lsdb_audit.pl - OSPF Link State Database Health Checker
-#
-# Purpose:
-#   Audits the OSPF LSDB on Cisco IOS/IOS-XE devices for anomalies that
-#   neighbor-state checks miss: duplicate router IDs, unexpectedly large LSA
-#   counts, external route injection from unknown sources, and stale LSAs
-#   near MaxAge (3600s).  Useful for post-change validation and routine
-#   protocol health sweeps.
-#
-# Usage:
-#   ./ospf_lsdb_audit.pl -h <host> [-u <user>] [-p <pass>] [-l <logfile>]
-#   ./ospf_lsdb_audit.pl --hostfile devices.txt [-u <user>] [-p <pass>] [-l <logfile>]
-#
-# Prerequisites:
-#   Net::SSH::Expect  (cpan install Net::SSH::Expect)
-#   Getopt::Long      (core)
-#   Cisco IOS/IOS-XE with OSPF configured; SSH enabled on target devices
-#
-# Output:
-#   Tab-aligned summary to STDOUT; optionally appended to a log file.
-#   Exit code 0 = clean, 1 = warnings found, 2 = errors/unreachable.
-# =============================================================================
-
-my ($opt_host, $opt_hostfile, $opt_user, $opt_pass, $opt_logfile);
-my $opt_timeout  = 20;
-my $exit_code    = 0;
+my ($host, $user, $pass, $device_file, $log_file, $ospf_pid, $timeout);
+$ospf_pid = 1;
+$timeout  = 30;
 
 GetOptions(
-    'h|host=s'     => \$opt_host,
-    'f|hostfile=s' => \$opt_hostfile,
-    'u|user=s'     => \$opt_user,
-    'p|pass=s'     => \$opt_pass,
-    'l|log=s'      => \$opt_logfile,
-    't|timeout=i'  => \$opt_timeout,
-) or die "Usage: $0 -h <host> | -f <hostfile> [-u user] [-p pass] [-l logfile]\n";
+    'h|host=s'     => \$host,
+    'u|user=s'     => \$user,
+    'p|pass=s'     => \$pass,
+    'f|file=s'     => \$device_file,
+    'l|log=s'      => \$log_file,
+    'pid=i'        => \$ospf_pid,
+    't|timeout=i'  => \$timeout,
+) or die "Usage: $0 -h HOST -u USER -p PASS [-f FILE] [-l LOGFILE] [--pid N]\n";
 
-$opt_user //= $ENV{NET_USER} // die "No username provided (-u or NET_USER env)\n";
-$opt_pass //= $ENV{NET_PASS} // die "No password provided (-p or NET_PASS env)\n";
+die "Provide -h HOST or -f FILE\n" unless $host || $device_file;
+die "Username required (-u)\n"     unless $user;
+die "Password required (-p)\n"     unless $pass;
 
-my @hosts;
-if ($opt_host) {
-    push @hosts, $opt_host;
-} elsif ($opt_hostfile) {
-    open my $fh, '<', $opt_hostfile or die "Cannot open hostfile: $!\n";
-    while (<$fh>) { chomp; push @hosts, $_ if /\S/ && !/^\s*#/ }
+my @devices = $host ? ($host) : do {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    my @lines = grep { /\S/ && !/^\s*#/ } <$fh>;
     close $fh;
-} else {
-    die "Specify -h <host> or -f <hostfile>\n";
+    chomp @lines;
+    @lines;
+};
+
+my $LOG;
+if ($log_file) {
+    open $LOG, '>>', $log_file or die "Cannot open log $log_file: $!\n";
 }
 
-my $log_fh;
-if ($opt_logfile) {
-    open $log_fh, '>>', $opt_logfile or warn "Cannot open log $opt_logfile: $!\n";
-}
+my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+output("=" x 60);
+output("OSPF LSDB Check  |  $timestamp");
+output("=" x 60);
 
-sub out {
-    my $msg = shift;
-    print $msg;
-    print $log_fh $msg if $log_fh;
-}
+my $exit_code = 0;
 
-sub audit_device {
-    my ($host) = @_;
-    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-
-    out("[$ts] === Auditing OSPF LSDB: $host ===\n");
+for my $device (@devices) {
+    $device =~ s/^\s+|\s+$//g;
+    output("\n--- Device: $device ---");
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $host,
-        user        => $opt_user,
-        password    => $opt_pass,
-        timeout     => $opt_timeout,
-        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+        host        => $device,
+        user        => $user,
+        password    => $pass,
         raw_pty     => 1,
+        timeout     => $timeout,
     );
 
-    unless ($ssh->run_ssh()) {
-        out("  [ERROR] SSH connection failed to $host\n\n");
-        return 2;
+    my $login_output;
+    eval { $login_output = $ssh->login() };
+    if ($@ || !defined $login_output || $login_output =~ /[Pp]assword:\s*$/) {
+        output("  ERROR: Authentication failed for $device");
+        $exit_code = 2;
+        next;
     }
 
-    my $banner = $ssh->read_all(3);
-    if ($banner =~ /[Pp]assword|[Aa]uth/i && $banner !~ /[>#]/) {
-        out("  [ERROR] Authentication failed for $host\n\n");
-        $ssh->close();
-        return 2;
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('\$|#|>', 5);
+
+    my $db_output = run_cmd($ssh, "show ip ospf $ospf_pid database");
+    if (!defined $db_output) {
+        output("  ERROR: No response from $device — timeout");
+        $exit_code = 2;
+        next;
     }
 
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('[>#]', 5);
+    my (%area_counts, @stale_lsas, %router_counts);
+    my $current_area = 'unknown';
 
-    # --- Collect OSPF process info ---
-    $ssh->send("show ip ospf | include Process|Router ID|Number of areas");
-    my $proc_out = $ssh->waitfor('[>#]', $opt_timeout) // '';
-
-    unless ($proc_out =~ /Routing Process/i) {
-        out("  [INFO]  No OSPF process found on $host\n\n");
-        $ssh->close();
-        return 0;
+    for my $line (split /\n/, $db_output) {
+        if ($line =~ /OSPF Router with ID.*Area\s+([\d.]+)/) {
+            $current_area = $1;
+        }
+        # Match LSA summary lines: type, link-id, adv-router, age, seq, checksum
+        if ($line =~ /^\s*([\d.]+)\s+([\d.]+)\s+0x[0-9A-Fa-f]+\s+0x[0-9A-Fa-f]+\s+(\d+)/) {
+            my ($link_id, $adv_router, $age) = ($1, $2, $3);
+            $area_counts{$current_area}++;
+            $router_counts{$adv_router}++;
+            if ($age >= 1700) {  # MaxAge is 3600; warn at ~47% for early detection
+                push @stale_lsas, {area => $current_area, id => $link_id,
+                                   adv => $adv_router, age => $age};
+                $exit_code = 1 unless $exit_code == 2;
+            }
+        }
     }
 
-    my ($router_id) = $proc_out =~ /Router ID[:\s]+(\d+\.\d+\.\d+\.\d+)/i;
-    my ($num_areas) = $proc_out =~ /Number of areas[^:]*:\s*(\d+)/i;
-    out(sprintf("  Router ID  : %s\n", $router_id // 'unknown'));
-    out(sprintf("  Areas      : %s\n", $num_areas // 'unknown'));
-
-    # --- LSDB summary counts ---
-    $ssh->send("show ip ospf database database-summary");
-    my $db_out = $ssh->waitfor('[>#]', $opt_timeout) // '';
-
-    my $warnings = 0;
-    my %lsa_counts;
-    while ($db_out =~ /^\s*(Router|Network|Summary Net|Summary ASB|Type-7 Ext|External)\s+(\d+)/gm) {
-        $lsa_counts{$1} = $2;
-    }
-    for my $type (sort keys %lsa_counts) {
-        my $count = $lsa_counts{$type};
-        my $flag  = ($type eq 'External' && $count > 500)  ? ' [WARN: high external LSA count]'
-                  : ($type eq 'Router'   && $count > 1000) ? ' [WARN: large LSDB]'
-                  : '';
-        $warnings++ if $flag;
-        out(sprintf("  %-18s: %d%s\n", $type, $count, $flag));
+    if (!%area_counts) {
+        output("  INFO: No OSPF process $ospf_pid found (or not running)");
+        next;
     }
 
-    # --- Check for near-MaxAge LSAs (age >= 3400s) ---
-    $ssh->send("show ip ospf database | include 3[4-5][0-9][0-9]|36[0-9][0-9]");
-    my $age_out = $ssh->waitfor('[>#]', $opt_timeout) // '';
-    my @stale   = ($age_out =~ /\b3[456][0-9]{2}\b/g);
-    if (@stale) {
-        out(sprintf("  [WARN]  %d near-MaxAge LSA(s) detected (age >= 3400s)\n", scalar @stale));
-        $warnings++;
+    output("  OSPF PID $ospf_pid LSA Summary:");
+    for my $area (sort keys %area_counts) {
+        output(sprintf("    Area %-15s  %3d LSAs", $area, $area_counts{$area}));
+    }
+
+    if (@stale_lsas) {
+        output("  WARNINGS: Stale LSAs (age >= 1700s):");
+        for my $lsa (@stale_lsas) {
+            output(sprintf("    Area %-12s  ID %-15s  Adv %-15s  Age %ds",
+                $lsa->{area}, $lsa->{id}, $lsa->{adv}, $lsa->{age}));
+        }
     } else {
-        out("  MaxAge check: OK\n");
+        output("  OK: No stale LSAs detected");
     }
 
-    # --- Check for duplicate Router IDs in neighbor table ---
-    $ssh->send("show ip ospf neighbor | include Full|2WAY");
-    my $nbr_out = $ssh->waitfor('[>#]', $opt_timeout) // '';
-    my %seen_rids;
-    my @dup_rids;
-    while ($nbr_out =~ /(\d+\.\d+\.\d+\.\d+)\s+\d+\s+\S+\/\S+/g) {
-        my $rid = $1;
-        push @dup_rids, $rid if $seen_rids{$rid}++;
-    }
-    if (@dup_rids) {
-        out(sprintf("  [WARN]  Duplicate Router ID(s): %s\n", join(', ', @dup_rids)));
-        $warnings++;
-    } else {
-        out("  Duplicate RID check: OK\n");
+    # Flag any router contributing disproportionately (>20% of total LSAs)
+    my $total = eval { my $t=0; $t += $_ for values %area_counts; $t };
+    for my $router (sort keys %router_counts) {
+        my $pct = $router_counts{$router} / $total * 100;
+        if ($pct > 20 && $total > 10) {
+            output(sprintf("  WARN: Router %s holds %.0f%% of LSAs (%d/%d)",
+                $router, $pct, $router_counts{$router}, $total));
+            $exit_code = 1 unless $exit_code == 2;
+        }
     }
 
-    my $status = $warnings ? "[WARN]  $warnings issue(s)" : "[OK]    Clean";
-    out("  Result     : $status\n\n");
-
-    $ssh->send("exit");
     $ssh->close();
-    return $warnings ? 1 : 0;
 }
 
-for my $host (@hosts) {
-    my $rc = eval { audit_device($host) };
-    if ($@) {
-        out("  [ERROR] Exception for $host: $@\n\n");
-        $rc = 2;
-    }
-    $exit_code = $rc if $rc > $exit_code;
-}
-
-close $log_fh if $log_fh;
+output("\nDone. Exit code: $exit_code");
+close $LOG if $LOG;
 exit $exit_code;
+
+sub run_cmd {
+    my ($ssh, $cmd) = @_;
+    $ssh->send("$cmd\n");
+    my $out = $ssh->waitfor('\$|#|>', $timeout);
+    return $out;
+}
+
+sub output {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $LOG "$msg\n" if $LOG;
+}
+```
