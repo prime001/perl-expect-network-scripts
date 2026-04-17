@@ -1,195 +1,161 @@
-```perl
 #!/usr/bin/perl
-# =============================================================================
-# port_security_audit.pl - Cisco IOS Port Security Audit Tool
-# =============================================================================
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE devices via SSH and audits port security
-#   configurations. Reports violation counts, sticky MACs, max MAC limits,
-#   and flags ports in error-disabled state due to security violations.
-#
-# Usage:
-#   ./port_security_audit.pl -h <host> [-u <user>] [-p <pass>] [-l <logfile>]
-#   ./port_security_audit.pl -f <device_list.txt> [-u <user>] [-p <pass>] [-l <logfile>]
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect Getopt::Long
-#
-# Device list file format (one host per line, blank lines and # comments ok):
-#   192.168.1.1
-#   switch02.corp.example.com
-#
-# Exit codes: 0=success, 1=arg error, 2=connection failure, 3=auth failure
-# =============================================================================
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_logfile, $opt_help);
-$opt_user = $ENV{NET_USER} // 'admin';
-$opt_pass = $ENV{NET_PASS} // '';
+# =============================================================================
+# interface_errors.pl - Interface Error Counter Audit
+#
+# Purpose:
+#   Connects to Cisco IOS/IOS-XE devices via SSH and audits interface error
+#   counters (CRC, input errors, output drops, resets, runts, giants).
+#   Flags any interface exceeding configurable thresholds — useful for
+#   identifying degraded cables, duplex mismatches, or overloaded uplinks
+#   before they impact production traffic.
+#
+# Usage:
+#   ./interface_errors.pl -h <host> [-u <user>] [-p <pass>] [-l <logfile>]
+#                         [-t <threshold>] [-f <device_list>]
+#
+# Prerequisites:
+#   cpan Net::SSH::Expect
+#
+# Examples:
+#   ./interface_errors.pl -h 192.168.1.1 -u admin -p secret
+#   ./interface_errors.pl -f devices.txt -t 100 -l /var/log/if_errors.log
+# =============================================================================
+
+my ($host, $username, $password, $logfile, $device_file);
+my $threshold = 50;   # flag interfaces with errors above this count
 
 GetOptions(
-    'h|host=s'    => \$opt_host,
-    'f|file=s'    => \$opt_file,
-    'u|user=s'    => \$opt_user,
-    'p|pass=s'    => \$opt_pass,
-    'l|log=s'     => \$opt_logfile,
-    'help'        => \$opt_help,
-) or usage();
+    'h|host=s'      => \$host,
+    'u|user=s'      => \$username,
+    'p|pass=s'      => \$password,
+    'l|log=s'       => \$logfile,
+    't|threshold=i' => \$threshold,
+    'f|file=s'      => \$device_file,
+) or die "Usage: $0 -h <host> [-u user] [-p pass] [-l logfile] [-t threshold] [-f device_list]\n";
 
-usage() if $opt_help;
-usage() unless $opt_host || $opt_file;
+$username //= $ENV{NET_USER} // 'admin';
+$password //= $ENV{NET_PASS} or die "ERROR: Password required via -p or NET_PASS env var\n";
 
-my @devices;
-if ($opt_host) {
-    push @devices, $opt_host;
-} elsif ($opt_file) {
-    open my $fh, '<', $opt_file or die "Cannot open $opt_file: $!\n";
-    while (<$fh>) {
-        chomp;
-        next if /^\s*$/ || /^\s*#/;
-        push @devices, $_;
-    }
+my @hosts;
+if ($device_file) {
+    open my $fh, '<', $device_file or die "Cannot open device file '$device_file': $!\n";
+    while (<$fh>) { chomp; push @hosts, $_ if /\S/ && !/^#/; }
     close $fh;
+} elsif ($host) {
+    @hosts = ($host);
+} else {
+    die "ERROR: Specify -h <host> or -f <device_list>\n";
 }
 
 my $log_fh;
-if ($opt_logfile) {
-    open $log_fh, '>>', $opt_logfile or warn "Cannot open log $opt_logfile: $!\n";
+if ($logfile) {
+    open $log_fh, '>>', $logfile or die "Cannot open logfile '$logfile': $!\n";
 }
 
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-output("=" x 70);
-output("Port Security Audit - $timestamp");
-output("=" x 70);
-
-for my $host (@devices) {
-    audit_device($host);
+sub log_print {
+    my ($msg) = @_;
+    print $msg;
+    print {$log_fh} $msg if $log_fh;
 }
 
-close $log_fh if $log_fh;
-exit 0;
-
-# -----------------------------------------------------------------------------
 sub audit_device {
-    my ($host) = @_;
-    output("\n--- Device: $host ---");
+    my ($device) = @_;
+    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
 
-    my $ssh = Net::SSH::Expect->new(
-        host        => $host,
-        user        => $opt_user,
-        password    => $opt_pass,
-        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
-        raw_pty     => 1,
-        timeout     => 15,
-    );
+    log_print("\n[$ts] === Connecting to $device ===\n");
 
-    my $login_output;
-    eval { $login_output = $ssh->login() };
+    my $ssh;
+    eval {
+        $ssh = Net::SSH::Expect->new(
+            host        => $device,
+            user        => $username,
+            password    => $password,
+            raw_pty     => 1,
+            timeout     => 15,
+        );
+        $ssh->login();
+    };
     if ($@) {
-        output("  ERROR: Connection failed to $host - $@");
-        return;
-    }
-    if ($login_output =~ /[Pp]assword|[Aa]uthentication failed/i && $login_output !~ /[>#]/) {
-        output("  ERROR: Authentication failed for $host");
+        log_print("ERROR: Cannot connect to $device: $@\n");
         return;
     }
 
     # Disable paging
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('[>#]', 5);
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('\$|#', 5);
 
-    # Collect port security summary
-    $ssh->send("show port-security");
-    my $ps_output = $ssh->waitfor('[>#]', 20) // '';
+    $ssh->send("show interfaces\n");
+    my $output = $ssh->waitfor('#', 30) // '';
 
-    # Collect interface detail for error-disabled
-    $ssh->send("show interfaces status err-disabled");
-    my $errdis_output = $ssh->waitfor('[>#]', 20) // '';
+    if (!$output) {
+        log_print("ERROR: No response from $device\n");
+        $ssh->close();
+        return;
+    }
 
-    # Collect sticky MAC detail
-    $ssh->send("show port-security address");
-    my $mac_output = $ssh->waitfor('[>#]', 20) // '';
+    my %iface_errors;
+    my $current_if = '';
 
-    $ssh->send("exit");
+    for my $line (split /\n/, $output) {
+        # Match interface header line
+        if ($line =~ /^(\S+)\s+is\s+(up|down|administratively down)/) {
+            $current_if = $1;
+            $iface_errors{$current_if} //= { crc => 0, input_err => 0, output_drop => 0, resets => 0, runts => 0, giants => 0 };
+            next;
+        }
+        next unless $current_if;
 
-    parse_and_report($host, $ps_output, $errdis_output, $mac_output);
-}
-
-# -----------------------------------------------------------------------------
-sub parse_and_report {
-    my ($host, $ps_out, $errdis_out, $mac_out) = @_;
-
-    my @violations;
-    my @errdisabled;
-    my $total_secure = 0;
-    my $total_ports  = 0;
-
-    # Parse: show port-security
-    # Format: Gi1/0/1   Enabled   Restrict   0          1          0
-    for my $line (split /\n/, $ps_out) {
-        next unless $line =~ /^((?:Gi|Fa|Te|Hu|Et)\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+)/i;
-        my ($intf, $enabled, $violation_mode, $cur_addr, $max_addr, $violation_count) = ($1,$2,$3,$4,$5,$6);
-        next unless lc($enabled) eq 'enabled';
-        $total_ports++;
-        $total_secure += $cur_addr;
-        if ($violation_count > 0) {
-            push @violations, sprintf("  %-20s  mode=%-10s  violations=%d  macs=%d/%d",
-                $intf, $violation_mode, $violation_count, $cur_addr, $max_addr);
+        if ($line =~ /(\d+)\s+input errors.*?(\d+)\s+CRC/) {
+            $iface_errors{$current_if}{input_err} = $1;
+            $iface_errors{$current_if}{crc}       = $2;
+        }
+        if ($line =~ /(\d+)\s+output drops/) {
+            $iface_errors{$current_if}{output_drop} = $1;
+        }
+        if ($line =~ /(\d+)\s+interface resets/) {
+            $iface_errors{$current_if}{resets} = $1;
+        }
+        if ($line =~ /(\d+)\s+runts,\s+(\d+)\s+giants/) {
+            $iface_errors{$current_if}{runts}  = $1;
+            $iface_errors{$current_if}{giants} = $2;
         }
     }
 
-    # Parse: show interfaces status err-disabled
-    for my $line (split /\n/, $errdis_out) {
-        next unless $line =~ /^((?:Gi|Fa|Te|Hu|Et)\S+)\s+.*psecure-violation/i;
-        push @errdisabled, "  $1  [err-disabled: psecure-violation]";
+    $ssh->send("show version | include uptime\n");
+    my $uptime_raw = $ssh->waitfor('#', 10) // '';
+    my $uptime = ($uptime_raw =~ /uptime is (.+)/i) ? $1 : 'unknown';
+    $uptime =~ s/\r//g;
+
+    $ssh->send("exit\n");
+    $ssh->close();
+
+    log_print("Device uptime: $uptime\n");
+    log_print(sprintf("%-30s %8s %8s %10s %8s %8s %8s\n",
+        'Interface', 'CRC', 'InpErr', 'OutDrop', 'Resets', 'Runts', 'Giants'));
+    log_print('-' x 82 . "\n");
+
+    my $flagged = 0;
+    for my $iface (sort keys %iface_errors) {
+        my $e = $iface_errors{$iface};
+        my $total = $e->{crc} + $e->{input_err} + $e->{output_drop}
+                  + $e->{resets} + $e->{runts} + $e->{giants};
+        next if $total == 0 && !($iface =~ /^(Gi|Fa|Te|Hu|Et)/i);
+
+        my $flag = ($total > $threshold) ? ' *** EXCEEDS THRESHOLD' : '';
+        log_print(sprintf("%-30s %8d %8d %10d %8d %8d %8d%s\n",
+            $iface, $e->{crc}, $e->{input_err}, $e->{output_drop},
+            $e->{resets}, $e->{runts}, $e->{giants}, $flag));
+        $flagged++ if $flag;
     }
 
-    # Count sticky MACs
-    my $sticky_count = () = $mac_out =~ /SecureSticky/gi;
-
-    output(sprintf("  Secure ports : %d", $total_ports));
-    output(sprintf("  Secured MACs : %d", $total_secure));
-    output(sprintf("  Sticky MACs  : %d", $sticky_count));
-
-    if (@violations) {
-        output(sprintf("  Ports with violations (%d):", scalar @violations));
-        output($_) for @violations;
-    } else {
-        output("  No active violation counts detected.");
-    }
-
-    if (@errdisabled) {
-        output(sprintf("  Err-disabled by port-security (%d):", scalar @errdisabled));
-        output($_) for @errdisabled;
-    } else {
-        output("  No interfaces err-disabled by port-security.");
-    }
+    log_print("\nSummary: $flagged interface(s) exceed error threshold of $threshold on $device\n");
 }
 
-# -----------------------------------------------------------------------------
-sub output {
-    my ($msg) = @_;
-    print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
-}
-
-sub usage {
-    print <<'USAGE';
-Usage: port_security_audit.pl -h <host> | -f <file> [-u user] [-p pass] [-l logfile]
-
-  -h, --host   Single device IP or hostname
-  -f, --file   File containing list of devices (one per line)
-  -u, --user   SSH username (default: $NET_USER env or 'admin')
-  -p, --pass   SSH password (default: $NET_PASS env)
-  -l, --log    Append output to log file
-  --help       This help message
-
-USAGE
-    exit 1;
-}
-```
+audit_device($_) for @hosts;
+close $log_fh if $log_fh;
