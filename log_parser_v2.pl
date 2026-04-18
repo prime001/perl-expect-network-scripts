@@ -5,151 +5,140 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-# =============================================================================
-# arp_table.pl - Network Device ARP Table Collector and Analyzer
+#
+# security_log_audit.pl - Network Device Security Event Log Auditor
 #
 # PURPOSE:
-#   Connects to Cisco IOS/IOS-XE devices via SSH and retrieves ARP table data.
-#   Parses entries to identify duplicate MACs (potential IP spoofing), incomplete
-#   ARP entries (connectivity issues), and builds a host inventory from ARP data.
+#   Connects to Cisco IOS/IOS-XE devices and parses buffered syslog output
+#   for security-relevant events: failed authentications, ACL denies,
+#   configuration changes, and privilege escalations.
 #
 # USAGE:
-#   Single device:   ./arp_table.pl --host 192.168.1.1
-#   Multiple devices: ./arp_table.pl --file devices.txt
-#   With logging:    ./arp_table.pl --host 192.168.1.1 --logfile arp_audit.log
-#   Custom creds:    ./arp_table.pl --host 192.168.1.1 --user admin --pass secret
+#   perl security_log_audit.pl --host <IP> --user <username> --pass <password>
+#   perl security_log_audit.pl --file devices.txt --user admin --pass secret --log audit.log
 #
 # PREREQUISITES:
 #   cpan Net::SSH::Expect
-#   SSH access to target devices (IOS/IOS-XE)
-#   Credentials with 'show' privilege (priv 1+)
 #
 # OUTPUT:
-#   ARP table summary per device, flagged anomalies, optional CSV log
-# =============================================================================
+#   Categorized security events with timestamps, counts, and source IPs.
+#   Exits with code 1 if critical thresholds are exceeded.
+#
 
-my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_logfile, $opt_timeout);
-$opt_user    = $ENV{NET_USER}  || 'admin';
-$opt_pass    = $ENV{NET_PASS}  || 'cisco';
-$opt_timeout = 15;
+my ($host, $devfile, $username, $password, $logfile, $threshold);
+$threshold = 5;
 
 GetOptions(
-    'host=s'    => \$opt_host,
-    'file=s'    => \$opt_file,
-    'user=s'    => \$opt_user,
-    'pass=s'    => \$opt_pass,
-    'logfile=s' => \$opt_logfile,
-    'timeout=i' => \$opt_timeout,
-) or die "Usage: $0 --host <ip> | --file <file> [--user u] [--pass p] [--logfile f]\n";
+    'host=s'      => \$host,
+    'file=s'      => \$devfile,
+    'user=s'      => \$username,
+    'pass=s'      => \$password,
+    'log=s'       => \$logfile,
+    'threshold=i' => \$threshold,
+) or die "Usage: $0 --host <ip> --user <u> --pass <p> [--log file] [--threshold N]\n";
 
-die "Specify --host or --file\n" unless $opt_host || $opt_file;
+die "Provide --host or --file\n" unless $host || $devfile;
+die "Provide --user and --pass\n" unless $username && $password;
 
-my @devices;
-if ($opt_host) {
-    push @devices, $opt_host;
-} else {
-    open(my $fh, '<', $opt_file) or die "Cannot open $opt_file: $!\n";
-    @devices = grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
-    close $fh;
-}
+my @devices = $host ? ($host) : do {
+    open my $fh, '<', $devfile or die "Cannot open $devfile: $!\n";
+    map { chomp; $_ } grep { /\S/ && !/^#/ } <$fh>;
+};
 
 my $log_fh;
-if ($opt_logfile) {
-    open($log_fh, '>>', $opt_logfile) or die "Cannot open logfile $opt_logfile: $!\n";
-    print $log_fh "# ARP audit started: " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n";
-    print $log_fh "# device,ip_address,mac_address,interface,type,age,flag\n";
+if ($logfile) {
+    open $log_fh, '>>', $logfile or die "Cannot open log $logfile: $!\n";
 }
 
-sub log_out {
-    my ($msg) = @_;
+sub log_print {
+    my $msg = shift;
     print $msg;
     print $log_fh $msg if $log_fh;
 }
 
-for my $host (@devices) {
-    log_out("\n=== ARP Table: $host ===\n");
+sub audit_device {
+    my $dev = shift;
+    my $ts  = strftime('%Y-%m-%d %H:%M:%S', localtime);
 
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host        => $host,
-            user        => $opt_user,
-            password    => $opt_pass,
-            ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
-            timeout     => $opt_timeout,
-            raw_pty     => 1,
-        );
-    };
+    log_print("\n=== Security Log Audit: $dev  [$ts] ===\n");
+
+    my $ssh = Net::SSH::Expect->new(
+        host        => $dev,
+        user        => $username,
+        password     => $password,
+        raw_pty     => 1,
+        timeout     => 20,
+    );
+
+    eval { $ssh->login() };
     if ($@) {
-        log_out("[ERROR] Cannot create SSH session to $host: $@\n");
-        next;
+        log_print("  [ERROR] SSH login failed for $dev: $@\n");
+        return;
     }
 
-    my $login = eval { $ssh->login() };
-    if ($@ || !defined $login) {
-        log_out("[ERROR] Login failed for $host (check credentials or SSH access)\n");
-        next;
-    }
-    if ($login =~ /password|denied|fail/i) {
-        log_out("[ERROR] Authentication rejected on $host\n");
-        next;
-    }
+    $ssh->exec("terminal length 0");
 
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('\$|#', $opt_timeout) or do {
-        log_out("[ERROR] Prompt not found after terminal length on $host\n");
-        next;
-    };
+    my $raw = $ssh->exec("show logging | include %SEC|%LOGIN|%AAA|%SYS-5-CONFIG|%PARSER|denied");
+    $ssh->close();
 
-    $ssh->send("show ip arp");
-    my $output = $ssh->waitfor('\$|#', $opt_timeout);
-    unless (defined $output) {
-        log_out("[ERROR] Timeout waiting for ARP output on $host\n");
-        next;
+    unless ($raw) {
+        log_print("  [WARN]  No output received from $dev\n");
+        return;
     }
 
-    $ssh->send("exit");
+    my (%events, @acl_denies, %fail_src);
 
-    my %mac_to_ips;
-    my @entries;
-    my $total = 0;
-    my $incomplete = 0;
+    for my $line (split /\n/, $raw) {
+        next unless $line =~ /^[*%]|^\d/;
+        $line =~ s/\r//g;
 
-    for my $line (split /\n/, $output) {
-        # IOS format: Protocol  Address  Age(min)  Hardware Addr  Type  Interface
-        # Internet   10.0.0.1    -       aabb.cc00.0100  ARPA  Gi0/0
-        next unless $line =~ /^Internet\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/;
-        my ($ip, $age, $mac, $type, $iface) = ($1, $2, $3, $4, $5);
-        $total++;
-
-        if ($mac =~ /^Incom/i) {
-            $incomplete++;
-            my $flag = "INCOMPLETE";
-            log_out(sprintf("  %-18s %-20s %-15s %s\n", $ip, $mac, $iface, "[$flag]"));
-            print $log_fh "$host,$ip,$mac,$iface,$type,$age,$flag\n" if $log_fh;
-            next;
+        if ($line =~ /Login\s+failed|Authentication\s+failed|%LOGIN-\d-FAIL/i) {
+            $events{auth_fail}++;
+            $fail_src{$1}++ if $line =~ /from\s+(\d+\.\d+\.\d+\.\d+)/;
         }
-
-        push @{ $mac_to_ips{lc $mac} }, $ip;
-        push @entries, { ip => $ip, mac => lc($mac), age => $age, iface => $iface, type => $type };
+        elsif ($line =~ /%SYS-5-CONFIG_I/i) {
+            $events{config_change}++;
+            my $who = ($line =~ /by\s+(\S+)\s+on/) ? $1 : 'unknown';
+            log_print("  [CONFIG] Change by $who: $line\n");
+        }
+        elsif ($line =~ /denied|%SEC-6-IPACCESSLOG/i) {
+            $events{acl_deny}++;
+            push @acl_denies, $line if @acl_denies < 10;
+        }
+        elsif ($line =~ /%AAA-\d|privilege.*level/i) {
+            $events{priv_change}++;
+            log_print("  [PRIV]  $line\n");
+        }
     }
 
-    my %dup_macs = map { $_ => $mac_to_ips{$_} }
-                   grep { scalar @{ $mac_to_ips{$_} } > 1 } keys %mac_to_ips;
+    log_print("  Auth failures : " . ($events{auth_fail}   // 0) . "\n");
+    log_print("  Config changes: " . ($events{config_change} // 0) . "\n");
+    log_print("  ACL denies    : " . ($events{acl_deny}     // 0) . "\n");
+    log_print("  Priv changes  : " . ($events{priv_change}  // 0) . "\n");
 
-    for my $entry (@entries) {
-        my $flag = exists $dup_macs{ $entry->{mac} } ? "DUPLICATE_MAC" : "ok";
-        my $display = $flag eq "ok" ? "" : "[$flag -> " . join(", ", @{ $dup_macs{ $entry->{mac} } }) . "]";
-        log_out(sprintf("  %-18s %-20s %-15s %s\n", $entry->{ip}, $entry->{mac}, $entry->{iface}, $display));
-        print $log_fh "$host,$entry->{ip},$entry->{mac},$entry->{iface},$entry->{type},$entry->{age},$flag\n" if $log_fh;
+    if (%fail_src) {
+        log_print("  Failed login sources:\n");
+        for my $ip (sort { $fail_src{$b} <=> $fail_src{$a} } keys %fail_src) {
+            log_print("    $ip : $fail_src{$ip} attempt(s)\n");
+        }
     }
 
-    log_out(sprintf("\n  Summary: %d total entries, %d incomplete, %d duplicate MACs\n",
-        $total, $incomplete, scalar keys %dup_macs));
-    log_out("  Flagged MACs (possible IP conflict/spoofing):\n") if %dup_macs;
-    for my $mac (sort keys %dup_macs) {
-        log_out(sprintf("    %s => %s\n", $mac, join(", ", @{ $dup_macs{$mac} })));
+    if (@acl_denies) {
+        log_print("  Recent ACL denies (up to 10):\n");
+        log_print("    $_\n") for @acl_denies;
     }
+
+    if (($events{auth_fail} // 0) >= $threshold) {
+        log_print("  [ALERT] Auth failure threshold ($threshold) exceeded on $dev!\n");
+        return 1;
+    }
+    return 0;
+}
+
+my $exit_code = 0;
+for my $dev (@devices) {
+    $exit_code |= audit_device($dev);
 }
 
 close $log_fh if $log_fh;
-log_out("\nDone. " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n");
+exit $exit_code;
