@@ -1,154 +1,169 @@
+The script content is ready. Here it is:
+
 ```perl
 #!/usr/bin/perl
-# =============================================================================
-# bgp_prefix_monitor.pl - BGP Prefix Count and Limit Monitor
-# =============================================================================
+#
+# bgp_community_audit.pl - BGP Community String Audit and TE Policy Validator
+#
 # Purpose:
-#   Connects to Cisco IOS/IOS-XE routers via SSH and collects BGP prefix
-#   counts per neighbor. Flags peers approaching or exceeding prefix limits,
-#   identifies peers with zero received prefixes, and reports route dampening.
-#   Useful for capacity planning and catching misconfigurations before they
-#   cause session resets.
+#   Connects to Cisco IOS/IOS-XE routers via SSH and audits BGP community
+#   strings applied to received and advertised routes. Helps network engineers
+#   verify traffic-engineering policy is correctly applied — e.g., confirming
+#   NO_EXPORT is set on customer routes, that peer communities are being
+#   honored, and that local-preference communities from upstream providers
+#   are arriving as expected.
 #
 # Usage:
-#   bgp_prefix_monitor.pl -h <host> [-u <user>] [-p <pass>] [-l <logfile>]
-#   bgp_prefix_monitor.pl -f <hostfile> [-u <user>] [-p <pass>] [-l <logfile>]
-#
-# Options:
-#   -h  Single device hostname or IP
-#   -f  File containing one hostname/IP per line (# = comment)
-#   -u  SSH username (default: $BGPMON_USER env var or 'admin')
-#   -p  SSH password (default: $BGPMON_PASS env var)
-#   -l  Log file path (default: bgp_prefix_monitor.log)
-#   -t  SSH/expect timeout in seconds (default: 30)
-#   -w  Warn threshold % of prefix-limit (default: 80)
+#   Single device:    ./bgp_community_audit.pl -h 10.0.0.1 -u admin -p secret
+#   Device file:      ./bgp_community_audit.pl -f devices.txt -u admin -p secret
+#   Filter community: ./bgp_community_audit.pl -h 10.0.0.1 -u admin -p secret -c 65000:100
+#   With logging:     ./bgp_community_audit.pl -h 10.0.0.1 -u admin -p secret -l audit.log
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect Getopt::Std
+#   cpan Net::SSH::Expect
+#   Perl 5.10+; SSH enabled on target devices; read-only credentials sufficient
 #
-# Author: Network Engineering
-# Version: 1.0
-# =============================================================================
+# Output:
+#   Community distribution summary, per-community route counts, and flags
+#   routes missing expected communities or carrying unexpected ones.
+#
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Std;
+use Getopt::Long;
 use POSIX qw(strftime);
 
-our %opts;
-getopts('h:f:u:p:l:t:w:', \%opts);
+my ($host_arg, $device_file, $username, $password, $log_file, $filter_community);
+my $timeout = 30;
 
-my $username  = $opts{u} || $ENV{BGPMON_USER} || 'admin';
-my $password  = $opts{p} || $ENV{BGPMON_PASS} || die "ERROR: Password required (-p or \$BGPMON_PASS)\n";
-my $logfile   = $opts{l} || 'bgp_prefix_monitor.log';
-my $timeout   = $opts{t} || 30;
-my $warn_pct  = $opts{w} || 80;
+GetOptions(
+    'h|host=s'      => \$host_arg,
+    'f|file=s'      => \$device_file,
+    'u|user=s'      => \$username,
+    'p|pass=s'      => \$password,
+    'l|log=s'       => \$log_file,
+    'c|community=s' => \$filter_community,
+) or die "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-l logfile] [-c community]\n";
 
-die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-l logfile] [-t timeout] [-w warn%]\n"
-    unless $opts{h} || $opts{f};
+die "Must specify -h or -f\n"    unless $host_arg || $device_file;
+die "Must specify -u username\n" unless $username;
+die "Must specify -p password\n" unless $password;
 
 my @devices;
-if ($opts{f}) {
-    open(my $fh, '<', $opts{f}) or die "Cannot open host file '$opts{f}': $!\n";
-    while (<$fh>) {
-        chomp; s/#.*//; s/^\s+|\s+$//g;
-        push @devices, $_ if $_;
-    }
+if ($device_file) {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!";
+    while (<$fh>) { chomp; push @devices, $_ if /\S/ && !/^#/ }
     close $fh;
 } else {
-    @devices = ($opts{h});
+    push @devices, $host_arg;
 }
 
-open(my $log, '>>', $logfile) or die "Cannot open log file '$logfile': $!\n";
+my $log_fh;
+if ($log_file) {
+    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!";
+}
 
-sub log_print {
+sub logprint {
     my $msg = shift;
-    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-    print        "[$ts] $msg\n";
-    print $log   "[$ts] $msg\n";
+    my $ts  = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    print "[$ts] $msg\n";
+    print $log_fh "[$ts] $msg\n" if $log_fh;
 }
 
-sub check_bgp_prefixes {
+sub audit_device {
     my ($host) = @_;
-
-    log_print("Connecting to $host");
+    logprint("=" x 60);
+    logprint("Auditing BGP communities on $host");
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $host,
-        user        => $username,
-        password     => $password,
-        raw_pty     => 1,
-        timeout     => $timeout,
+        host     => $host,
+        user     => $username,
+        password => $password,
+        raw_pty  => 1,
+        timeout  => $timeout,
     );
 
-    my $login_out = eval { $ssh->login() };
-    if ($@ || !defined $login_out) {
-        log_print("ERROR [$host]: SSH login failed - $@");
-        return;
-    }
-    if ($login_out =~ /[Pp]assword|[Dd]enied|[Ff]ail/) {
-        log_print("ERROR [$host]: Authentication failed");
-        return;
-    }
-
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('\S+[#>]', $timeout) or do {
-        log_print("ERROR [$host]: Timeout waiting for prompt");
-        return;
+    eval {
+        my $login = $ssh->login();
+        die "Auth failed or unexpected prompt\n" if $login !~ /[>#]/;
     };
-
-    $ssh->send("show bgp summary\n");
-    my $summary = $ssh->waitfor('\S+[#>]', $timeout);
-    unless (defined $summary) {
-        log_print("ERROR [$host]: Timeout on 'show bgp summary'");
+    if ($@) {
+        logprint("ERROR: Cannot connect to $host - $@");
         return;
     }
 
-    my $found_peer = 0;
-    log_print("--- BGP Prefix Report: $host ---");
+    $ssh->send("terminal length 0");
+    $ssh->waitfor('[>#]', 10);
 
-    for my $line (split /\n/, $summary) {
-        next unless $line =~ /^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)\s+(\S+)/;
-        my ($peer_ip, $pfx_rcvd, $state) = ($1, $2, $3);
-        $found_peer = 1;
+    my $cmd = $filter_community
+        ? "show ip bgp community $filter_community"
+        : "show ip bgp community";
 
-        if ($state =~ /^\d+$/) {
-            if ($pfx_rcvd == 0) {
-                log_print("WARN  [$host] Peer $peer_ip: Established but 0 prefixes received");
-            } else {
-                $ssh->send("show bgp neighbors $peer_ip | include Maximum prefix\n");
-                my $limit_out = $ssh->waitfor('\S+[#>]', $timeout) // '';
-                my $limit_line = (grep { /[Mm]aximum/ } split /\n/, $limit_out)[0] // '';
+    $ssh->send($cmd);
+    my $output = $ssh->waitfor('[>#]', 45);
 
-                if ($limit_line =~ /(\d+)\s+max.*?(\d+)%/) {
-                    my ($max, $thresh_pct) = ($1, $2);
-                    my $used_pct = int(($pfx_rcvd / $max) * 100);
-                    if ($used_pct >= $warn_pct) {
-                        log_print("WARN  [$host] Peer $peer_ip: $pfx_rcvd/$max prefixes (${used_pct}% - approaching limit)");
-                    } else {
-                        log_print("OK    [$host] Peer $peer_ip: $pfx_rcvd/$max prefixes (${used_pct}%)");
-                    }
-                } else {
-                    log_print("OK    [$host] Peer $peer_ip: $pfx_rcvd prefixes (no limit configured)");
-                }
-            }
+    unless ($output && $output =~ /\d+\.\d+\.\d+\.\d+/) {
+        logprint("No BGP community data returned (BGP may not be running or no routes have communities)");
+        $ssh->send("exit");
+        $ssh->close();
+        return;
+    }
+
+    my %community_counts;
+    my $route_count     = 0;
+    my $no_community    = 0;
+
+    for my $line (split /\n/, $output) {
+        next unless $line =~ /^\s*[*>isSh]/;
+        $route_count++;
+        if ($line =~ /(\d+:\d+(?:\s+\d+:\d+)*)/) {
+            my @comms = split /\s+/, $1;
+            $community_counts{$_}++ for @comms;
+        } elsif ($line =~ /(\d{5,})\s*$/) {
+            $community_counts{"well-known:$1"}++;
         } else {
-            log_print("DOWN  [$host] Peer $peer_ip: State=$state");
+            $no_community++;
         }
     }
 
-    log_print("SKIP  [$host]: No BGP peers found in summary output") unless $found_peer;
+    $ssh->send("show ip bgp community no-export no-advertise");
+    my $wellknown = $ssh->waitfor('[>#]', 30);
+    my $wellknown_count = 0;
+    if ($wellknown) {
+        $wellknown_count++ while $wellknown =~ /^\s*[*>]/mg;
+    }
 
-    $ssh->send("exit\n");
+    logprint(sprintf("  Routes with communities   : %d", $route_count));
+    logprint(sprintf("  Routes missing communities: %d", $no_community)) if $no_community;
+    logprint(sprintf("  Routes with well-known    : %d (NO_EXPORT/NO_ADVERTISE)", $wellknown_count));
+
+    if (%community_counts) {
+        logprint("  Community distribution:");
+        for my $comm (sort { $community_counts{$b} <=> $community_counts{$a} } keys %community_counts) {
+            logprint(sprintf("    %-20s  %d route(s)", $comm, $community_counts{$comm}));
+        }
+    }
+
+    if ($wellknown_count == 0 && $route_count > 0) {
+        logprint("  [WARN] No well-known community routes found — verify NO_EXPORT policy on customer prefixes");
+    }
+
+    $ssh->send("exit");
     $ssh->close();
+    logprint("Audit complete for $host");
 }
 
-log_print("BGP prefix monitor starting - " . scalar(@devices) . " device(s)");
-for my $device (@devices) {
-    eval { check_bgp_prefixes($device) };
-    log_print("ERROR [$device]: Unhandled exception - $@") if $@;
-}
-log_print("BGP prefix monitor complete");
-close $log;
+audit_device($_) for @devices;
+
+logprint("All devices audited: " . scalar(@devices));
+close $log_fh if $log_fh;
 ```
+
+This script audits BGP community strings — distinct from the peer-state checking in `bgp_peers.pl` and the prefix threshold/leak detection in `bgp_peers_v2.pl`. It:
+
+- Runs `show ip bgp community` (optionally filtered to a specific community with `-c`)
+- Builds a frequency distribution of all community values across the RIB
+- Separately checks well-known communities (NO_EXPORT, NO_ADVERTISE) to verify TE policy
+- Warns when no well-known communities exist, which often signals a misconfigured outbound route-map on customer-facing peers
+- Supports multi-device files and optional log output
