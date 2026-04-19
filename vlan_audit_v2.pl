@@ -6,156 +6,208 @@ use Getopt::Long;
 use POSIX qw(strftime);
 
 # =============================================================================
-# mac_vlan_audit.pl - MAC Address Table Analysis per VLAN
+# vlan_stp_audit.pl - VLAN Spanning Tree Protocol Audit Tool
 #
 # Purpose:
-#   Connects to a Cisco IOS/IOS-XE switch and cross-references the VLAN
-#   database against the MAC address table to identify active vs unused VLANs.
-#   Useful for VLAN cleanup initiatives, capacity planning, and documentation.
+#   Connects to Cisco IOS/IOS-XE switches and audits STP (Spanning Tree
+#   Protocol) state per VLAN. Reports root bridge identity, port roles/states,
+#   topology change counts, and flags VLANs with active TCN activity or
+#   suboptimal root placement.
 #
 # Usage:
-#   ./mac_vlan_audit.pl --host <ip> --user <username> --pass <password>
-#   ./mac_vlan_audit.pl --host <ip> --user <username> --pass <password> --log audit.log
-#   ./mac_vlan_audit.pl --file devices.txt --user <username> --pass <password>
+#   ./vlan_stp_audit.pl -h <host> -u <user> -p <pass> [-l <logfile>]
+#   ./vlan_stp_audit.pl -f <device_list.txt> -u <user> -p <pass> [-l <logfile>]
 #
 # Prerequisites:
-#   - Perl modules: Net::SSH::Expect, Getopt::Long
-#     Install: cpan Net::SSH::Expect
-#   - SSH must be enabled on target device
-#   - User account needs at minimum privilege 1 (show commands)
+#   - Net::SSH::Expect (cpan install Net::SSH::Expect)
+#   - SSH enabled on target device with valid credentials
+#   - 'terminal length 0' supported (standard IOS)
+#   - Read-only or higher privilege level
 #
 # Output:
-#   Per-VLAN summary showing VLAN ID, name, state, and MAC count.
-#   Flags VLANs with zero MACs as candidates for decommission review.
-#
-# Tested on: Cisco IOS 15.x, IOS-XE 16.x/17.x
+#   Per-VLAN STP summary including root bridge, hello/max/fwd timers,
+#   topology change count, and ports in non-forwarding states.
 # =============================================================================
 
-my ($host, $user, $pass, $logfile, $device_file, $timeout);
-$timeout = 30;
+my ($host, $user, $pass, $device_file, $logfile);
+my $timeout = 30;
 
 GetOptions(
-    'host=s'    => \$host,
-    'user=s'    => \$user,
-    'pass=s'    => \$pass,
-    'log=s'     => \$logfile,
-    'file=s'    => \$device_file,
-    'timeout=i' => \$timeout,
-) or die "Usage: $0 --host <ip> --user <u> --pass <p> [--log file] [--file devices.txt]\n";
+    'h|host=s'     => \$host,
+    'u|user=s'     => \$user,
+    'p|pass=s'     => \$pass,
+    'f|file=s'     => \$device_file,
+    'l|log=s'      => \$logfile,
+    't|timeout=i'  => \$timeout,
+) or die "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-l <logfile>] [-t <timeout>]\n";
 
-die "Must supply --user and --pass\n" unless $user && $pass;
-die "Must supply --host or --file\n" unless $host || $device_file;
+die "Must specify -u <user> and -p <pass>\n" unless $user && $pass;
+die "Must specify -h <host> or -f <file>\n"  unless $host || $device_file;
 
-my @hosts;
+my @devices;
 if ($device_file) {
     open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; push @hosts, $_ if /\S/ && !/^#/; }
+    while (<$fh>) {
+        chomp;
+        s/#.*//;
+        s/^\s+|\s+$//g;
+        push @devices, $_ if length($_);
+    }
     close $fh;
 } else {
-    @hosts = ($host);
+    @devices = ($host);
 }
 
 my $log_fh;
 if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log $logfile: $!\n";
+    open($log_fh, '>>', $logfile) or die "Cannot open logfile $logfile: $!\n";
 }
 
-sub log_output {
+sub log_print {
     my $msg = shift;
     print $msg;
     print $log_fh $msg if $log_fh;
 }
 
 sub audit_device {
-    my $target = shift;
-    my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    my $device = shift;
+    my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
 
-    log_output("\n" . "=" x 60 . "\n");
-    log_output("Device : $target\n");
-    log_output("Time   : $timestamp\n");
-    log_output("=" x 60 . "\n");
+    log_print("=" x 70 . "\n");
+    log_print("Host: $device  |  Time: $timestamp\n");
+    log_print("=" x 70 . "\n");
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $target,
+        host        => $device,
         user        => $user,
         password    => $pass,
         raw_pty     => 1,
         timeout     => $timeout,
     );
 
-    eval {
-        my $login = $ssh->login();
-        die "Authentication failed for $target\n" unless $login =~ /[#>]/;
-    };
-    if ($@) {
-        log_output("ERROR: Cannot connect to $target: $@\n");
+    my $login_output;
+    eval { $login_output = $ssh->login() };
+    if ($@ || !defined $login_output) {
+        log_print("ERROR: SSH login failed for $device: $@\n\n");
+        return;
+    }
+    if ($login_output =~ /Permission denied|Authentication failed/i) {
+        log_print("ERROR: Authentication failed for $device\n\n");
+        $ssh->close();
         return;
     }
 
-    # Disable paging
     $ssh->send("terminal length 0\n");
-    $ssh->waitfor('\s*#', $timeout) or do {
-        log_output("ERROR: Prompt not found after terminal length on $target\n");
-        return;
-    };
+    $ssh->waitfor('\$|#|\>', 5);
 
-    # Collect VLAN database
-    $ssh->send("show vlan brief\n");
-    my $vlan_output = $ssh->waitfor('\s*#', $timeout) or do {
-        log_output("ERROR: Timeout getting VLAN data from $target\n");
-        return;
+    $ssh->send("show spanning-tree\n");
+    my $stp_output = '';
+    eval {
+        $ssh->waitfor('\$|#|\>', $timeout);
+        $stp_output = $ssh->before();
     };
-
-    # Collect MAC address table counts per VLAN
-    $ssh->send("show mac address-table count\n");
-    my $mac_output = $ssh->waitfor('\s*#', $timeout) or do {
-        log_output("ERROR: Timeout getting MAC table from $target\n");
+    if ($@ || !$stp_output) {
+        log_print("ERROR: No response to 'show spanning-tree' on $device\n\n");
+        $ssh->close();
         return;
+    }
+
+    $ssh->send("show spanning-tree summary totals\n");
+    my $summary_output = '';
+    eval {
+        $ssh->waitfor('\$|#|\>', 10);
+        $summary_output = $ssh->before();
     };
 
     $ssh->send("exit\n");
+    $ssh->close();
 
-    # Parse VLAN brief: lines like "10   management               active    Gi0/1"
-    my %vlans;
-    for my $line (split /\n/, $vlan_output) {
-        if ($line =~ /^(\d+)\s+(\S+)\s+(active|act\/unsup|suspended|act\/lshut)\s*(.*)/) {
-            $vlans{$1} = { name => $2, state => $3, ports => $4 };
-        }
-    }
-
-    # Parse MAC count output: lines like "Vlan 10   : 14"
-    my %mac_counts;
-    for my $line (split /\n/, $mac_output) {
-        if ($line =~ /[Vv]lan\s+(\d+)\s*:\s*(\d+)/) {
-            $mac_counts{$1} = $2;
-        }
-    }
-
-    # Report
-    my (@empty_vlans, @active_vlans);
-    log_output(sprintf("%-6s %-24s %-12s %s\n", "VLAN", "Name", "State", "MACs"));
-    log_output("-" x 55 . "\n");
-
-    for my $vid (sort { $a <=> $b } keys %vlans) {
-        next if $vid == 1;  # Skip VLAN 1 — expected to exist everywhere
-        my $count = $mac_counts{$vid} // 0;
-        my $flag  = ($count == 0) ? " *" : "";
-        log_output(sprintf("%-6s %-24s %-12s %d%s\n",
-            $vid, $vlans{$vid}{name}, $vlans{$vid}{state}, $count, $flag));
-        if ($count == 0) { push @empty_vlans, $vid; }
-        else             { push @active_vlans, $vid; }
-    }
-
-    log_output("\nSummary for $target:\n");
-    log_output("  Total VLANs (excl. VLAN 1) : " . scalar(keys %vlans) . "\n");
-    log_output("  Active (MACs > 0)           : " . scalar(@active_vlans) . "\n");
-    log_output("  Empty  (MACs = 0) *         : " . scalar(@empty_vlans) . "\n");
-    if (@empty_vlans) {
-        log_output("  Empty VLAN IDs              : " . join(", ", @empty_vlans) . "\n");
-        log_output("  NOTE: Verify empty VLANs before decommission.\n");
-        log_output("        MACs flush after 300s; check during business hours.\n");
-    }
+    parse_and_report($device, $stp_output, $summary_output);
 }
 
-audit_device($_) for @hosts;
-close $log_fh if $log_fh;
+sub parse_and_report {
+    my ($device, $stp_out, $summary_out) = @_;
+
+    my %vlans;
+    my $current_vlan;
+
+    for my $line (split /\n/, $stp_out) {
+        if ($line =~ /^VLAN(\d+)\s+(\S+)/) {
+            $current_vlan = $1;
+            $vlans{$current_vlan}{mode} = $2;
+        }
+        next unless $current_vlan;
+
+        if ($line =~ /Root ID.*Priority\s+(\d+)/) {
+            $vlans{$current_vlan}{root_priority} = $1;
+        }
+        if ($line =~ /Address\s+([0-9a-fA-F.]+)/ && !exists $vlans{$current_vlan}{root_mac}) {
+            $vlans{$current_vlan}{root_mac} = $1;
+        }
+        if ($line =~ /This bridge is the root/i) {
+            $vlans{$current_vlan}{is_root} = 1;
+        }
+        if ($line =~ /Topology change count\s+(\d+)/i) {
+            $vlans{$current_vlan}{tc_count} = $1;
+        }
+        if ($line =~ /Times:\s+Hello\s+([\d.]+),\s+Max Age\s+([\d.]+),\s+Forward Delay\s+([\d.]+)/i) {
+            $vlans{$current_vlan}{hello}   = $1;
+            $vlans{$current_vlan}{maxage}  = $2;
+            $vlans{$current_vlan}{fwddly}  = $3;
+        }
+        if ($line =~ /^\s+(\S+)\s+(Root|Desg|Altn|Back|Mast)\s+(FWD|BLK|LIS|LRN|DIS)\s+/i) {
+            my ($port, $role, $state) = ($1, $2, $3);
+            push @{$vlans{$current_vlan}{ports}}, { port => $port, role => $role, state => $state };
+        }
+    }
+
+    if (!%vlans) {
+        log_print("  No STP data parsed from $device (check output format)\n\n");
+        return;
+    }
+
+    my $total_vlans    = scalar keys %vlans;
+    my $root_vlans     = grep { $_->{is_root} } values %vlans;
+    my $blocking_vlans = 0;
+    my $tc_warn_vlans  = 0;
+
+    log_print(sprintf("  %-10s %-8s %-20s %-5s %-5s %-5s  %-5s  %s\n",
+        'VLAN', 'Mode', 'Root MAC', 'Pri', 'Helo', 'FwdD', 'TCN', 'Flags'));
+    log_print("  " . "-" x 68 . "\n");
+
+    for my $vid (sort { $a <=> $b } keys %vlans) {
+        my $v    = $vlans{$vid};
+        my $flags = '';
+        $flags .= '[ROOT] '    if $v->{is_root};
+        $flags .= '[HIGH-TCN] ' if ($v->{tc_count} // 0) > 100;
+        $flags .= '[BLK-PORTS] ' if grep { $_->{state} eq 'BLK' } @{$v->{ports} // []};
+
+        $blocking_vlans++ if grep { $_->{state} eq 'BLK' } @{$v->{ports} // []};
+        $tc_warn_vlans++  if ($v->{tc_count} // 0) > 100;
+
+        log_print(sprintf("  VLAN%-6s %-8s %-20s %-5s %-5s %-5s  %-5s  %s\n",
+            $vid,
+            $v->{mode}         // 'unknown',
+            $v->{root_mac}     // 'n/a',
+            $v->{root_priority} // '-',
+            $v->{hello}        // '-',
+            $v->{fwddly}       // '-',
+            $v->{tc_count}     // '0',
+            $flags));
+    }
+
+    log_print("\n  Summary: $total_vlans VLANs | Root here: $root_vlans | " .
+              "VLANs w/ blocking ports: $blocking_vlans | High TCN: $tc_warn_vlans\n");
+
+    if ($summary_out =~ /(\d+)\s+vlans.*?(\d+)\s+in.*?forwarding/si) {
+        log_print("  STP totals from summary: $1 VLANs active\n");
+    }
+
+    log_print("\n");
+}
+
+for my $dev (@devices) {
+    audit_device($dev);
+}
+
+close($log_fh) if $log_fh;
