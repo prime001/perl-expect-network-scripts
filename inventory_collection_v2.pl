@@ -6,157 +6,169 @@ use Getopt::Long;
 use POSIX qw(strftime);
 
 # =============================================================================
-# cpu_memory_health.pl - Network Device CPU/Memory Health Monitor
+# cdp_lldp_neighbors.pl - CDP/LLDP Neighbor Discovery Collector
 # =============================================================================
 # Purpose:
-#   Connects to Cisco IOS/IOS-XE network devices via SSH and collects CPU
-#   utilization (5s/1m/5m intervals) and memory pool statistics. Flags devices
-#   exceeding configurable thresholds. Designed for NOC health checks and
-#   capacity planning data collection.
+#   Connects to Cisco IOS/IOS-XE/NX-OS devices via SSH and collects CDP and
+#   LLDP neighbor detail output. Useful for automated topology discovery,
+#   asset audits, and verifying physical cabling against intended design.
 #
 # Usage:
-#   Single device:  ./cpu_memory_health.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:    ./cpu_memory_health.pl -f devices.txt -u admin -p secret
-#   With logging:   ./cpu_memory_health.pl -f devices.txt -u admin -p secret -l health.log
-#   Custom thresh:  ./cpu_memory_health.pl -h 10.0.0.1 -u admin -p secret --cpu-warn 70 --mem-warn 80
+#   ./cdp_lldp_neighbors.pl --host <ip> [--user <username>] [--pass <password>]
+#   ./cdp_lldp_neighbors.pl --file devices.txt [--user <username>] [--pass <password>]
+#   ./cdp_lldp_neighbors.pl --host 10.0.0.1 --user admin --pass secret --log neighbors.log
 #
 # Prerequisites:
-#   cpan install Net::SSH::Expect
-#   SSH key-based auth or password auth (--password flag)
-#   Target devices must have SSH enabled and user must have priv 1+
+#   - Net::SSH::Expect (cpan install Net::SSH::Expect)
+#   - CDP and/or LLDP enabled on target devices
+#   - SSH access with privilege level sufficient to run show commands
 #
 # Output:
-#   Tabular summary per device with WARN/OK/FAIL status indicators
+#   Neighbor entries including device ID, IP, platform, interface, and
+#   capabilities — printed to STDOUT and optionally written to a log file.
 # =============================================================================
 
-my ($host, $device_file, $username, $password, $logfile);
-my $cpu_warn   = 75;
-my $mem_warn   = 85;
-my $timeout    = 15;
-my $prompt     = '#';
+my ($host, $file, $username, $password, $logfile, $timeout);
+$username = $ENV{NET_USER} // 'admin';
+$password = $ENV{NET_PASS} // '';
+$timeout  = 30;
 
 GetOptions(
-    'h|host=s'      => \$host,
-    'f|file=s'      => \$device_file,
-    'u|user=s'      => \$username,
-    'p|password=s'  => \$password,
-    'l|log=s'       => \$logfile,
-    'cpu-warn=i'    => \$cpu_warn,
-    'mem-warn=i'    => \$mem_warn,
-    't|timeout=i'   => \$timeout,
-) or die "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-l logfile]\n";
+    'host=s'    => \$host,
+    'file=s'    => \$file,
+    'user=s'    => \$username,
+    'pass=s'    => \$password,
+    'log=s'     => \$logfile,
+    'timeout=i' => \$timeout,
+) or die "Usage: $0 --host <ip>|--file <list> [--user u] [--pass p] [--log file]\n";
 
-die "ERROR: Provide -h <host> or -f <file>\n" unless $host || $device_file;
-die "ERROR: Username required (-u)\n" unless $username;
-die "ERROR: Password required (-p)\n" unless $password;
+die "ERROR: Specify --host or --file\n" unless $host || $file;
 
 my @devices;
 if ($host) {
     push @devices, $host;
 } else {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+    open(my $fh, '<', $file) or die "Cannot open device list '$file': $!\n";
     while (<$fh>) {
         chomp;
-        s/#.*//;
-        s/^\s+|\s+$//g;
-        push @devices, $_ if $_;
+        next if /^\s*$/ || /^#/;
+        push @devices, $_;
     }
-    close($fh);
+    close $fh;
 }
 
 my $log_fh;
 if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log $logfile: $!\n";
+    open($log_fh, '>>', $logfile) or die "Cannot open log '$logfile': $!\n";
 }
 
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-my $header = sprintf("%-20s %-8s %-8s %-8s %-12s %-12s %-6s",
-    'DEVICE', 'CPU-5s', 'CPU-1m', 'CPU-5m', 'MEM-USED%', 'MEM-FREE', 'STATUS');
-output("=" x 78);
-output("CPU/Memory Health Check  |  $timestamp");
-output("Thresholds: CPU warn >=$cpu_warn%  |  Mem warn >=$mem_warn%");
-output("=" x 78);
-output($header);
-output("-" x 78);
-
-for my $device (@devices) {
-    check_device($device);
+sub output {
+    my ($msg) = @_;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
 
-output("=" x 78);
-close($log_fh) if $log_fh;
+sub collect_neighbors {
+    my ($device) = @_;
+    my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
 
-sub check_device {
-    my ($dev) = @_;
+    output("=" x 70 . "\n");
+    output("Device: $device  |  Collected: $timestamp\n");
+    output("=" x 70 . "\n");
+
     my $ssh;
-
     eval {
         $ssh = Net::SSH::Expect->new(
-            host        => $dev,
+            host        => $device,
             user        => $username,
-            password    => $password,
+            password     => $password,
             raw_pty     => 1,
             timeout     => $timeout,
             ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
         );
         $ssh->login();
     };
-    if ($@) {
-        my $err = $@;
-        $err =~ s/\n.*//s;
-        output(sprintf("%-20s %-42s FAIL - %s", $dev, '', $err));
+    if ($@ || !$ssh) {
+        output("  ERROR: SSH connection failed to $device: $@\n\n");
         return;
     }
 
     # Disable paging
-    $ssh->send("terminal length 0");
-    $ssh->waitfor("$prompt\\s*\$", $timeout);
+    eval { $ssh->exec('terminal length 0'); };
 
-    # Collect CPU stats
-    $ssh->send("show processes cpu | include CPU utilization");
-    my $cpu_raw = $ssh->waitfor("$prompt\\s*\$", $timeout) // '';
+    my @commands = (
+        'show cdp neighbors detail',
+        'show lldp neighbors detail',
+    );
 
-    my ($cpu5s, $cpu1m, $cpu5m) = ('?', '?', '?');
-    if ($cpu_raw =~ /(\d+)%\/\d+%;\s+one minute:\s+(\d+)%;\s+five minutes:\s+(\d+)%/) {
-        ($cpu5s, $cpu1m, $cpu5m) = ($1, $2, $3);
-    }
+    for my $cmd (@commands) {
+        output("\n--- $cmd ---\n");
+        my $output = eval { $ssh->exec($cmd) };
+        if ($@) {
+            output("  TIMEOUT or error running '$cmd': $@\n");
+            next;
+        }
 
-    # Collect memory stats
-    $ssh->send("show processes memory | include Processor");
-    my $mem_raw = $ssh->waitfor("$prompt\\s*\$", $timeout) // '';
+        # Strip the echoed command and prompt lines
+        $output =~ s/^\Q$cmd\E\r?\n//;
+        $output =~ s/\r//g;
 
-    my ($mem_used_pct, $mem_free_kb) = ('?', '?');
-    if ($mem_raw =~ /Processor\s+\d+\s+(\d+)\s+(\d+)/) {
-        my ($used, $free) = ($1, $2);
-        my $total = $used + $free;
-        if ($total > 0) {
-            $mem_used_pct = int(($used / $total) * 100);
-            $mem_free_kb  = int($free / 1024) . 'M';
+        # Check for unsupported protocol
+        if ($output =~ /Invalid input|% CDP is not enabled|% LLDP is not enabled|not enabled/i) {
+            output("  (Protocol not enabled or not supported on this device)\n");
+            next;
+        }
+
+        # Parse and summarize neighbor entries
+        my @neighbors;
+        my %entry;
+
+        for my $line (split /\n/, $output) {
+            if ($line =~ /^Device ID:\s*(.+)/i || $line =~ /^System Name:\s*(.+)/i) {
+                if (%entry) { push @neighbors, {%entry}; %entry = (); }
+                $entry{device_id} = $1;
+            }
+            elsif ($line =~ /IP[Vv]?(?:4)? [Aa]ddress(?:es)?:\s*(.+)/i || $line =~ /Management [Aa]ddress.*?:\s*([\d\.]+)/i) {
+                $entry{ip} //= $1;
+            }
+            elsif ($line =~ /Platform:\s*([^,]+)/i) {
+                ($entry{platform} = $1) =~ s/^\s+|\s+$//g;
+            }
+            elsif ($line =~ /Interface:\s*(\S+)/i || $line =~ /Local intf[a-z]*:\s*(\S+)/i) {
+                $entry{local_intf} //= $1;
+            }
+            elsif ($line =~ /Port ID.*?:\s*(\S+)/i) {
+                $entry{remote_intf} //= $1;
+            }
+            elsif ($line =~ /Capabilities:\s*(.+)/i) {
+                $entry{capabilities} = $1;
+            }
+        }
+        push @neighbors, {%entry} if %entry;
+
+        if (@neighbors) {
+            output(sprintf("  %-30s %-16s %-12s %-16s %s\n",
+                'Neighbor', 'IP', 'Local Intf', 'Remote Intf', 'Platform'));
+            output("  " . "-" x 90 . "\n");
+            for my $n (@neighbors) {
+                output(sprintf("  %-30s %-16s %-12s %-16s %s\n",
+                    $n->{device_id}   // '(unknown)',
+                    $n->{ip}          // 'N/A',
+                    $n->{local_intf}  // 'N/A',
+                    $n->{remote_intf} // 'N/A',
+                    $n->{platform}    // '',
+                ));
+            }
+            output("  Total neighbors: " . scalar(@neighbors) . "\n");
+        } else {
+            output("  No neighbors found.\n");
         }
     }
 
-    $ssh->send("exit");
-
-    my $status = 'OK';
-    if ($cpu5s eq '?' && $mem_used_pct eq '?') {
-        $status = 'PARSE-ERR';
-    } else {
-        $status = 'WARN' if ($cpu5s  ne '?' && $cpu5s  >= $cpu_warn);
-        $status = 'WARN' if ($cpu1m  ne '?' && $cpu1m  >= $cpu_warn);
-        $status = 'WARN' if ($mem_used_pct ne '?' && $mem_used_pct >= $mem_warn);
-    }
-
-    output(sprintf("%-20s %-8s %-8s %-8s %-12s %-12s %-6s",
-        $dev,
-        "${cpu5s}%", "${cpu1m}%", "${cpu5m}%",
-        "${mem_used_pct}%",
-        $mem_free_kb,
-        $status
-    ));
+    eval { $ssh->close(); };
+    output("\n");
 }
 
-sub output {
-    my ($line) = @_;
-    print "$line\n";
-    print $log_fh "$line\n" if $log_fh;
-}
+collect_neighbors($_) for @devices;
+
+close $log_fh if $log_fh;
