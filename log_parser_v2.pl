@@ -5,140 +5,151 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
+# =============================================================================
+# syslog_event_monitor.pl - Network Device Syslog Event Analyzer
 #
-# security_log_audit.pl - Network Device Security Event Log Auditor
+# Purpose:
+#   SSH into Cisco IOS/IOS-XE devices and parse 'show logging' output to
+#   detect and categorize critical syslog events: interface flaps, BGP state
+#   changes, hardware errors, authentication failures, and CPU/memory alerts.
+#   Generates a prioritized event summary useful for NOC triage and reporting.
 #
-# PURPOSE:
-#   Connects to Cisco IOS/IOS-XE devices and parses buffered syslog output
-#   for security-relevant events: failed authentications, ACL denies,
-#   configuration changes, and privilege escalations.
+# Usage:
+#   ./syslog_event_monitor.pl --host <ip> --user <username> [options]
+#   ./syslog_event_monitor.pl --file <hosts.txt> --user <username> [options]
 #
-# USAGE:
-#   perl security_log_audit.pl --host <IP> --user <username> --pass <password>
-#   perl security_log_audit.pl --file devices.txt --user admin --pass secret --log audit.log
+# Options:
+#   --host   <ip>       Single device IP or hostname
+#   --file   <file>     File with one device IP/hostname per line
+#   --user   <user>     SSH username
+#   --pass   <pass>     SSH password (prompted if omitted)
+#   --log    <file>     Write output to log file (default: syslog_events_YYYYMMDD.log)
+#   --nolog             Disable log file output
+#   --timeout <sec>     SSH timeout in seconds (default: 30)
 #
-# PREREQUISITES:
-#   cpan Net::SSH::Expect
+# Prerequisites:
+#   Net::SSH::Expect (cpan install Net::SSH::Expect)
+#   SSH access to target devices, 'show logging' privilege
 #
-# OUTPUT:
-#   Categorized security events with timestamps, counts, and source IPs.
-#   Exits with code 1 if critical thresholds are exceeded.
-#
+# Author: Network Engineering Team
+# =============================================================================
 
-my ($host, $devfile, $username, $password, $logfile, $threshold);
-$threshold = 5;
+my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_log, $opt_nolog, $opt_timeout);
+$opt_timeout = 30;
 
 GetOptions(
-    'host=s'      => \$host,
-    'file=s'      => \$devfile,
-    'user=s'      => \$username,
-    'pass=s'      => \$password,
-    'log=s'       => \$logfile,
-    'threshold=i' => \$threshold,
-) or die "Usage: $0 --host <ip> --user <u> --pass <p> [--log file] [--threshold N]\n";
+    'host=s'    => \$opt_host,
+    'file=s'    => \$opt_file,
+    'user=s'    => \$opt_user,
+    'pass=s'    => \$opt_pass,
+    'log=s'     => \$opt_log,
+    'nolog'     => \$opt_nolog,
+    'timeout=i' => \$opt_timeout,
+) or die "Usage: $0 --host <ip> --user <user> [--pass <pass>] [--log <file>]\n";
 
-die "Provide --host or --file\n" unless $host || $devfile;
-die "Provide --user and --pass\n" unless $username && $password;
+die "ERROR: Specify --host or --file\n" unless $opt_host || $opt_file;
+die "ERROR: --user is required\n" unless $opt_user;
 
-my @devices = $host ? ($host) : do {
-    open my $fh, '<', $devfile or die "Cannot open $devfile: $!\n";
-    map { chomp; $_ } grep { /\S/ && !/^#/ } <$fh>;
-};
-
-my $log_fh;
-if ($logfile) {
-    open $log_fh, '>>', $logfile or die "Cannot open log $logfile: $!\n";
+unless ($opt_pass) {
+    print "Password: ";
+    system("stty -echo");
+    chomp($opt_pass = <STDIN>);
+    system("stty echo");
+    print "\n";
 }
 
-sub log_print {
+my @devices;
+if ($opt_host) {
+    push @devices, $opt_host;
+} else {
+    open(my $fh, '<', $opt_file) or die "Cannot open $opt_file: $!\n";
+    @devices = grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
+    close $fh;
+}
+
+my $logfile;
+unless ($opt_nolog) {
+    $opt_log ||= 'syslog_events_' . strftime('%Y%m%d_%H%M%S', localtime) . '.log';
+    open($logfile, '>', $opt_log) or die "Cannot open log $opt_log: $!\n";
+}
+
+sub log_output {
     my $msg = shift;
     print $msg;
-    print $log_fh $msg if $log_fh;
+    print $logfile $msg if $logfile;
 }
 
-sub audit_device {
-    my $dev = shift;
-    my $ts  = strftime('%Y-%m-%d %H:%M:%S', localtime);
+my %patterns = (
+    FLAP       => qr/(?:UPDOWN|LINEPROTO-5-UPDOWN|LINK-3-UPDOWN)/,
+    BGP        => qr/(?:BGP-5-ADJCHANGE|BGP.*(?:Up|Down|Reset))/,
+    HARDWARE   => qr/(?:HARDWARE_ALARM|TRANSCEIVER|FAN|POWER|SYS-2-MALLOCFAIL)/,
+    SECURITY   => qr/(?:SEC_LOGIN-4-LOGIN_FAILED|SSH-4-SSH2_UNEXPECTED_MSG|AAA.*fail)/i,
+    CPU        => qr/(?:SYS-4-P2_WARN|CPUHOG|CPU.*exceed|PROC-4)/i,
+    OSPF       => qr/(?:OSPF-5-ADJCHG|OSPF.*(?:FULL|INIT|DOWN))/,
+);
 
-    log_print("\n=== Security Log Audit: $dev  [$ts] ===\n");
+my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+log_output("=" x 70 . "\n");
+log_output("Syslog Event Monitor Report - $timestamp\n");
+log_output("=" x 70 . "\n\n");
+
+for my $host (@devices) {
+    log_output("Device: $host\n" . "-" x 40 . "\n");
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $dev,
-        user        => $username,
-        password     => $password,
-        raw_pty     => 1,
-        timeout     => 20,
+        host       => $host,
+        user       => $opt_user,
+        password   => $opt_pass,
+        raw_pty    => 1,
+        timeout    => $opt_timeout,
     );
 
-    eval { $ssh->login() };
-    if ($@) {
-        log_print("  [ERROR] SSH login failed for $dev: $@\n");
-        return;
+    my $login_output;
+    eval { $login_output = $ssh->login() };
+    if ($@ || !defined $login_output || $login_output =~ /[Pp]assword|[Dd]enied/) {
+        log_output("  ERROR: Authentication failed or connection refused\n\n");
+        next;
     }
 
-    $ssh->exec("terminal length 0");
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('\$|\#|\>', 10);
 
-    my $raw = $ssh->exec("show logging | include %SEC|%LOGIN|%AAA|%SYS-5-CONFIG|%PARSER|denied");
-    $ssh->close();
+    $ssh->send("show logging\n");
+    my $output = '';
+    eval {
+        while (my $line = $ssh->read_line(5)) {
+            last if $line =~ /\$|\#|\>/ && length($output) > 100;
+            $output .= $line . "\n";
+        }
+    };
 
-    unless ($raw) {
-        log_print("  [WARN]  No output received from $dev\n");
-        return;
+    $ssh->send("exit\n");
+
+    my %events;
+    for my $category (keys %patterns) {
+        my @matches = grep { $_ =~ $patterns{$category} } split(/\n/, $output);
+        $events{$category} = \@matches if @matches;
     }
 
-    my (%events, @acl_denies, %fail_src);
-
-    for my $line (split /\n/, $raw) {
-        next unless $line =~ /^[*%]|^\d/;
-        $line =~ s/\r//g;
-
-        if ($line =~ /Login\s+failed|Authentication\s+failed|%LOGIN-\d-FAIL/i) {
-            $events{auth_fail}++;
-            $fail_src{$1}++ if $line =~ /from\s+(\d+\.\d+\.\d+\.\d+)/;
-        }
-        elsif ($line =~ /%SYS-5-CONFIG_I/i) {
-            $events{config_change}++;
-            my $who = ($line =~ /by\s+(\S+)\s+on/) ? $1 : 'unknown';
-            log_print("  [CONFIG] Change by $who: $line\n");
-        }
-        elsif ($line =~ /denied|%SEC-6-IPACCESSLOG/i) {
-            $events{acl_deny}++;
-            push @acl_denies, $line if @acl_denies < 10;
-        }
-        elsif ($line =~ /%AAA-\d|privilege.*level/i) {
-            $events{priv_change}++;
-            log_print("  [PRIV]  $line\n");
-        }
+    if (!%events) {
+        log_output("  No critical events detected in syslog buffer.\n\n");
+        next;
     }
 
-    log_print("  Auth failures : " . ($events{auth_fail}   // 0) . "\n");
-    log_print("  Config changes: " . ($events{config_change} // 0) . "\n");
-    log_print("  ACL denies    : " . ($events{acl_deny}     // 0) . "\n");
-    log_print("  Priv changes  : " . ($events{priv_change}  // 0) . "\n");
-
-    if (%fail_src) {
-        log_print("  Failed login sources:\n");
-        for my $ip (sort { $fail_src{$b} <=> $fail_src{$a} } keys %fail_src) {
-            log_print("    $ip : $fail_src{$ip} attempt(s)\n");
+    my $total = 0;
+    for my $cat (sort keys %events) {
+        my $count = scalar @{$events{$cat}};
+        $total += $count;
+        log_output(sprintf("  %-12s: %3d event(s)\n", $cat, $count));
+        for my $line (@{$events{$cat}}[-3..-1]) {
+            next unless defined $line;
+            $line =~ s/^\s+//;
+            log_output("    >> $line\n") if $line =~ /\S/;
         }
     }
-
-    if (@acl_denies) {
-        log_print("  Recent ACL denies (up to 10):\n");
-        log_print("    $_\n") for @acl_denies;
-    }
-
-    if (($events{auth_fail} // 0) >= $threshold) {
-        log_print("  [ALERT] Auth failure threshold ($threshold) exceeded on $dev!\n");
-        return 1;
-    }
-    return 0;
+    log_output("  Total events flagged: $total\n\n");
 }
 
-my $exit_code = 0;
-for my $dev (@devices) {
-    $exit_code |= audit_device($dev);
-}
-
-close $log_fh if $log_fh;
-exit $exit_code;
+log_output("=" x 70 . "\n");
+log_output("Report complete. Output: $opt_log\n") if $logfile;
+close $logfile if $logfile;
