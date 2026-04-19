@@ -1,167 +1,170 @@
+```perl
 #!/usr/bin/perl
+#
+# acl_audit.pl - Bulk ACL Audit Tool for Cisco IOS Devices
+#
+# Purpose:
+#   Connects to one or more network devices and audits access control lists
+#   (ACLs). Reports ACL names, entry counts, and flags any ACLs containing
+#   permit-any rules that may represent security risks.
+#
+# Usage:
+#   Single device:  perl acl_audit.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:    perl acl_audit.pl -f devices.txt -u admin -p secret
+#   With logging:   perl acl_audit.pl -f devices.txt -u admin -p secret -l acl_audit.log
+#
+# Prerequisites:
+#   cpan Net::SSH::Expect
+#
+# Device file format (one IP/hostname per line, blank lines and # comments ignored):
+#   192.168.1.1
+#   192.168.1.2
+#   # This device is offline
+#   router-core-01
+#
+# Author: Network Automation Portfolio
+# Version: 1.0
+
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-# =============================================================================
-# arp_table.pl - Network Device ARP Table Collector
-# =============================================================================
-# Purpose:
-#   Connects to one or more Cisco IOS/IOS-XE devices via SSH and collects
-#   ARP table entries. Useful for IP-to-MAC tracking, detecting duplicate
-#   IPs, and identifying unknown devices on network segments.
-#
-# Usage:
-#   Single device:   ./arp_table.pl --host 192.168.1.1 --user admin
-#   Device file:     ./arp_table.pl --file devices.txt --user admin --log arp_out.txt
-#   With password:   ./arp_table.pl --host 10.0.0.1 --user admin --pass secretpass
-#
-# Device file format (one IP or hostname per line, # for comments):
-#   192.168.1.1
-#   192.168.1.2
-#   # core-sw3 is down for maintenance
-#   192.168.1.4
-#
-# Prerequisites:
-#   - Perl modules: Net::SSH::Expect, Getopt::Long
-#   - SSH access to devices with 'show ip arp' privilege
-#   - Install: cpan Net::SSH::Expect
-#
-# Output columns: Device | IP Address | MAC Address | Age | Interface
-# =============================================================================
-
-my ($host, $file, $user, $pass, $logfile, $timeout, $help);
-$timeout = 15;
+my ($host, $device_file, $username, $password, $log_file);
+my $timeout = 30;
 
 GetOptions(
-    'host=s'    => \$host,
-    'file=s'    => \$file,
-    'user=s'    => \$user,
-    'pass=s'    => \$pass,
-    'log=s'     => \$logfile,
-    'timeout=i' => \$timeout,
-    'help'      => \$help,
-) or die "Error parsing options. Use --help for usage.\n";
+    'h|host=s'     => \$host,
+    'f|file=s'     => \$device_file,
+    'u|user=s'     => \$username,
+    'p|pass=s'     => \$password,
+    'l|log=s'      => \$log_file,
+    't|timeout=i'  => \$timeout,
+) or die "Usage: $0 [-h host|-f file] -u user -p pass [-l logfile] [-t timeout]\n";
 
-if ($help || (!$host && !$file)) {
-    print "Usage: $0 --host <ip> | --file <devices.txt> --user <username> [--pass <password>] [--log <outfile>] [--timeout <secs>]\n";
-    exit 0;
-}
-
-die "Error: --user is required\n" unless $user;
-
-# Prompt for password if not supplied (avoid plaintext on command line in prod)
-unless ($pass) {
-    print "Password for $user: ";
-    system('stty', '-echo');
-    chomp($pass = <STDIN>);
-    system('stty', 'echo');
-    print "\n";
-}
+die "ERROR: Provide -h <host> or -f <file>\n" unless $host || $device_file;
+die "ERROR: -u username required\n" unless $username;
+die "ERROR: -p password required\n" unless $password;
 
 my @devices;
 if ($host) {
     push @devices, $host;
-} elsif ($file) {
-    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
+} else {
+    open(my $fh, '<', $device_file) or die "ERROR: Cannot open $device_file: $!\n";
     while (<$fh>) {
         chomp;
-        s/#.*//;    # strip comments
-        s/^\s+|\s+$//g;
-        push @devices, $_ if $_;
+        next if /^\s*$/ || /^\s*#/;
+        push @devices, $_;
     }
     close $fh;
 }
 
-die "No devices to process.\n" unless @devices;
-
 my $log_fh;
-if ($logfile) {
-    open($log_fh, '>', $logfile) or die "Cannot open log file '$logfile': $!\n";
+if ($log_file) {
+    open($log_fh, '>>', $log_file) or warn "WARN: Cannot open log $log_file: $!\n";
 }
 
-my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
-my $header = sprintf("%-20s %-16s %-19s %-6s %-20s\n", "Device", "IP Address", "MAC Address", "Age", "Interface");
-my $divider = "-" x 85 . "\n";
+my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+output("=" x 60);
+output("ACL Audit Report - $timestamp");
+output("Devices to audit: " . scalar(@devices));
+output("=" x 60);
 
-print "\nARP Table Collection - $timestamp\n";
-print $divider;
-print $header;
-print $divider;
-
-if ($log_fh) {
-    print $log_fh "ARP Table Collection - $timestamp\n";
-    print $log_fh $divider;
-    print $log_fh $header;
-    print $log_fh $divider;
-}
-
-my ($total_entries, $failed_devices) = (0, 0);
+my %summary = (processed => 0, failed => 0, total_acls => 0, risky_acls => 0);
 
 for my $device (@devices) {
-    my $ssh;
+    output("\n--- Device: $device ---");
+    my $result = audit_device($device, $username, $password, $timeout);
+    if ($result->{error}) {
+        output("  FAILED: $result->{error}");
+        $summary{failed}++;
+    } else {
+        $summary{processed}++;
+        $summary{total_acls} += $result->{acl_count};
+        $summary{risky_acls} += $result->{risky_count};
+    }
+}
+
+output("\n" . "=" x 60);
+output("SUMMARY");
+output("  Devices successful : $summary{processed}");
+output("  Devices failed     : $summary{failed}");
+output("  Total ACLs found   : $summary{total_acls}");
+output("  Risky ACLs (permit any): $summary{risky_acls}");
+output("=" x 60);
+
+close $log_fh if $log_fh;
+
+sub audit_device {
+    my ($dev, $user, $pass, $tout) = @_;
+    my %result = (acl_count => 0, risky_count => 0);
+
+    my $ssh = Net::SSH::Expect->new(
+        host        => $dev,
+        user        => $user,
+        password    => $pass,
+        timeout     => $tout,
+        raw_pty     => 1,
+    );
+
     eval {
-        $ssh = Net::SSH::Expect->new(
-            host        => $device,
-            user        => $user,
-            password    => $pass,
-            raw_pty     => 1,
-            timeout     => $timeout,
-        );
-        $ssh->login();
-    };
-    if ($@ || !$ssh) {
-        my $err = "[$device] Connection/auth failed: $@";
-        $err =~ s/\n/ /g;
-        warn "$err\n";
-        print $log_fh "$err\n" if $log_fh;
-        $failed_devices++;
-        next;
-    }
-
-    # Disable paging to get full output
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('\s*#\s*$', $timeout) or warn "[$device] Prompt not found after terminal length 0\n";
-
-    $ssh->send("show ip arp");
-    my $output = $ssh->waitfor('\s*#\s*$', $timeout);
-    unless (defined $output) {
-        warn "[$device] Timeout waiting for 'show ip arp' output\n";
-        $failed_devices++;
-        next;
-    }
-
-    my $device_count = 0;
-    for my $line (split /\n/, $output) {
-        # Match ARP entries: Internet  10.0.0.1  5  aabb.cc00.0100  ARPA  GigabitEthernet0/0
-        if ($line =~ /^Internet\s+([\d.]+)\s+(\d+|-)\s+([\w.]+)\s+ARPA\s+(\S+)/) {
-            my ($ip, $age, $mac, $iface) = ($1, $2, $3, $4);
-            my $row = sprintf("%-20s %-16s %-19s %-6s %-20s\n", $device, $ip, $mac, $age, $iface);
-            print $row;
-            print $log_fh $row if $log_fh;
-            $device_count++;
-            $total_entries++;
+        my $login = $ssh->login();
+        if ($login !~ /[>#]/) {
+            die "Authentication failed or unexpected prompt\n";
         }
+        $ssh->send("terminal length 0\n");
+        $ssh->waitfor('\s*[>#]', 10) or die "Timeout after terminal length\n";
+
+        $ssh->send("show ip access-lists\n");
+        my $output = '';
+        while (1) {
+            my $chunk = $ssh->waitfor('\s*[>#]', $tout);
+            last unless defined $chunk;
+            $output .= $chunk;
+            last if $chunk =~ /[>#]\s*$/;
+        }
+
+        my %acls;
+        my $current_acl = '';
+        for my $line (split /\r?\n/, $output) {
+            if ($line =~ /^(?:Standard|Extended)\s+IP\s+access\s+list\s+(\S+)/i) {
+                $current_acl = $1;
+                $acls{$current_acl} //= { entries => 0, risky => 0 };
+            } elsif ($current_acl && $line =~ /^\s+\d+/) {
+                $acls{$current_acl}{entries}++;
+                if ($line =~ /permit\s+any\s+any/i || $line =~ /permit\s+any\s*$/i) {
+                    $acls{$current_acl}{risky} = 1;
+                }
+            }
+        }
+
+        for my $acl_name (sort keys %acls) {
+            my $flag = $acls{$acl_name}{risky} ? ' [RISK: permit any]' : '';
+            output(sprintf("  %-30s  entries: %3d%s",
+                $acl_name, $acls{$acl_name}{entries}, $flag));
+            $result{acl_count}++;
+            $result{risky_count}++ if $acls{$acl_name}{risky};
+        }
+
+        output("  No ACLs configured") unless %acls;
+        $ssh->send("exit\n");
+    };
+
+    if ($@) {
+        $result{error} = $@;
+        $result{error} =~ s/\n/ /g;
+        chomp $result{error};
     }
 
-    if ($device_count == 0) {
-        my $msg = sprintf("%-20s  (no ARP entries found or output parse error)\n", $device);
-        print $msg;
-        print $log_fh $msg if $log_fh;
+    return \%result;
+}
+
+sub output {
+    my ($msg) = @_;
+    print "$msg\n";
+    if ($log_fh) {
+        print $log_fh "$msg\n";
     }
-
-    $ssh->send("exit");
-    $ssh->close() if $ssh->can('close');
 }
-
-my $summary = "\nSummary: $total_entries ARP entries collected from " . scalar(@devices) . " device(s). Failed: $failed_devices\n";
-print $divider;
-print $summary;
-if ($log_fh) {
-    print $log_fh $divider;
-    print $log_fh $summary;
-    close $log_fh;
-    print "Output saved to: $logfile\n";
-}
+```
