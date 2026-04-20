@@ -1,32 +1,26 @@
-The script content is ready. Here it is:
-
 ```perl
 #!/usr/bin/perl
-#
-# bgp_community_audit.pl - BGP Community String Audit and TE Policy Validator
-#
+# =============================================================================
+# bgp_route_dampening.pl - BGP Route Dampening and Flap Detection Audit
+# =============================================================================
 # Purpose:
-#   Connects to Cisco IOS/IOS-XE routers via SSH and audits BGP community
-#   strings applied to received and advertised routes. Helps network engineers
-#   verify traffic-engineering policy is correctly applied — e.g., confirming
-#   NO_EXPORT is set on customer routes, that peer communities are being
-#   honored, and that local-preference communities from upstream providers
-#   are arriving as expected.
+#   Connects to IOS/IOS-XE routers via SSH and audits BGP for dampened routes,
+#   peer instability indicators, and prefix count anomalies. Useful for
+#   identifying route flap issues before they escalate to full outages.
 #
 # Usage:
-#   Single device:    ./bgp_community_audit.pl -h 10.0.0.1 -u admin -p secret
-#   Device file:      ./bgp_community_audit.pl -f devices.txt -u admin -p secret
-#   Filter community: ./bgp_community_audit.pl -h 10.0.0.1 -u admin -p secret -c 65000:100
-#   With logging:     ./bgp_community_audit.pl -h 10.0.0.1 -u admin -p secret -l audit.log
+#   ./bgp_route_dampening.pl -h 192.168.1.1 -u admin -p secret
+#   ./bgp_route_dampening.pl -f devices.txt -u admin -p secret [-l bgp_damp.log]
 #
 # Prerequisites:
 #   cpan Net::SSH::Expect
-#   Perl 5.10+; SSH enabled on target devices; read-only credentials sufficient
+#   SSH access to devices with 'show bgp' privileges
+#   devices.txt: one IP/hostname per line, lines starting with # are skipped
 #
 # Output:
-#   Community distribution summary, per-community route counts, and flags
-#   routes missing expected communities or carrying unexpected ones.
-#
+#   Prints dampened prefix count, peer reset history, and flagged anomalies.
+#   Exit code 2 if any device shows dampened routes or recent peer resets.
+# =============================================================================
 
 use strict;
 use warnings;
@@ -34,136 +28,149 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host_arg, $device_file, $username, $password, $log_file, $filter_community);
-my $timeout = 30;
+my ($host, $file, $user, $pass, $logfile, $help);
+my $timeout   = 30;
+my $issues    = 0;
 
 GetOptions(
-    'h|host=s'      => \$host_arg,
-    'f|file=s'      => \$device_file,
-    'u|user=s'      => \$username,
-    'p|pass=s'      => \$password,
-    'l|log=s'       => \$log_file,
-    'c|community=s' => \$filter_community,
-) or die "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-l logfile] [-c community]\n";
+    'h|host=s'     => \$host,
+    'f|file=s'     => \$file,
+    'u|user=s'     => \$user,
+    'p|pass=s'     => \$pass,
+    'l|log=s'      => \$logfile,
+    't|timeout=i'  => \$timeout,
+    'help'         => \$help,
+) or usage();
 
-die "Must specify -h or -f\n"    unless $host_arg || $device_file;
-die "Must specify -u username\n" unless $username;
-die "Must specify -p password\n" unless $password;
+usage() if $help || !$user || !$pass || (!$host && !$file);
 
 my @devices;
-if ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!";
-    while (<$fh>) { chomp; push @devices, $_ if /\S/ && !/^#/ }
+if ($file) {
+    open my $fh, '<', $file or die "Cannot open device file '$file': $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        push @devices, $_;
+    }
     close $fh;
 } else {
-    push @devices, $host_arg;
+    push @devices, $host;
 }
 
 my $log_fh;
-if ($log_file) {
-    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!";
+if ($logfile) {
+    open $log_fh, '>>', $logfile or warn "Cannot open log '$logfile': $! — logging to STDOUT only\n";
 }
 
-sub logprint {
-    my $msg = shift;
-    my $ts  = strftime("%Y-%m-%d %H:%M:%S", localtime);
-    print "[$ts] $msg\n";
-    print $log_fh "[$ts] $msg\n" if $log_fh;
-}
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+output("=" x 70);
+output("BGP Route Dampening Audit — $ts");
+output("=" x 70);
 
-sub audit_device {
-    my ($host) = @_;
-    logprint("=" x 60);
-    logprint("Auditing BGP communities on $host");
+for my $device (@devices) {
+    output("\n[*] Connecting to $device ...");
 
-    my $ssh = Net::SSH::Expect->new(
-        host     => $host,
-        user     => $username,
-        password => $password,
-        raw_pty  => 1,
-        timeout  => $timeout,
-    );
-
-    eval {
-        my $login = $ssh->login();
-        die "Auth failed or unexpected prompt\n" if $login !~ /[>#]/;
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host        => $device,
+            user        => $user,
+            password    => $pass,
+            raw_pty     => 1,
+            timeout     => $timeout,
+        );
     };
-    if ($@) {
-        logprint("ERROR: Cannot connect to $host - $@");
-        return;
+    if ($@ || !$ssh) {
+        output("  [ERROR] Failed to create SSH session for $device: $@");
+        $issues++;
+        next;
     }
 
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('[>#]', 10);
-
-    my $cmd = $filter_community
-        ? "show ip bgp community $filter_community"
-        : "show ip bgp community";
-
-    $ssh->send($cmd);
-    my $output = $ssh->waitfor('[>#]', 45);
-
-    unless ($output && $output =~ /\d+\.\d+\.\d+\.\d+/) {
-        logprint("No BGP community data returned (BGP may not be running or no routes have communities)");
-        $ssh->send("exit");
-        $ssh->close();
-        return;
+    my $login = eval { $ssh->login() };
+    if ($@ || !$login) {
+        output("  [ERROR] Authentication failed for $device");
+        $issues++;
+        next;
     }
 
-    my %community_counts;
-    my $route_count     = 0;
-    my $no_community    = 0;
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('\$|#|>', 5);
 
-    for my $line (split /\n/, $output) {
-        next unless $line =~ /^\s*[*>isSh]/;
-        $route_count++;
-        if ($line =~ /(\d+:\d+(?:\s+\d+:\d+)*)/) {
-            my @comms = split /\s+/, $1;
-            $community_counts{$_}++ for @comms;
-        } elsif ($line =~ /(\d{5,})\s*$/) {
-            $community_counts{"well-known:$1"}++;
-        } else {
-            $no_community++;
+    # Check for dampened BGP routes
+    $ssh->send("show ip bgp dampened-paths\n");
+    my $damp_out = $ssh->waitfor('\$|#|>', $timeout);
+    my $damp_count = 0;
+    $damp_count++ while $damp_out =~ /^\s*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/mg;
+
+    if ($damp_count > 0) {
+        output("  [WARN]  $damp_count dampened prefix(es) found on $device");
+        $issues++;
+    } else {
+        output("  [OK]    No dampened prefixes on $device");
+    }
+
+    # Check BGP peer reset counts from summary
+    $ssh->send("show ip bgp neighbors | include BGP neighbor|resets\n");
+    my $peer_out = $ssh->waitfor('\$|#|>', $timeout);
+    my $reset_total = 0;
+    while ($peer_out =~ /(\d+)\s+resets/g) {
+        $reset_total += $1;
+    }
+
+    if ($reset_total > 0) {
+        output("  [WARN]  $reset_total cumulative BGP peer reset(s) on $device");
+        $issues++;
+    } else {
+        output("  [OK]    No BGP peer resets recorded on $device");
+    }
+
+    # Check prefix counts — flag peers exceeding 80% of max-prefix
+    $ssh->send("show ip bgp neighbors | include BGP neighbor|prefixes\n");
+    my $prefix_out = $ssh->waitfor('\$|#|>', $timeout);
+    my $current_peer = '';
+    for my $line (split /\n/, $prefix_out) {
+        if ($line =~ /BGP neighbor is (\S+)/) {
+            $current_peer = $1;
+        }
+        if ($line =~ /(\d+) accepted prefixes.*maximum (\d+)/) {
+            my ($cur, $max) = ($1, $2);
+            my $pct = int(($cur / $max) * 100);
+            if ($pct >= 80) {
+                output("  [WARN]  Peer $current_peer at ${pct}% of max-prefix ($cur/$max) on $device");
+                $issues++;
+            }
         }
     }
 
-    $ssh->send("show ip bgp community no-export no-advertise");
-    my $wellknown = $ssh->waitfor('[>#]', 30);
-    my $wellknown_count = 0;
-    if ($wellknown) {
-        $wellknown_count++ while $wellknown =~ /^\s*[*>]/mg;
-    }
-
-    logprint(sprintf("  Routes with communities   : %d", $route_count));
-    logprint(sprintf("  Routes missing communities: %d", $no_community)) if $no_community;
-    logprint(sprintf("  Routes with well-known    : %d (NO_EXPORT/NO_ADVERTISE)", $wellknown_count));
-
-    if (%community_counts) {
-        logprint("  Community distribution:");
-        for my $comm (sort { $community_counts{$b} <=> $community_counts{$a} } keys %community_counts) {
-            logprint(sprintf("    %-20s  %d route(s)", $comm, $community_counts{$comm}));
-        }
-    }
-
-    if ($wellknown_count == 0 && $route_count > 0) {
-        logprint("  [WARN] No well-known community routes found — verify NO_EXPORT policy on customer prefixes");
-    }
-
-    $ssh->send("exit");
     $ssh->close();
-    logprint("Audit complete for $host");
 }
 
-audit_device($_) for @devices;
+output("\n" . "=" x 70);
+output("Audit complete. " . ($issues ? "Issues found: $issues" : "All checks passed."));
+output("=" x 70);
 
-logprint("All devices audited: " . scalar(@devices));
 close $log_fh if $log_fh;
+exit($issues ? 2 : 0);
+
+sub output {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $log_fh "$msg\n" if $log_fh;
+}
+
+sub usage {
+    print <<'USAGE';
+Usage: bgp_route_dampening.pl -u USER -p PASS (-h HOST | -f FILE) [-l LOG] [-t TIMEOUT]
+
+  -h, --host     Single device IP or hostname
+  -f, --file     File containing one device per line
+  -u, --user     SSH username
+  -p, --pass     SSH password
+  -l, --log      Optional log file (appended)
+  -t, --timeout  SSH timeout in seconds (default: 30)
+  --help         Show this help
+
+Exit codes: 0 = clean, 2 = issues found
+USAGE
+    exit 1;
+}
 ```
-
-This script audits BGP community strings — distinct from the peer-state checking in `bgp_peers.pl` and the prefix threshold/leak detection in `bgp_peers_v2.pl`. It:
-
-- Runs `show ip bgp community` (optionally filtered to a specific community with `-c`)
-- Builds a frequency distribution of all community values across the RIB
-- Separately checks well-known communities (NO_EXPORT, NO_ADVERTISE) to verify TE policy
-- Warns when no well-known communities exist, which often signals a misconfigured outbound route-map on customer-facing peers
-- Supports multi-device files and optional log output
