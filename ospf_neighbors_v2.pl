@@ -1,70 +1,72 @@
-```perl
 #!/usr/bin/perl
-# =============================================================================
-# ospf_neighbor_health.pl - OSPF Neighbor State Health Monitor
-#
-# Purpose:
-#   Connects to one or more IOS/IOS-XE routers and performs an OSPF neighbor
-#   health check. Flags neighbors not in FULL/2WAY state, reports dead-timer
-#   values, DR/BDR roles, and cross-references neighbor count per interface.
-#   Useful for pre/post-change validation and NOC triage.
-#
-# Usage:
-#   Single device:  ./ospf_neighbor_health.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:    ./ospf_neighbor_health.pl -f devices.txt -u admin -p secret
-#   With log file:  ./ospf_neighbor_health.pl -f devices.txt -u admin -p secret -l /var/log/ospf_health.log
-#
-# Prerequisites:
-#   cpan install Net::SSH::Expect Getopt::Long
-#
-# Device file format (one IP or hostname per line, # for comments):
-#   192.168.1.1
-#   192.168.1.2  # core-rtr-01
-#
-# Exit codes: 0=all neighbors healthy, 1=degraded neighbors found, 2=error
-# =============================================================================
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $device_file, $username, $password, $log_file, $timeout);
-$timeout = 30;
+# =============================================================================
+# ospf_neighbor_state_monitor.pl
+#
+# Purpose:
+#   Monitor OSPF neighbor adjacency states and alert on non-FULL neighbors.
+#   Compares current state against a saved baseline to detect state changes.
+#   Useful for post-change validation and proactive adjacency monitoring.
+#
+# Usage:
+#   Single device:  ./ospf_neighbor_state_monitor.pl --host 192.168.1.1
+#   Device file:    ./ospf_neighbor_state_monitor.pl --file devices.txt
+#   With baseline:  ./ospf_neighbor_state_monitor.pl --host 192.168.1.1 --save-baseline
+#   With logging:   ./ospf_neighbor_state_monitor.pl --file devices.txt --log ospf_audit.log
+#
+# Device file format (one per line):
+#   192.168.1.1
+#   10.0.0.1
+#
+# Prerequisites:
+#   cpan Net::SSH::Expect
+#   SSH key auth or credentials via environment vars:
+#     NET_USER, NET_PASS, NET_ENABLE
+#
+# Exit codes:
+#   0 = all neighbors FULL
+#   1 = one or more neighbors not FULL or state change detected
+#   2 = connection/auth error
+# =============================================================================
+
+my ($host, $device_file, $log_file, $save_baseline, $baseline_dir);
+my $timeout  = 30;
+my $any_issue = 0;
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'f|file=s'     => \$device_file,
-    'u|user=s'     => \$username,
-    'p|pass=s'     => \$password,
-    'l|log=s'      => \$log_file,
-    't|timeout=i'  => \$timeout,
-) or die "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-l <logfile>] [-t <timeout>]\n";
+    'host=s'          => \$host,
+    'file=s'          => \$device_file,
+    'log=s'           => \$log_file,
+    'save-baseline'   => \$save_baseline,
+    'baseline-dir=s'  => \$baseline_dir,
+    'timeout=i'       => \$timeout,
+) or die "Usage: $0 --host <ip> | --file <file> [--log <file>] [--save-baseline] [--baseline-dir <dir>]\n";
 
-die "ERROR: Must specify -h <host> or -f <file>\n" unless $host || $device_file;
-die "ERROR: Must specify -u <username>\n" unless $username;
-die "ERROR: Must specify -p <password>\n" unless $password;
+die "Specify --host or --file\n" unless $host || $device_file;
 
-my @devices;
-if ($host) {
-    push @devices, $host;
-} else {
-    open(my $fh, '<', $device_file) or die "ERROR: Cannot open device file '$device_file': $!\n";
-    while (<$fh>) {
-        chomp; s/#.*//; s/^\s+|\s+$//g;
-        push @devices, $_ if $_;
-    }
-    close $fh;
-}
+my $user   = $ENV{NET_USER}   // die "Set NET_USER env var\n";
+my $pass   = $ENV{NET_PASS}   // die "Set NET_PASS env var\n";
+my $enable = $ENV{NET_ENABLE} // $pass;
+
+$baseline_dir //= '/tmp/ospf_baselines';
+mkdir $baseline_dir unless -d $baseline_dir;
+
+my @devices = $host ? ($host) : do {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    map { chomp; $_ } grep { /\S/ && !/^#/ } <$fh>;
+};
 
 my $log_fh;
 if ($log_file) {
-    open($log_fh, '>>', $log_file) or warn "WARNING: Cannot open log file '$log_file': $!\n";
+    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
 }
 
-my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
-my $global_exit = 0;
+my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
 
 sub log_output {
     my ($msg) = @_;
@@ -72,9 +74,9 @@ sub log_output {
     print $log_fh $msg if $log_fh;
 }
 
-log_output("=" x 72 . "\n");
-log_output("OSPF Neighbor Health Check - $timestamp\n");
-log_output("=" x 72 . "\n\n");
+log_output("=" x 70 . "\n");
+log_output("OSPF Neighbor State Monitor  -  $timestamp\n");
+log_output("=" x 70 . "\n\n");
 
 for my $device (@devices) {
     log_output("Device: $device\n");
@@ -82,94 +84,124 @@ for my $device (@devices) {
 
     my $ssh = Net::SSH::Expect->new(
         host        => $device,
-        user        => $username,
-        password     => $password,
-        raw_pty     => 1,
-        timeout     => $timeout,
-        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=15',
+        user        => $user,
+        password     => $pass,
+        raw_pty      => 1,
+        timeout      => $timeout,
+        ssh_option   => '-o StrictHostKeyChecking=no -o ConnectTimeout=15',
     );
 
-    my $login_output;
-    eval { $login_output = $ssh->login() };
+    my $login_output = eval { $ssh->login() };
     if ($@ || !defined $login_output) {
-        log_output("  ERROR: Connection failed - $@\n\n");
-        $global_exit = 2;
-        next;
-    }
-    if ($login_output =~ /[Pp]assword|[Aa]uth/i && $login_output !~ /[>#]/) {
-        log_output("  ERROR: Authentication failed for $device\n\n");
-        $global_exit = 2;
+        log_output("  ERROR: SSH connection failed - $@\n\n");
+        $any_issue = 2;
         next;
     }
 
-    # Disable paging
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('[>#]', 5);
+    # Handle enable prompt
+    if ($login_output =~ /Password:/i) {
+        $ssh->send($enable);
+        $ssh->waitfor('>\s*$|#\s*$', 5);
+    }
+    if ($login_output =~ />\s*$/) {
+        $ssh->exec("enable");
+        $ssh->send($enable);
+        $ssh->waitfor('#\s*$', 5);
+    }
 
-    # Collect OSPF neighbor detail
-    $ssh->send("show ip ospf neighbor detail");
-    my $neighbor_output = $ssh->waitfor('[>#]', $timeout) // '';
+    $ssh->exec("terminal length 0");
 
-    # Collect OSPF interface summary for neighbor counts
-    $ssh->send("show ip ospf interface brief");
-    my $intf_output = $ssh->waitfor('[>#]', $timeout) // '';
+    my $neighbor_output = $ssh->exec("show ip ospf neighbor");
+    my $interface_output = $ssh->exec("show ip ospf interface brief");
 
-    $ssh->send("exit");
     $ssh->close();
 
-    # Parse neighbor detail blocks
+    # Parse neighbor table
     my @neighbors;
-    my @blocks = split(/(?=Neighbor\s+\d+\.\d+\.\d+\.\d+)/i, $neighbor_output);
-
-    for my $block (@blocks) {
-        next unless $block =~ /Neighbor\s+(\d+\.\d+\.\d+\.\d+)/i;
-        my %n;
-        $n{router_id} = $1;
-        $n{state}     = $block =~ /State is (\S+)/i        ? $1 : 'UNKNOWN';
-        $n{address}   = $block =~ /Neighbor address (\S+)/i ? $1 : 'N/A';
-        $n{interface} = $block =~ /Interface address.*?(?:,\s*interface\s+)?(\S+)/i ? $1
-                      : $block =~ /on interface (\S+)/i ? $1 : 'N/A';
-        $n{dead_timer}= $block =~ /Dead timer due in\s+(\S+)/i ? $1 : 'N/A';
-        $n{priority}  = $block =~ /Neighbor priority is (\d+)/i ? $1 : 'N/A';
-        $n{dr_role}   = $block =~ /\bDR\b/i && $block =~ /This router is the/i ? 'DR'
-                      : $block =~ /\bBDR\b/i && $block =~ /This router is the/i ? 'BDR' : 'DROTHER';
-        push @neighbors, \%n;
+    for my $line (split /\n/, $neighbor_output) {
+        # Match: NeighborID  Pri  State  Dead Time  Address  Interface
+        if ($line =~ /^(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)/) {
+            push @neighbors, {
+                neighbor_id => $1,
+                priority    => $2,
+                state       => $3,
+                dead_time   => $4,
+                address     => $5,
+                interface   => $6,
+            };
+        }
     }
 
     if (!@neighbors) {
-        log_output("  No OSPF neighbors found\n\n");
-        next;
-    }
-
-    my $degraded = 0;
-    log_output(sprintf("  %-18s %-16s %-12s %-12s %s\n",
-        "Neighbor-ID", "Address", "State", "Dead-Timer", "Interface"));
-    log_output("  " . "-" x 68 . "\n");
-
-    for my $n (@neighbors) {
-        my $healthy = ($n->{state} =~ /^FULL|2WAY/i);
-        $degraded++ unless $healthy;
-        my $flag = $healthy ? '  ' : '! ';
-        log_output(sprintf("%s%-18s %-16s %-12s %-12s %s\n",
-            $flag, $n->{router_id}, $n->{address},
-            $n->{state}, $n->{dead_timer}, $n->{interface}));
-    }
-
-    log_output("\n  Total neighbors: " . scalar(@neighbors));
-    if ($degraded) {
-        log_output("  |  DEGRADED: $degraded (marked with !)\n");
-        $global_exit = 1 unless $global_exit == 2;
+        log_output("  WARNING: No OSPF neighbors found\n");
+        $any_issue = 1;
     } else {
-        log_output("  |  All neighbors healthy\n");
+        my $baseline_file = "$baseline_dir/${device}_ospf_baseline.txt";
+        my %baseline;
+
+        if (-f $baseline_file) {
+            open my $bfh, '<', $baseline_file or warn "Cannot read baseline: $!\n";
+            while (<$bfh>) {
+                chomp;
+                my ($nid, $state) = split /\t/;
+                $baseline{$nid} = $state if $nid && $state;
+            }
+            close $bfh;
+        }
+
+        printf "  %-18s %-6s %-16s %-13s %-18s %s\n",
+            'Neighbor ID', 'Pri', 'State', 'Dead Time', 'Address', 'Interface';
+        log_output(sprintf "  %-18s %-6s %-16s %-13s %-18s %s\n",
+            'Neighbor ID', 'Pri', 'State', 'Dead Time', 'Address', 'Interface')
+            if $log_fh;
+
+        for my $n (@neighbors) {
+            my $alert = '';
+            if ($n->{state} !~ /FULL/) {
+                $alert = ' <<< NOT FULL';
+                $any_issue = 1;
+            }
+            if (%baseline && exists $baseline{$n->{neighbor_id}}) {
+                if ($baseline{$n->{neighbor_id}} ne $n->{state}) {
+                    $alert .= " [CHANGED from $baseline{$n->{neighbor_id}}]";
+                    $any_issue = 1;
+                }
+            } elsif (%baseline) {
+                $alert .= ' [NEW NEIGHBOR]';
+            }
+
+            my $line = sprintf "  %-18s %-6s %-16s %-13s %-18s %s%s\n",
+                $n->{neighbor_id}, $n->{priority}, $n->{state},
+                $n->{dead_time}, $n->{address}, $n->{interface}, $alert;
+            log_output($line);
+        }
+
+        if ($save_baseline) {
+            open my $bfh, '>', $baseline_file or warn "Cannot write baseline: $!\n";
+            for my $n (@neighbors) {
+                print $bfh "$n->{neighbor_id}\t$n->{state}\n";
+            }
+            close $bfh;
+            log_output("  [Baseline saved to $baseline_file]\n");
+        }
+
+        # Show OSPF interface summary
+        log_output("\n  OSPF Interface Summary:\n");
+        for my $line (split /\n/, $interface_output) {
+            next unless $line =~ /^\S+\d+/;
+            log_output("    $line\n");
+        }
     }
+
     log_output("\n");
 }
 
-log_output("=" x 72 . "\n");
-log_output("Check complete. Exit status: $global_exit\n");
-log_output("  0=healthy  1=degraded neighbors  2=connection errors\n");
-log_output("=" x 72 . "\n");
+log_output("=" x 70 . "\n");
+log_output("Completed: $timestamp\n");
+log_output("Status: " . ($any_issue == 0 ? "ALL NEIGHBORS FULL" :
+                         $any_issue == 1 ? "ISSUES DETECTED"    :
+                                           "CONNECTION ERRORS") . "\n");
+log_output("=" x 70 . "\n");
 
 close $log_fh if $log_fh;
-exit $global_exit;
-```
+exit($any_issue ? 1 : 0);
