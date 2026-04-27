@@ -3,205 +3,154 @@ use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use POSIX qw(strftime);
+use File::Spec;
 
-# =============================================================================
-# ospf_neighbor_state_monitor.pl
-#
-# Purpose:
-#   Monitor OSPF neighbor adjacency states and alert on non-FULL neighbors.
-#   Compares current state against a saved baseline to detect state changes.
-#   Useful for post-change validation and proactive adjacency monitoring.
-#
-# Usage:
-#   Single device:  ./ospf_neighbor_state_monitor.pl --host 192.168.1.1
-#   Device file:    ./ospf_neighbor_state_monitor.pl --file devices.txt
-#   With baseline:  ./ospf_neighbor_state_monitor.pl --host 192.168.1.1 --save-baseline
-#   With logging:   ./ospf_neighbor_state_monitor.pl --file devices.txt --log ospf_audit.log
-#
-# Device file format (one per line):
-#   192.168.1.1
-#   10.0.0.1
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH key auth or credentials via environment vars:
-#     NET_USER, NET_PASS, NET_ENABLE
-#
-# Exit codes:
-#   0 = all neighbors FULL
-#   1 = one or more neighbors not FULL or state change detected
-#   2 = connection/auth error
-# =============================================================================
+=head1 ACL Audit and Compliance Check
 
-my ($host, $device_file, $log_file, $save_baseline, $baseline_dir);
-my $timeout  = 30;
-my $any_issue = 0;
+=head2 PURPOSE
+Audits all configured Access Control Lists (ACLs) on Cisco network devices,
+including ACL names, rule counts, match statistics, and interface assignments.
+Enables security compliance verification and ACL configuration tracking.
+
+=head2 USAGE
+acl_audit.pl --device <ip|hostname> --user <username> [--pass <password>] [--logfile <path>]
+acl_audit.pl --file devices.txt --user <username> [--logfile audit.log]
+
+=head2 EXAMPLES
+acl_audit.pl --device 192.168.1.1 --user admin
+acl_audit.pl --file switches.txt --user netadmin --logfile acl_results.log
+
+=head2 PREREQUISITES
+- Net::SSH::Expect module (cpan Net::SSH::Expect)
+- SSH access to Cisco IOS/IOS-XE network devices
+- Valid credentials with read access to show commands
+- Device must support 'show access-lists' and related commands
+
+=cut
+
+my ($device, $file, $username, $password, $logfile);
+my $port = 22;
+my $timeout = 20;
+my @targets;
 
 GetOptions(
-    'host=s'          => \$host,
-    'file=s'          => \$device_file,
-    'log=s'           => \$log_file,
-    'save-baseline'   => \$save_baseline,
-    'baseline-dir=s'  => \$baseline_dir,
-    'timeout=i'       => \$timeout,
-) or die "Usage: $0 --host <ip> | --file <file> [--log <file>] [--save-baseline] [--baseline-dir <dir>]\n";
+    'device=s'  => \$device,
+    'file=s'    => \$file,
+    'user=s'    => \$username,
+    'pass=s'    => \$password,
+    'logfile=s' => \$logfile,
+    'port=i'    => \$port,
+    'timeout=i' => \$timeout,
+) or die "Invalid arguments\n";
 
-die "Specify --host or --file\n" unless $host || $device_file;
+die "Specify --device or --file\n" unless ($device || $file);
+die "Username required (--user)\n" unless $username;
 
-my $user   = $ENV{NET_USER}   // die "Set NET_USER env var\n";
-my $pass   = $ENV{NET_PASS}   // die "Set NET_PASS env var\n";
-my $enable = $ENV{NET_ENABLE} // $pass;
-
-$baseline_dir //= '/tmp/ospf_baselines';
-mkdir $baseline_dir unless -d $baseline_dir;
-
-my @devices = $host ? ($host) : do {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    map { chomp; $_ } grep { /\S/ && !/^#/ } <$fh>;
-};
-
-my $log_fh;
-if ($log_file) {
-    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
+unless ($password) {
+    print "Password: ";
+    system("stty -echo") if -t STDIN;
+    chomp($password = <STDIN>);
+    system("stty echo") if -t STDIN;
+    print "\n";
 }
 
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+if ($device) {
+    push @targets, $device;
+} elsif ($file) {
+    open my $fh, '<', $file or die "Cannot open $file: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^#/ || /^\s*$/;
+        push @targets, $_;
+    }
+    close $fh;
+}
+
+my $logfh;
+if ($logfile) {
+    open $logfh, '>>', $logfile or warn "Cannot open logfile: $!\n";
+}
 
 sub log_output {
     my ($msg) = @_;
     print $msg;
-    print $log_fh $msg if $log_fh;
+    print $logfh $msg if defined $logfh;
 }
 
-log_output("=" x 70 . "\n");
-log_output("OSPF Neighbor State Monitor  -  $timestamp\n");
-log_output("=" x 70 . "\n\n");
+my $timestamp = scalar localtime;
+log_output("\n" . "=" x 60 . "\n");
+log_output("ACL Audit Report - $timestamp\n");
+log_output("=" x 60 . "\n");
 
-for my $device (@devices) {
-    log_output("Device: $device\n");
-    log_output("-" x 50 . "\n");
-
+foreach my $target (@targets) {
+    log_output("\n[Device: $target]\n");
+    
     my $ssh = Net::SSH::Expect->new(
-        host        => $device,
-        user        => $user,
-        password     => $pass,
-        raw_pty      => 1,
-        timeout      => $timeout,
-        ssh_option   => '-o StrictHostKeyChecking=no -o ConnectTimeout=15',
+        host => $target,
+        user => $username,
+        password => $password,
+        port => $port,
+        timeout => $timeout,
+        raw_pty => 1,
     );
-
-    my $login_output = eval { $ssh->login() };
-    if ($@ || !defined $login_output) {
-        log_output("  ERROR: SSH connection failed - $@\n\n");
-        $any_issue = 2;
+    
+    unless ($ssh->connect()) {
+        log_output("ERROR: Cannot connect\n");
         next;
     }
-
-    # Handle enable prompt
-    if ($login_output =~ /Password:/i) {
-        $ssh->send($enable);
-        $ssh->waitfor('>\s*$|#\s*$', 5);
+    
+    $ssh->send('terminal length 0');
+    $ssh->waitfor('.*#', 5);
+    
+    # Get ACL summary - count total ACLs
+    my @acl_list = $ssh->exec_cmd('show access-lists');
+    my $acl_count = 0;
+    my %acl_stats = (permit => 0, deny => 0, total => 0);
+    
+    foreach my $line (@acl_list) {
+        $acl_count++ if $line =~ /^(Standard|Extended|Named|IPv6|MAC)/;
+        $acl_stats{permit}++ if $line =~ /\spermit\s/;
+        $acl_stats{deny}++ if $line =~ /\sdeny\s/;
+        $acl_stats{total}++ if $line =~ /\s(permit|deny)\s/;
     }
-    if ($login_output =~ />\s*$/) {
-        $ssh->exec("enable");
-        $ssh->send($enable);
-        $ssh->waitfor('#\s*$', 5);
+    
+    log_output("Total ACLs configured: $acl_count\n");
+    log_output("ACL Rule Summary:\n");
+    log_output("  Total rules: $acl_stats{total}\n");
+    log_output("  Permit rules: $acl_stats{permit}\n");
+    log_output("  Deny rules: $acl_stats{deny}\n");
+    
+    # Get interface ACL bindings
+    my @int_status = $ssh->exec_cmd('show ip interface brief');
+    my $in_acl_count = 0;
+    my $out_acl_count = 0;
+    
+    foreach my $line (@int_status) {
+        $in_acl_count++ if $line =~ /inbound/;
+        $out_acl_count++ if $line =~ /outbound/;
     }
-
-    $ssh->exec("terminal length 0");
-
-    my $neighbor_output = $ssh->exec("show ip ospf neighbor");
-    my $interface_output = $ssh->exec("show ip ospf interface brief");
-
+    
+    log_output("Interface ACL Bindings:\n");
+    log_output("  Interfaces with inbound ACLs: $in_acl_count\n");
+    log_output("  Interfaces with outbound ACLs: $out_acl_count\n");
+    
+    # Show active ACL names
+    log_output("Active ACLs:\n");
+    my %seen;
+    foreach my $line (@acl_list) {
+        if ($line =~ /^(Standard|Extended|Named|IPv6|MAC)\s+([^\s,]+)/) {
+            my $name = $2;
+            unless ($seen{$name}++) {
+                log_output("  - $name\n");
+            }
+        }
+    }
+    
     $ssh->close();
-
-    # Parse neighbor table
-    my @neighbors;
-    for my $line (split /\n/, $neighbor_output) {
-        # Match: NeighborID  Pri  State  Dead Time  Address  Interface
-        if ($line =~ /^(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)/) {
-            push @neighbors, {
-                neighbor_id => $1,
-                priority    => $2,
-                state       => $3,
-                dead_time   => $4,
-                address     => $5,
-                interface   => $6,
-            };
-        }
-    }
-
-    if (!@neighbors) {
-        log_output("  WARNING: No OSPF neighbors found\n");
-        $any_issue = 1;
-    } else {
-        my $baseline_file = "$baseline_dir/${device}_ospf_baseline.txt";
-        my %baseline;
-
-        if (-f $baseline_file) {
-            open my $bfh, '<', $baseline_file or warn "Cannot read baseline: $!\n";
-            while (<$bfh>) {
-                chomp;
-                my ($nid, $state) = split /\t/;
-                $baseline{$nid} = $state if $nid && $state;
-            }
-            close $bfh;
-        }
-
-        printf "  %-18s %-6s %-16s %-13s %-18s %s\n",
-            'Neighbor ID', 'Pri', 'State', 'Dead Time', 'Address', 'Interface';
-        log_output(sprintf "  %-18s %-6s %-16s %-13s %-18s %s\n",
-            'Neighbor ID', 'Pri', 'State', 'Dead Time', 'Address', 'Interface')
-            if $log_fh;
-
-        for my $n (@neighbors) {
-            my $alert = '';
-            if ($n->{state} !~ /FULL/) {
-                $alert = ' <<< NOT FULL';
-                $any_issue = 1;
-            }
-            if (%baseline && exists $baseline{$n->{neighbor_id}}) {
-                if ($baseline{$n->{neighbor_id}} ne $n->{state}) {
-                    $alert .= " [CHANGED from $baseline{$n->{neighbor_id}}]";
-                    $any_issue = 1;
-                }
-            } elsif (%baseline) {
-                $alert .= ' [NEW NEIGHBOR]';
-            }
-
-            my $line = sprintf "  %-18s %-6s %-16s %-13s %-18s %s%s\n",
-                $n->{neighbor_id}, $n->{priority}, $n->{state},
-                $n->{dead_time}, $n->{address}, $n->{interface}, $alert;
-            log_output($line);
-        }
-
-        if ($save_baseline) {
-            open my $bfh, '>', $baseline_file or warn "Cannot write baseline: $!\n";
-            for my $n (@neighbors) {
-                print $bfh "$n->{neighbor_id}\t$n->{state}\n";
-            }
-            close $bfh;
-            log_output("  [Baseline saved to $baseline_file]\n");
-        }
-
-        # Show OSPF interface summary
-        log_output("\n  OSPF Interface Summary:\n");
-        for my $line (split /\n/, $interface_output) {
-            next unless $line =~ /^\S+\d+/;
-            log_output("    $line\n");
-        }
-    }
-
-    log_output("\n");
 }
 
-log_output("=" x 70 . "\n");
-log_output("Completed: $timestamp\n");
-log_output("Status: " . ($any_issue == 0 ? "ALL NEIGHBORS FULL" :
-                         $any_issue == 1 ? "ISSUES DETECTED"    :
-                                           "CONNECTION ERRORS") . "\n");
-log_output("=" x 70 . "\n");
+close $logfh if defined $logfh;
+log_output("\n" . "=" x 60 . "\n");
+log_output("Audit complete\n\n");
 
-close $log_fh if $log_fh;
-exit($any_issue ? 1 : 0);
+exit 0;
