@@ -1,194 +1,164 @@
+```perl
 #!/usr/bin/perl
+# ACL Audit Script - Collects and analyzes Access Control Lists from network devices
+# Purpose: Audit ACLs across network devices for policy compliance and configuration audit
+# Usage: ./acl_audit.pl <device_ip> [--user username] [--pass password] [--log logfile]
+# Prerequisites: Net::SSH::Expect module, SSH access to network devices
+# Supports: Cisco IOS, IOS-XE, NX-OS devices
+
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use POSIX qw(strftime);
-use File::Basename;
-use File::Path qw(make_path);
+use Time::HiRes qw(time);
 
-# =============================================================================
-# config_diff.pl - Network Device Configuration Change Detector
-#
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE devices via SSH, retrieves the running
-#   configuration, and compares it against a previously saved baseline.
-#   Highlights configuration drift for change management and audit trails.
-#
-# Usage:
-#   perl config_diff.pl --host <ip_or_hostname> [options]
-#   perl config_diff.pl --file <device_list.txt> [options]
-#
-# Options:
-#   --host   <host>       Single device IP or hostname
-#   --file   <file>       File with one device per line (IP user pass format)
-#   --user   <username>   SSH username (default: admin)
-#   --pass   <password>   SSH password
-#   --dir    <directory>  Baseline storage directory (default: ./baselines)
-#   --log    <logfile>    Optional log file path
-#   --update              Save current config as new baseline after diff
-#   --timeout <secs>      SSH timeout in seconds (default: 30)
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#
-# Output:
-#   Prints unified diff of configuration changes to STDOUT.
-#   If no baseline exists, saves current config as initial baseline.
-#
-# Author:  Network Engineering
-# Version: 1.0
-# =============================================================================
-
-my ($host, $device_file, $user, $pass, $baseline_dir, $log_file, $update, $timeout);
-$user        = 'admin';
-$baseline_dir = './baselines';
-$timeout     = 30;
+my $device = shift @ARGV or die "Usage: $0 <device_ip> [--user user] [--pass pass] [--log file]\n";
+my ($username, $password, $logfile, $timeout) = ('admin', '', '', 15);
 
 GetOptions(
-    'host=s'    => \$host,
-    'file=s'    => \$device_file,
-    'user=s'    => \$user,
-    'pass=s'    => \$pass,
-    'dir=s'     => \$baseline_dir,
-    'log=s'     => \$log_file,
-    'update'    => \$update,
+    'user=s'    => \$username,
+    'pass=s'    => \$password,
+    'log=s'     => \$logfile,
     'timeout=i' => \$timeout,
-) or die "Usage: $0 --host <host> --user <user> --pass <pass> [--dir <dir>] [--log <file>] [--update]\n";
+) or die "Invalid options\n";
 
-die "Provide --host or --file\n" unless $host || $device_file;
-die "Password required (--pass)\n" unless $pass;
-
-make_path($baseline_dir) unless -d $baseline_dir;
-
-my @devices;
-if ($host) {
-    push @devices, { host => $host, user => $user, pass => $pass };
-} else {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    while (<$fh>) {
-        chomp; next if /^\s*#/ || /^\s*$/;
-        my ($h, $u, $p) = split /\s+/;
-        push @devices, { host => $h, user => $u || $user, pass => $p || $pass };
-    }
-    close $fh;
+# Prompt for password if not provided
+if (!$password) {
+    print "Password for $username: ";
+    system('stty', '-echo');
+    chomp($password = <STDIN>);
+    system('stty', 'echo');
+    print "\n";
 }
 
-my $log_fh;
-if ($log_file) {
-    open $log_fh, '>>', $log_file or warn "Cannot open log $log_file: $!\n";
-}
+my $start_time = time();
+my %results = (
+    device => $device,
+    status => 'UNKNOWN',
+    timestamp => scalar(localtime()),
+    acl_count => 0,
+    total_rules => 0,
+    ipv4_count => 0,
+    ipv6_count => 0,
+    empty_acls => 0,
+);
 
-sub log_msg {
-    my $msg = shift;
-    my $ts  = strftime('%Y-%m-%d %H:%M:%S', localtime);
-    print "[$ts] $msg\n";
-    print $log_fh "[$ts] $msg\n" if $log_fh;
-}
-
-sub fetch_config {
-    my ($dev) = @_;
-    my $ssh = Net::SSH::Expect->new(
-        host        => $dev->{host},
-        user        => $dev->{user},
-        password    => $dev->{pass},
-        raw_pty     => 1,
-        timeout     => $timeout,
+# Establish SSH connection
+my $ssh = eval {
+    Net::SSH::Expect->new(
+        host => $device,
+        user => $username,
+        password => $password,
+        raw_pty => 1,
+        timeout => $timeout,
     );
+};
 
-    my $login = eval { $ssh->login() };
-    if ($@) {
-        log_msg("ERROR [$dev->{host}] Login failed: $@");
-        return undef;
-    }
-    if (!$login || $login =~ /denied|fail/i) {
-        log_msg("ERROR [$dev->{host}] Authentication failed");
-        return undef;
-    }
+if (!$ssh || $@) {
+    $results{status} = 'FAILED';
+    $results{error} = "Connection failed: $@";
+    output_results(\%results, time() - $start_time, $logfile);
+    exit 1;
+}
 
-    $ssh->send('terminal length 0');
-    $ssh->waitfor('\$|\#|>', 5);
-    $ssh->send('show running-config');
-    my $output = $ssh->waitfor('\#', $timeout);
+# Authenticate
+eval { $ssh->login(); };
+if ($@) {
+    $results{status} = 'FAILED';
+    $results{error} = "Authentication failed: $@";
+    output_results(\%results, time() - $start_time, $logfile);
+    exit 1;
+}
 
-    unless ($output) {
-        log_msg("ERROR [$dev->{host}] No response to show running-config");
-        return undef;
-    }
+# Collect ACL information
+my $acl_data = '';
+eval {
+    $ssh->send('show access-lists');
+    $acl_data = $ssh->read_all();
+};
 
-    $ssh->send('exit');
+if ($@) {
+    $results{status} = 'FAILED';
+    $results{error} = "Command failed: $@";
     $ssh->close();
-
-    $output =~ s/\r//g;
-    $output =~ s/^.*?^Building configuration\.\.\./Building configuration.../ms;
-    $output =~ s/\#\s*$//;
-    return $output;
+    output_results(\%results, time() - $start_time, $logfile);
+    exit 1;
 }
 
-sub load_baseline {
-    my ($host) = @_;
-    my $file = "$baseline_dir/${host}.baseline";
-    return undef unless -f $file;
-    open my $fh, '<', $file or return undef;
-    my $content = do { local $/; <$fh> };
-    close $fh;
-    return $content;
-}
+# Parse ACL output
+my %acl_info = parse_acls($acl_data);
+$results{acl_count} = scalar(keys %acl_info);
 
-sub save_baseline {
-    my ($host, $config) = @_;
-    my $file = "$baseline_dir/${host}.baseline";
-    open my $fh, '>', $file or die "Cannot write baseline $file: $!\n";
-    print $fh $config;
-    close $fh;
-}
-
-sub diff_configs {
-    my ($old, $new, $host) = @_;
-    my $old_file = "/tmp/${host}_old_$$.tmp";
-    my $new_file = "/tmp/${host}_new_$$.tmp";
-    open(my $of, '>', $old_file) or return "Cannot create temp file\n";
-    print $of $old; close $of;
-    open(my $nf, '>', $new_file) or return "Cannot create temp file\n";
-    print $nf $new; close $nf;
-    my $diff = `diff -u --label "baseline" --label "current" "$old_file" "$new_file" 2>/dev/null`;
-    unlink $old_file, $new_file;
-    return $diff;
-}
-
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-log_msg("=== Config Diff Run: $timestamp ===");
-
-for my $dev (@devices) {
-    log_msg("Connecting to $dev->{host}...");
-    my $config = fetch_config($dev);
-    next unless $config;
-
-    my $baseline = load_baseline($dev->{host});
-    if (!$baseline) {
-        log_msg("[$dev->{host}] No baseline found — saving current config as baseline");
-        save_baseline($dev->{host}, $config);
-        next;
-    }
-
-    if ($config eq $baseline) {
-        log_msg("[$dev->{host}] No configuration changes detected");
+# Analyze ACLs
+foreach my $acl (keys %acl_info) {
+    my $rules = $acl_info{$acl}{rules} // 0;
+    $results{total_rules} += $rules;
+    
+    if ($acl_info{$acl}{ipv6}) {
+        $results{ipv6_count}++;
     } else {
-        my $diff = diff_configs($baseline, $config, $dev->{host});
-        log_msg("[$dev->{host}] CONFIGURATION DRIFT DETECTED:");
-        print $diff;
-        print $log_fh $diff if $log_fh;
+        $results{ipv4_count}++;
+    }
+    
+    $results{empty_acls}++ if $rules == 0;
+}
 
-        my @additions = ($diff =~ /^\+[^+]/mg);
-        my @removals  = ($diff =~ /^-[^-]/mg);
-        log_msg(sprintf("[$dev->{host}] Summary: +%d lines added, -%d lines removed",
-            scalar @additions, scalar @removals));
+$results{status} = 'SUCCESS';
+$ssh->close();
 
-        if ($update) {
-            save_baseline($dev->{host}, $config);
-            log_msg("[$dev->{host}] Baseline updated");
+output_results(\%results, time() - $start_time, $logfile);
+exit 0;
+
+sub parse_acls {
+    my ($output) = @_;
+    my %acls;
+    my ($current_acl, $acl_type);
+    
+    foreach my $line (split /\n/, $output) {
+        next if !$line || $line =~ /^\s*$/;
+        
+        if ($line =~ /^(Standard|Extended)\s+(IP|IPv4|IPv6)\s+access list\s+(\S+)/i) {
+            $current_acl = $3;
+            $acl_type = $2;
+            $acls{$current_acl} = {
+                type => $1,
+                ipv6 => ($2 =~ /IPv6/i ? 1 : 0),
+                rules => 0,
+            };
+        } elsif ($current_acl && $line =~ /^\s+\d+\s+(permit|deny)/i) {
+            $acls{$current_acl}{rules}++;
         }
     }
+    
+    return %acls;
 }
 
-close $log_fh if $log_fh;
+sub output_results {
+    my ($results, $elapsed, $logfile) = @_;
+    
+    my $output = '';
+    $output .= "=== ACL Audit Report ===\n";
+    $output .= "Device: $results->{device}\n";
+    $output .= "Status: $results->{status}\n";
+    $output .= "Timestamp: $results->{timestamp}\n";
+    $output .= sprintf("Duration: %.2fs\n\n", $elapsed);
+    
+    if ($results->{status} eq 'SUCCESS') {
+        $output .= "ACL Count: $results->{acl_count}\n";
+        $output .= "Total Rules: $results->{total_rules}\n";
+        $output .= "IPv4 ACLs: $results->{ipv4_count}\n";
+        $output .= "IPv6 ACLs: $results->{ipv6_count}\n";
+        $output .= "Empty ACLs (warnings): $results->{empty_acls}\n";
+    } else {
+        $output .= "Error: $results->{error}\n";
+    }
+    
+    print $output;
+    
+    if ($logfile) {
+        open my $fh, '>>', $logfile or warn "Cannot open $logfile: $!\n";
+        print $fh $output;
+        close $fh;
+    }
+}
+```
