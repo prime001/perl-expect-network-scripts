@@ -1,172 +1,171 @@
-```perl
 #!/usr/bin/perl
+# =============================================================================
+# stp_audit.pl — Spanning Tree Protocol Topology Audit
+# =============================================================================
+# Purpose : Audits STP topology on Cisco IOS/IOS-XE switches. Reports root
+#           bridge status, port roles/states, and topology change (TCN)
+#           activity. Flags instability indicators that precede outages:
+#           excessive TCN counts, unexpected blocking ports, and err-disabled
+#           STP ports.
 #
-# interface_error_check.pl - Interface Error Rate Monitor for Cisco IOS/IOS-XE
+# Usage   : stp_audit.pl -h <host> [-u user] [-p pass] [-l logfile] [-t sec]
+#           stp_audit.pl -f <device_file> [-u user] [-p pass] [-l logfile]
 #
-# Purpose:
-#   Connects to one or more network devices via SSH and parses interface error
-#   counters (CRC, input errors, output drops, giants, runts). Flags interfaces
-#   whose error counts exceed configurable thresholds. Useful for identifying
-#   bad cables, duplex mismatches, or oversubscribed uplinks before they cause
-#   outages.
+# Options : -h  Single device hostname or IP
+#           -f  File with one hostname/IP per line (# lines are comments)
+#           -u  SSH username  (default: $NET_USER env var, then 'admin')
+#           -p  SSH password  (default: $NET_PASS env var)
+#           -l  Log file path (default: stp_audit_YYYYMMDD_HHMMSS.log)
+#           -t  SSH/expect timeout in seconds (default: 30)
 #
-# Usage:
-#   Single device:   ./interface_error_check.pl -h 192.168.1.1 -u admin -p secret
-#   Device list:     ./interface_error_check.pl -f devices.txt -u admin -p secret
-#   With log file:   ./interface_error_check.pl -h 192.168.1.1 -u admin -p secret -l errors.log
-#   Custom threshold:./interface_error_check.pl -h 192.168.1.1 -u admin -p secret -t 50
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH access to target devices with 'show interfaces' privilege
-#   Devices must present a standard IOS/IOS-XE prompt (hostname#)
-#
-# Output:
-#   PASS  - interface has zero or negligible errors
-#   WARN  - error count exceeds warning threshold (default: 10)
-#   FAIL  - error count exceeds critical threshold (default: 100)
-#
-# Author: Network Automation Portfolio
-# Version: 1.0
+# Prereqs : Net::SSH::Expect  — cpanm Net::SSH::Expect
+#           Cisco IOS or IOS-XE device with SSH enabled
+#           Account needs privilege 1+ (show commands only, no enable needed)
+# =============================================================================
 
 use strict;
 use warnings;
+use Getopt::Long qw(:config no_ignore_case bundling);
+use POSIX        qw(strftime);
 use Net::SSH::Expect;
-use Getopt::Long;
-use POSIX qw(strftime);
 
-my ($host, $device_file, $username, $password, $log_file, $threshold_warn, $threshold_fail);
-$threshold_warn = 10;
-$threshold_fail = 100;
+my $DEFAULT_USER    = $ENV{NET_USER} || 'admin';
+my $DEFAULT_TIMEOUT = 30;
+my $TCN_WARN_THRESH = 10;
 
+my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_log, $opt_timeout);
 GetOptions(
-    'h|host=s'      => \$host,
-    'f|file=s'      => \$device_file,
-    'u|user=s'      => \$username,
-    'p|pass=s'      => \$password,
-    'l|log=s'       => \$log_file,
-    't|threshold=i' => \$threshold_warn,
-) or die "Error in arguments. Use -h host or -f file, -u user, -p pass\n";
+    'h=s' => \$opt_host,
+    'f=s' => \$opt_file,
+    'u=s' => \$opt_user,
+    'p=s' => \$opt_pass,
+    'l=s' => \$opt_log,
+    't=i' => \$opt_timeout,
+) or usage();
 
-die "Must specify -u username\n" unless $username;
-die "Must specify -p password\n" unless $password;
-die "Must specify -h host or -f device file\n" unless $host || $device_file;
+usage() unless $opt_host || $opt_file;
 
-$threshold_fail = $threshold_warn * 10;
+my $user    = $opt_user    || $DEFAULT_USER;
+my $pass    = $opt_pass    || $ENV{NET_PASS} || '';
+my $timeout = $opt_timeout || $DEFAULT_TIMEOUT;
+my $logfile = $opt_log     || 'stp_audit_' . strftime('%Y%m%d_%H%M%S', localtime) . '.log';
 
 my @devices;
-if ($host) {
-    push @devices, $host;
-} elsif ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open device file $device_file: $!\n";
-    while (<$fh>) {
-        chomp;
-        s/#.*//;   # strip comments
-        s/^\s+|\s+$//g;
-        push @devices, $_ if $_;
-    }
+if ($opt_host) {
+    push @devices, $opt_host;
+} else {
+    open my $fh, '<', $opt_file or die "Cannot open '$opt_file': $!\n";
+    while (<$fh>) { chomp; next if /^\s*$/ || /^#/; push @devices, $_ }
     close $fh;
 }
+die "No devices to audit.\n" unless @devices;
 
-my $log_fh;
-if ($log_file) {
-    open($log_fh, '>', $log_file) or die "Cannot open log file $log_file: $!\n";
+open my $LOG, '>>', $logfile or die "Cannot open log '$logfile': $!\n";
+
+my $started = strftime('%Y-%m-%d %H:%M:%S', localtime);
+log_out("=" x 70 . "\n");
+log_out("STP Audit  —  $started\n");
+log_out("=" x 70 . "\n");
+
+my ($ok, $fail) = (0, 0);
+for my $host (@devices) {
+    log_out("\n--- $host ---\n");
+    eval { audit_device($host); $ok++ };
+    if ($@) {
+        (my $err = $@) =~ s/\n$//;
+        log_out("[FAIL] $err\n");
+        $fail++;
+    }
 }
 
-my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+log_out("\n" . "=" x 70 . "\n");
+log_out("Done. Devices OK: $ok  Failed: $fail  Log: $logfile\n");
+close $LOG;
+exit($fail ? 1 : 0);
 
-sub output {
-    my $msg = shift;
-    print $msg;
-    print $log_fh $msg if $log_fh;
-}
-
-sub check_device {
-    my $device = shift;
-    output("=" x 60 . "\n");
-    output("Device: $device  |  $timestamp\n");
-    output("=" x 60 . "\n");
+# ---------------------------------------------------------------------------
+sub audit_device {
+    my ($host) = @_;
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $device,
-        user        => $username,
-        password     => $password,
-        raw_pty     => 1,
-        timeout     => 15,
+        host     => $host,
+        user     => $user,
+        password => $pass,
+        raw_pty  => 1,
+        timeout  => $timeout,
     );
 
-    eval {
-        my $login_output = $ssh->login();
-        if ($login_output !~ /[>#]/) {
-            die "Login failed - unexpected prompt: $login_output\n";
-        }
-    };
-    if ($@) {
-        output("  ERROR: Cannot connect to $device: $@\n");
-        return;
-    }
+    my $banner = $ssh->login();
+    die "Auth failed or no prompt on $host" unless $banner =~ /[>#]/;
 
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('\#\s*$', 5);
+    $ssh->exec('terminal length 0');
+    $ssh->exec('terminal width 0');
 
-    $ssh->send("show interfaces");
-    my $output = $ssh->waitfor('\#\s*$', 30);
-
-    unless ($output) {
-        output("  ERROR: No response from 'show interfaces' on $device\n");
-        $ssh->close();
-        return;
-    }
-
-    my $current_iface = '';
-    my %iface_errors;
-
-    for my $line (split /\n/, $output) {
-        if ($line =~ /^(\S+)\s+is\s+(?:up|down|administratively down)/) {
-            $current_iface = $1;
-            $iface_errors{$current_iface} = { crc => 0, input_errors => 0, output_drops => 0, giants => 0, runts => 0 };
-        }
-        next unless $current_iface;
-        if ($line =~ /(\d+)\s+input errors.*?(\d+)\s+CRC/) {
-            $iface_errors{$current_iface}{input_errors} = $1;
-            $iface_errors{$current_iface}{crc}          = $2;
-        }
-        if ($line =~ /(\d+)\s+giants.*?(\d+)\s+runts/) {
-            $iface_errors{$current_iface}{giants} = $1;
-            $iface_errors{$current_iface}{runts}  = $2;
-        }
-        if ($line =~ /(\d+)\s+output drops/) {
-            $iface_errors{$current_iface}{output_drops} = $1;
-        }
-    }
-
-    my $issues_found = 0;
-    for my $iface (sort keys %iface_errors) {
-        my $e      = $iface_errors{$iface};
-        my $total  = $e->{input_errors} + $e->{output_drops} + $e->{crc};
-        my $status = $total == 0       ? 'PASS'
-                   : $total < $threshold_warn ? 'PASS'
-                   : $total < $threshold_fail ? 'WARN'
-                   :                            'FAIL';
-
-        next if $status eq 'PASS';
-        $issues_found++;
-        output(sprintf("  [%-4s] %-35s  CRC:%-6d InErr:%-6d OutDrop:%-6d Giants:%-5d Runts:%d\n",
-            $status, $iface,
-            $e->{crc}, $e->{input_errors}, $e->{output_drops},
-            $e->{giants}, $e->{runts}));
-    }
-
-    output("  All interfaces within thresholds (warn=$threshold_warn fail=$threshold_fail)\n") unless $issues_found;
-    output("  Total interfaces checked: " . scalar(keys %iface_errors) . "\n");
-    $ssh->send("exit");
+    my $prompt   = ($banner =~ /(\S+)\s*[>#]\s*$/) ? $1 : $host;
+    my $stp_sum  = $ssh->exec('show spanning-tree summary totals');
+    my $stp_det  = $ssh->exec('show spanning-tree detail');
     $ssh->close();
+
+    # --- parse summary -------------------------------------------------------
+    my $is_root = ($stp_sum =~ /This bridge is the root/i) ? 'YES' : 'NO';
+
+    my ($n_fwd, $n_blk, $n_lis, $n_lrn) = (0, 0, 0, 0);
+    if ($stp_sum =~ /(\d+)\s+forwarding/i)  { $n_fwd = $1 }
+    if ($stp_sum =~ /(\d+)\s+blocking/i)    { $n_blk = $1 }
+    if ($stp_sum =~ /(\d+)\s+listening/i)   { $n_lis = $1 }
+    if ($stp_sum =~ /(\d+)\s+learning/i)    { $n_lrn = $1 }
+
+    my $stp_mode = 'unknown';
+    if    ($stp_sum =~ /Rapid Spanning Tree/i) { $stp_mode = 'RSTP'  }
+    elsif ($stp_sum =~ /Multiple Spanning/i)   { $stp_mode = 'MSTP'  }
+    elsif ($stp_sum =~ /Spanning Tree/i)       { $stp_mode = 'STP'   }
+
+    # --- parse detail for TCN and err-disabled -------------------------------
+    my (%tcn, @err_dis, @half_dup);
+    my $cur_vlan = '';
+
+    for (split /\n/, $stp_det) {
+        $cur_vlan = $1 if /^(VLAN\S+)/i;
+        if (/number of topology changes\s+(\d+)/i && $cur_vlan) {
+            $tcn{$cur_vlan} = ($tcn{$cur_vlan} || 0) + $1;
+        }
+        push @err_dis,  $1 if /Port\s+(\S+).*err.disabled/i;
+        push @half_dup, $1 if /Port\s+(\S+).*half.duplex/i;
+    }
+
+    # --- report --------------------------------------------------------------
+    log_out(sprintf "Host         : %s (%s)\n", $prompt, $host);
+    log_out(sprintf "STP Mode     : %s\n",       $stp_mode);
+    log_out(sprintf "Root Bridge  : %s\n",       $is_root);
+    log_out(sprintf "Port states  : FWD=%-4d BLK=%-4d LIS=%-4d LRN=%-4d\n",
+            $n_fwd, $n_blk, $n_lis, $n_lrn);
+
+    my @high_tcn = map { "$_($tcn{$_})" }
+                   grep { $tcn{$_} > $TCN_WARN_THRESH }
+                   sort keys %tcn;
+
+    if (@high_tcn) {
+        log_out(sprintf "[WARN] High TCN (>%d): %s\n", $TCN_WARN_THRESH, join(', ', @high_tcn));
+    } else {
+        log_out("TCN Activity : within threshold\n");
+    }
+
+    log_out("[WARN] Err-disabled STP ports : " . join(', ', @err_dis)  . "\n") if @err_dis;
+    log_out("[WARN] Half-duplex STP ports  : " . join(', ', @half_dup) . "\n") if @half_dup;
+
+    if ($n_lis > 0 || $n_lrn > 0) {
+        log_out("[INFO] Ports in transitional state (LIS/LRN) — topology may be converging\n");
+    }
 }
 
-for my $dev (@devices) {
-    check_device($dev);
+# ---------------------------------------------------------------------------
+sub log_out {
+    my ($msg) = @_;
+    print $msg;
+    print $LOG $msg;
 }
 
-output("\nScan complete: " . scalar(@devices) . " device(s) checked\n");
-close $log_fh if $log_fh;
-```
+sub usage {
+    print "Usage: stp_audit.pl -h <host> | -f <file> [-u user] [-p pass] [-l log] [-t sec]\n";
+    exit 1;
+}
