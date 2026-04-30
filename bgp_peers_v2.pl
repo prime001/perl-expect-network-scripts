@@ -1,176 +1,160 @@
-```perl
 #!/usr/bin/perl
-# =============================================================================
-# bgp_route_dampening.pl - BGP Route Dampening and Flap Detection Audit
-# =============================================================================
-# Purpose:
-#   Connects to IOS/IOS-XE routers via SSH and audits BGP for dampened routes,
-#   peer instability indicators, and prefix count anomalies. Useful for
-#   identifying route flap issues before they escalate to full outages.
-#
-# Usage:
-#   ./bgp_route_dampening.pl -h 192.168.1.1 -u admin -p secret
-#   ./bgp_route_dampening.pl -f devices.txt -u admin -p secret [-l bgp_damp.log]
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH access to devices with 'show bgp' privileges
-#   devices.txt: one IP/hostname per line, lines starting with # are skipped
-#
-# Output:
-#   Prints dampened prefix count, peer reset history, and flagged anomalies.
-#   Exit code 2 if any device shows dampened routes or recent peer resets.
-# =============================================================================
-
 use strict;
 use warnings;
-use Net::SSH::Expect;
+use Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $file, $user, $pass, $logfile, $help);
-my $timeout   = 30;
-my $issues    = 0;
+# =============================================================================
+# bgp_route_monitor.pl - BGP Prefix Count Monitor with Threshold Alerting
+#
+# Purpose:
+#   Connects to IOS/IOS-XE routers via SSH and checks BGP peer prefix counts
+#   against configurable thresholds. Flags peers with anomalous route counts
+#   (too few suggesting a filter problem, too many suggesting a route leak).
+#   Useful for capacity planning audits and change-window pre/post checks.
+#
+# Usage:
+#   Single device:  perl bgp_route_monitor.pl -h 10.0.0.1 -u admin -p secret
+#   Device file:    perl bgp_route_monitor.pl -f devices.txt -u admin -p secret
+#   With logging:   perl bgp_route_monitor.pl -h 10.0.0.1 -u admin -p secret -l bgp_audit.log
+#   Set thresholds: perl bgp_route_monitor.pl -h 10.0.0.1 -u admin -p secret --min 100 --max 900000
+#
+# Device file format (one entry per line):
+#   10.0.0.1
+#   router2.example.com
+#
+# Prerequisites:
+#   - Perl modules: Expect, Getopt::Long (cpan install Expect)
+#   - SSH key-based auth recommended; password auth supported via -p flag
+#   - Router must have 'ip ssh' enabled and user with appropriate privilege
+#
+# Output:
+#   Prints per-peer prefix counts with WARN/ALERT flags to STDOUT and log file.
+# =============================================================================
+
+my ($host, $username, $password, $device_file, $log_file);
+my $min_prefixes = 1;
+my $max_prefixes = 750000;
+my $timeout      = 30;
 
 GetOptions(
     'h|host=s'     => \$host,
-    'f|file=s'     => \$file,
-    'u|user=s'     => \$user,
-    'p|pass=s'     => \$pass,
-    'l|log=s'      => \$logfile,
+    'u|user=s'     => \$username,
+    'p|pass=s'     => \$password,
+    'f|file=s'     => \$device_file,
+    'l|log=s'      => \$log_file,
+    'min=i'        => \$min_prefixes,
+    'max=i'        => \$max_prefixes,
     't|timeout=i'  => \$timeout,
-    'help'         => \$help,
-) or usage();
+) or die "Usage: $0 -h <host> | -f <file> -u <user> [-p <pass>] [-l <logfile>] [--min N] [--max N]\n";
 
-usage() if $help || !$user || !$pass || (!$host && !$file);
+die "Specify -h <host> or -f <file>\n" unless $host || $device_file;
+die "Username required (-u)\n"         unless $username;
 
 my @devices;
-if ($file) {
-    open my $fh, '<', $file or die "Cannot open device file '$file': $!\n";
-    while (<$fh>) {
-        chomp;
-        next if /^\s*#/ || /^\s*$/;
-        push @devices, $_;
-    }
-    close $fh;
-} else {
+if ($host) {
     push @devices, $host;
+} else {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+    while (<$fh>) { chomp; push @devices, $_ if /\S/ && !/^#/ }
+    close $fh;
 }
 
 my $log_fh;
-if ($logfile) {
-    open $log_fh, '>>', $logfile or warn "Cannot open log '$logfile': $! — logging to STDOUT only\n";
+if ($log_file) {
+    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
 }
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-output("=" x 70);
-output("BGP Route Dampening Audit — $ts");
-output("=" x 70);
-
-for my $device (@devices) {
-    output("\n[*] Connecting to $device ...");
-
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host        => $device,
-            user        => $user,
-            password    => $pass,
-            raw_pty     => 1,
-            timeout     => $timeout,
-        );
-    };
-    if ($@ || !$ssh) {
-        output("  [ERROR] Failed to create SSH session for $device: $@");
-        $issues++;
-        next;
-    }
-
-    my $login = eval { $ssh->login() };
-    if ($@ || !$login) {
-        output("  [ERROR] Authentication failed for $device");
-        $issues++;
-        next;
-    }
-
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('\$|#|>', 5);
-
-    # Check for dampened BGP routes
-    $ssh->send("show ip bgp dampened-paths\n");
-    my $damp_out = $ssh->waitfor('\$|#|>', $timeout);
-    my $damp_count = 0;
-    $damp_count++ while $damp_out =~ /^\s*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/mg;
-
-    if ($damp_count > 0) {
-        output("  [WARN]  $damp_count dampened prefix(es) found on $device");
-        $issues++;
-    } else {
-        output("  [OK]    No dampened prefixes on $device");
-    }
-
-    # Check BGP peer reset counts from summary
-    $ssh->send("show ip bgp neighbors | include BGP neighbor|resets\n");
-    my $peer_out = $ssh->waitfor('\$|#|>', $timeout);
-    my $reset_total = 0;
-    while ($peer_out =~ /(\d+)\s+resets/g) {
-        $reset_total += $1;
-    }
-
-    if ($reset_total > 0) {
-        output("  [WARN]  $reset_total cumulative BGP peer reset(s) on $device");
-        $issues++;
-    } else {
-        output("  [OK]    No BGP peer resets recorded on $device");
-    }
-
-    # Check prefix counts — flag peers exceeding 80% of max-prefix
-    $ssh->send("show ip bgp neighbors | include BGP neighbor|prefixes\n");
-    my $prefix_out = $ssh->waitfor('\$|#|>', $timeout);
-    my $current_peer = '';
-    for my $line (split /\n/, $prefix_out) {
-        if ($line =~ /BGP neighbor is (\S+)/) {
-            $current_peer = $1;
-        }
-        if ($line =~ /(\d+) accepted prefixes.*maximum (\d+)/) {
-            my ($cur, $max) = ($1, $2);
-            my $pct = int(($cur / $max) * 100);
-            if ($pct >= 80) {
-                output("  [WARN]  Peer $current_peer at ${pct}% of max-prefix ($cur/$max) on $device");
-                $issues++;
-            }
-        }
-    }
-
-    $ssh->close();
-}
-
-output("\n" . "=" x 70);
-output("Audit complete. " . ($issues ? "Issues found: $issues" : "All checks passed."));
-output("=" x 70);
-
-close $log_fh if $log_fh;
-exit($issues ? 2 : 0);
-
-sub output {
+sub log_print {
     my ($msg) = @_;
-    print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
+    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    print "[$ts] $msg\n";
+    print $log_fh "[$ts] $msg\n" if $log_fh;
 }
 
-sub usage {
-    print <<'USAGE';
-Usage: bgp_route_dampening.pl -u USER -p PASS (-h HOST | -f FILE) [-l LOG] [-t TIMEOUT]
+sub audit_device {
+    my ($device) = @_;
 
-  -h, --host     Single device IP or hostname
-  -f, --file     File containing one device per line
-  -u, --user     SSH username
-  -p, --pass     SSH password
-  -l, --log      Optional log file (appended)
-  -t, --timeout  SSH timeout in seconds (default: 30)
-  --help         Show this help
+    log_print("Connecting to $device ...");
 
-Exit codes: 0 = clean, 2 = issues found
-USAGE
-    exit 1;
+    my @cmd = ('ssh', '-o', 'StrictHostKeyChecking=no',
+                      '-o', 'ConnectTimeout=10',
+                      "$username\@$device");
+
+    my $exp = Expect->new;
+    $exp->raw_pty(1);
+    $exp->log_stdout(0);
+    $exp->spawn(@cmd) or do { log_print("ERROR: Cannot spawn SSH for $device: $!"); return };
+
+    my $authed = 0;
+    $exp->expect($timeout,
+        [ qr/[Pp]assword[:\s]/,         sub { $exp->send("$password\r"); exp_continue } ],
+        [ qr/[#>]\s*$/,                 sub { $authed = 1 } ],
+        [ qr/Connection refused/,       sub { log_print("ERROR: SSH refused on $device") } ],
+        [ qr/No route to host/,         sub { log_print("ERROR: No route to $device") } ],
+        [ qr/Host key verification/,    sub { log_print("ERROR: Host key mismatch on $device") } ],
+        [ timeout => sub { log_print("ERROR: Timeout connecting to $device") } ],
+    );
+
+    unless ($authed) {
+        $exp->soft_close;
+        return;
+    }
+
+    $exp->send("terminal length 0\r");
+    $exp->expect($timeout, qr/[#>]\s*$/);
+
+    $exp->send("show ip bgp summary\r");
+    my $summary = '';
+    $exp->expect($timeout,
+        [ qr/[#>]\s*$/m, sub { $summary = $exp->before() . $exp->match() } ],
+        [ timeout        => sub { log_print("WARN: Timeout on bgp summary from $device") } ],
+    );
+
+    unless ($summary) {
+        log_print("WARN: No BGP summary output from $device");
+        $exp->send("exit\r");
+        $exp->soft_close;
+        return;
+    }
+
+    log_print("--- BGP Prefix Audit: $device ---");
+
+    my @peers;
+    for my $line (split /\n/, $summary) {
+        # IOS bgp summary peer lines: IP state/up-time PfxRcd
+        if ($line =~ /^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\S+\s+(\d+|NoNeg|Active|Idle|Connect)\s*$/) {
+            push @peers, { ip => $1, pfx => $2 };
+        }
+    }
+
+    unless (@peers) {
+        log_print("  No established BGP peers found on $device");
+        $exp->send("exit\r");
+        $exp->soft_close;
+        return;
+    }
+
+    for my $peer (@peers) {
+        my $ip  = $peer->{ip};
+        my $pfx = $peer->{pfx};
+
+        if ($pfx =~ /^\d+$/) {
+            my $flag = '';
+            $flag = ' [WARN: below minimum]' if $pfx < $min_prefixes;
+            $flag = ' [ALERT: exceeds maximum - possible route leak!]' if $pfx > $max_prefixes;
+            log_print(sprintf("  Peer %-18s  PfxRcd: %7d%s", $ip, $pfx, $flag));
+        } else {
+            log_print(sprintf("  Peer %-18s  State: %s [not established]", $ip, $pfx));
+        }
+    }
+
+    $exp->send("exit\r");
+    $exp->soft_close;
 }
-```
+
+log_print("BGP route monitor started — min=$min_prefixes max=$max_prefixes");
+audit_device($_) for @devices;
+log_print("BGP route monitor complete.");
+close $log_fh if $log_fh;
