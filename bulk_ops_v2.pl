@@ -1,170 +1,187 @@
-```perl
 #!/usr/bin/perl
-#
-# acl_audit.pl - Bulk ACL Audit Tool for Cisco IOS Devices
-#
-# Purpose:
-#   Connects to one or more network devices and audits access control lists
-#   (ACLs). Reports ACL names, entry counts, and flags any ACLs containing
-#   permit-any rules that may represent security risks.
-#
-# Usage:
-#   Single device:  perl acl_audit.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:    perl acl_audit.pl -f devices.txt -u admin -p secret
-#   With logging:   perl acl_audit.pl -f devices.txt -u admin -p secret -l acl_audit.log
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#
-# Device file format (one IP/hostname per line, blank lines and # comments ignored):
-#   192.168.1.1
-#   192.168.1.2
-#   # This device is offline
-#   router-core-01
-#
-# Author: Network Automation Portfolio
-# Version: 1.0
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use POSIX qw(strftime);
+use Carp;
 
-my ($host, $device_file, $username, $password, $log_file);
-my $timeout = 30;
+=head1 NAME
+007_interface_stats_monitor.pl - Interface statistics and health monitoring
 
+=head1 SYNOPSIS
+    perl 007_interface_stats_monitor.pl --host 192.168.1.1 --user admin --pass password [--logfile report.txt]
+    perl 007_interface_stats_monitor.pl --file devices.txt --user admin --pass password [--logfile report.txt]
+
+=head1 DESCRIPTION
+Monitors interface health across Cisco IOS devices by collecting statistics on errors, 
+discards, and operational status. Identifies problematic interfaces with high error rates 
+or unexpected operational states. Useful for preventive maintenance and troubleshooting.
+
+=head1 PREREQUISITES
+- Net::SSH::Expect installed (cpan -i Net::SSH::Expect)
+- SSH access enabled on devices
+- Read-only credentials sufficient for show commands
+- Cisco IOS 12.0 or later (or compatible firmware)
+
+=head1 PARAMETERS
+    --host/-h       Device IP or hostname (or use --file for bulk)
+    --file/-f       File with device IPs/hostnames, one per line
+    --user/-u       SSH username
+    --pass/-p       SSH password
+    --timeout/-t    SSH timeout in seconds (default: 20)
+    --logfile/-l    Append results to log file (optional)
+    --verbose/-v    Enable verbose error output
+
+=head1 EXAMPLE
+    perl 007_interface_stats_monitor.pl --file production_devices.txt \
+        --user readuser --pass readpass --logfile interface_health.log
+
+=cut
+
+my ($host, $file, $user, $pass, $timeout, $logfile, $verbose);
 GetOptions(
-    'h|host=s'     => \$host,
-    'f|file=s'     => \$device_file,
-    'u|user=s'     => \$username,
-    'p|pass=s'     => \$password,
-    'l|log=s'      => \$log_file,
-    't|timeout=i'  => \$timeout,
-) or die "Usage: $0 [-h host|-f file] -u user -p pass [-l logfile] [-t timeout]\n";
+    'host|h=s'      => \$host,
+    'file|f=s'      => \$file,
+    'user|u=s'      => \$user,
+    'pass|p=s'      => \$pass,
+    'timeout|t=i'   => \$timeout,
+    'logfile|l=s'   => \$logfile,
+    'verbose|v'     => \$verbose,
+) or die "Usage: $0 --host <ip> --user <user> --pass <pass> [options]\n";
 
-die "ERROR: Provide -h <host> or -f <file>\n" unless $host || $device_file;
-die "ERROR: -u username required\n" unless $username;
-die "ERROR: -p password required\n" unless $password;
+die "Error: Specify --host or --file\n" unless ($host || $file);
+die "Error: --user and --pass are required\n" unless ($user && $pass);
 
-my @devices;
-if ($host) {
-    push @devices, $host;
-} else {
-    open(my $fh, '<', $device_file) or die "ERROR: Cannot open $device_file: $!\n";
-    while (<$fh>) {
-        chomp;
-        next if /^\s*$/ || /^\s*#/;
-        push @devices, $_;
-    }
-    close $fh;
+$timeout ||= 20;
+
+my @devices = $host ? ($host) : read_device_file($file);
+die "Error: No devices found\n" unless @devices;
+
+my $full_report;
+foreach my $device (@devices) {
+    $full_report .= monitor_interfaces($device, $user, $pass, $timeout);
 }
 
-my $log_fh;
-if ($log_file) {
-    open($log_fh, '>>', $log_file) or warn "WARN: Cannot open log $log_file: $!\n";
-}
+print $full_report;
+write_logfile($logfile, $full_report) if $logfile;
 
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-output("=" x 60);
-output("ACL Audit Report - $timestamp");
-output("Devices to audit: " . scalar(@devices));
-output("=" x 60);
+exit 0;
 
-my %summary = (processed => 0, failed => 0, total_acls => 0, risky_acls => 0);
-
-for my $device (@devices) {
-    output("\n--- Device: $device ---");
-    my $result = audit_device($device, $username, $password, $timeout);
-    if ($result->{error}) {
-        output("  FAILED: $result->{error}");
-        $summary{failed}++;
-    } else {
-        $summary{processed}++;
-        $summary{total_acls} += $result->{acl_count};
-        $summary{risky_acls} += $result->{risky_count};
-    }
-}
-
-output("\n" . "=" x 60);
-output("SUMMARY");
-output("  Devices successful : $summary{processed}");
-output("  Devices failed     : $summary{failed}");
-output("  Total ACLs found   : $summary{total_acls}");
-output("  Risky ACLs (permit any): $summary{risky_acls}");
-output("=" x 60);
-
-close $log_fh if $log_fh;
-
-sub audit_device {
-    my ($dev, $user, $pass, $tout) = @_;
-    my %result = (acl_count => 0, risky_count => 0);
-
-    my $ssh = Net::SSH::Expect->new(
-        host        => $dev,
-        user        => $user,
-        password    => $pass,
-        timeout     => $tout,
-        raw_pty     => 1,
-    );
-
+sub monitor_interfaces {
+    my ($device, $user, $pass, $timeout) = @_;
+    my $report = "=" x 70 . "\n";
+    $report .= "DEVICE: $device\n";
+    $report .= "=" x 70 . "\n";
+    
+    my $ssh;
     eval {
-        my $login = $ssh->login();
-        if ($login !~ /[>#]/) {
-            die "Authentication failed or unexpected prompt\n";
-        }
-        $ssh->send("terminal length 0\n");
-        $ssh->waitfor('\s*[>#]', 10) or die "Timeout after terminal length\n";
-
-        $ssh->send("show ip access-lists\n");
-        my $output = '';
-        while (1) {
-            my $chunk = $ssh->waitfor('\s*[>#]', $tout);
-            last unless defined $chunk;
-            $output .= $chunk;
-            last if $chunk =~ /[>#]\s*$/;
-        }
-
-        my %acls;
-        my $current_acl = '';
-        for my $line (split /\r?\n/, $output) {
-            if ($line =~ /^(?:Standard|Extended)\s+IP\s+access\s+list\s+(\S+)/i) {
-                $current_acl = $1;
-                $acls{$current_acl} //= { entries => 0, risky => 0 };
-            } elsif ($current_acl && $line =~ /^\s+\d+/) {
-                $acls{$current_acl}{entries}++;
-                if ($line =~ /permit\s+any\s+any/i || $line =~ /permit\s+any\s*$/i) {
-                    $acls{$current_acl}{risky} = 1;
+        $ssh = Net::SSH::Expect->new(
+            host     => $device,
+            user     => $user,
+            password => $pass,
+            timeout  => $timeout,
+            raw_pty  => 1,
+        );
+        $ssh->login() or croak "SSH login failed";
+    };
+    
+    if ($@) {
+        $report .= "[FAILED] Connection error: $@\n\n";
+        warn "[ERROR] $device: $@\n" if $verbose;
+        return $report;
+    }
+    
+    eval {
+        # Disable paging to ensure complete output
+        $ssh->send("terminal length 0");
+        $ssh->waitfor('>', $timeout);
+        
+        # Retrieve interface statistics
+        $ssh->send("show interfaces");
+        my $output = $ssh->waitfor('>', $timeout);
+        
+        my %interfaces;
+        my $current_iface = '';
+        
+        # Parse interface output
+        foreach my $line (split /\n/, $output) {
+            if ($line =~ /^(\S+)\s+is\s+(up|down),\s+line\s+protocol\s+is\s+(up|down)/i) {
+                $current_iface = $1;
+                $interfaces{$current_iface} = {
+                    admin_status => lc($2),
+                    protocol_status => lc($3),
+                    errors => 0,
+                    discards => 0,
+                };
+            }
+            
+            if ($current_iface) {
+                if ($line =~ /(\d+)\s+input errors/) {
+                    $interfaces{$current_iface}{errors} += $1;
+                }
+                if ($line =~ /(\d+)\s+output errors/) {
+                    $interfaces{$current_iface}{errors} += $1;
+                }
+                if ($line =~ /(\d+)\s+(dropped|discarded)/) {
+                    $interfaces{$current_iface}{discards} += $1;
                 }
             }
         }
-
-        for my $acl_name (sort keys %acls) {
-            my $flag = $acls{$acl_name}{risky} ? ' [RISK: permit any]' : '';
-            output(sprintf("  %-30s  entries: %3d%s",
-                $acl_name, $acls{$acl_name}{entries}, $flag));
-            $result{acl_count}++;
-            $result{risky_count}++ if $acls{$acl_name}{risky};
+        
+        # Generate report
+        my ($up_count, $down_count, $error_count) = (0, 0, 0);
+        
+        foreach my $iface (sort keys %interfaces) {
+            my $data = $interfaces{$iface};
+            
+            if ($data->{admin_status} eq 'down' || $data->{protocol_status} eq 'down') {
+                $down_count++;
+                $report .= "[DOWN] $iface (admin: $data->{admin_status}, "
+                        .  "protocol: $data->{protocol_status})\n";
+            } else {
+                $up_count++;
+            }
+            
+            if ($data->{errors} > 0 || $data->{discards} > 0) {
+                $error_count++;
+                $report .= "  [ISSUES] $iface: $data->{errors} errors, "
+                        .  "$data->{discards} discards\n";
+            }
         }
-
-        output("  No ACLs configured") unless %acls;
-        $ssh->send("exit\n");
+        
+        $report .= "\nSUMMARY:\n";
+        $report .= "  Total Interfaces: " . (scalar keys %interfaces) . "\n";
+        $report .= "  Up: $up_count | Down: $down_count | With Errors: $error_count\n\n";
+        
+        $ssh->send("exit");
+        $ssh->close();
+        
     };
-
+    
     if ($@) {
-        $result{error} = $@;
-        $result{error} =~ s/\n/ /g;
-        chomp $result{error};
+        $report .= "[ERROR] Command execution failed: $@\n\n";
+        warn "[ERROR] $device execution: $@\n" if $verbose;
+        $ssh->close() if $ssh;
     }
-
-    return \%result;
+    
+    return $report;
 }
 
-sub output {
-    my ($msg) = @_;
-    print "$msg\n";
-    if ($log_fh) {
-        print $log_fh "$msg\n";
-    }
+sub read_device_file {
+    my ($file) = @_;
+    open my $fh, '<', $file or croak "Cannot open $file: $!";
+    my @devices = map { chomp; $_ } grep { /\S/ } <$fh>;
+    close $fh;
+    return @devices;
 }
-```
+
+sub write_logfile {
+    my ($file, $content) = @_;
+    open my $fh, '>>', $file or croak "Cannot write to $file: $!";
+    printf $fh "[%s] Interface Statistics Report\n", scalar localtime;
+    print $fh $content;
+    print $fh "\n";
+    close $fh;
+}
+
+__END__
