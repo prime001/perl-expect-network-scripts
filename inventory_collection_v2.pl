@@ -1,163 +1,157 @@
-```perl
 #!/usr/bin/perl
-=head1 NAME
-device_access_auditor.pl - Verify SSH connectivity and authentication to network devices
-
-=head1 SYNOPSIS
-./device_access_auditor.pl -d <device> [OPTIONS]
-./device_access_auditor.pl -f <device_list.txt> [OPTIONS]
-
-=head1 DESCRIPTION
-Audits SSH accessibility to network devices. Tests both key-based and password
-authentication, validates shell access with diagnostic commands. Essential for
-verifying device reachability before executing production automation scripts.
-Reports which authentication methods work and identifies access failures.
-
-=head1 OPTIONS
-  -d, --device HOST       Single device IP or hostname
-  -f, --file FILE         File with list of devices (one per line)
-  -u, --username USER     SSH username (default: admin)
-  -p, --password PASS     SSH password (uses key if not specified)
-  -k, --keyfile PATH      SSH private key file (default: ~/.ssh/id_rsa)
-  -t, --timeout SECS      SSH timeout in seconds (default: 15)
-  -l, --logfile FILE      Write results to log file
-  -q, --quick             Quick mode - test connection only
-  -v, --verbose           Verbose output
-
-=head1 PREREQUISITES
-Net::SSH::Expect, Getopt::Long (core Perl modules)
-
-=head1 AUTHOR
-Network Engineering Automation Suite
-
-=cut
+# =============================================================================
+# cdp_lldp_discovery.pl - CDP/LLDP Neighbor Discovery and Topology Mapper
+#
+# Purpose : Collect CDP and LLDP neighbor tables from network devices to
+#           document adjacencies, verify cabling, and build topology maps.
+#           Useful for auditing undocumented links and onboarding new sites.
+#
+# Usage   : perl cdp_lldp_discovery.pl -h 10.0.0.1 -u admin -p secret
+#           perl cdp_lldp_discovery.pl -f devices.txt -u admin -p secret -l out.log
+#           perl cdp_lldp_discovery.pl -h 10.0.0.1 -u admin -p secret --lldp-only
+#
+# Options : -h host       Single device IP or hostname
+#           -f file       File with one device per line (# = comment)
+#           -u user       SSH username
+#           -p pass       SSH password
+#           -l logfile    Write output to file in addition to STDOUT
+#           -t timeout    SSH timeout in seconds (default: 30)
+#           --lldp-only   Skip CDP collection (non-Cisco or CDP disabled)
+#
+# Prereqs : cpan install Net::SSH::Expect Getopt::Long
+#           SSH enabled; read-only privilege level sufficient
+# Tested  : Cisco IOS 15.x, IOS-XE 16.x, NX-OS 9.x
+# =============================================================================
 
 use strict;
 use warnings;
-use Getopt::Long;
 use Net::SSH::Expect;
-use Time::HiRes qw(time);
+use Getopt::Long;
+use POSIX qw(strftime);
 
-my %opts = (
-    username => 'admin',
-    timeout  => 15,
-    quick    => 0,
-    verbose  => 0,
-);
+my ($host, $file, $user, $pass, $logfile, $lldp_only, $timeout);
+$timeout = 30;
 
 GetOptions(
-    'file|f=s'     => \$opts{file},
-    'device|d=s'   => \$opts{device},
-    'username|u=s' => \$opts{username},
-    'password|p=s' => \$opts{password},
-    'keyfile|k=s'  => \$opts{keyfile},
-    'timeout|t=i'  => \$opts{timeout},
-    'logfile|l=s'  => \$opts{logfile},
-    'quick|q'      => \$opts{quick},
-    'verbose|v'    => \$opts{verbose},
-) or die "Error in command line arguments\n";
+    'h|host=s'    => \$host,
+    'f|file=s'    => \$file,
+    'u|user=s'    => \$user,
+    'p|pass=s'    => \$pass,
+    'l|log=s'     => \$logfile,
+    't|timeout=i' => \$timeout,
+    'lldp-only'   => \$lldp_only,
+) or die usage();
 
-die "Specify either --file or --device\n" unless $opts{file} || $opts{device};
+die usage() unless ($host || $file) && $user && $pass;
 
 my @devices;
-if ($opts{device}) {
-    push @devices, $opts{device};
-} else {
-    open my $fh, '<', $opts{file} or die "Cannot open $opts{file}: $!\n";
-    while (<$fh>) {
-        chomp;
-        next if /^\s*#/ || /^\s*$/;
-        push @devices, $_;
-    }
+if ($file) {
+    open(my $fh, '<', $file) or die "Cannot open '$file': $!\n";
+    while (<$fh>) { chomp; next if /^\s*$/ || /^#/; push @devices, $_; }
     close $fh;
+} else {
+    @devices = ($host);
 }
 
-my $logfh;
-open $logfh, '>', $opts{logfile} or die "Cannot open logfile: $!\n" if $opts{logfile};
+my $log_fh;
+if ($logfile) {
+    open($log_fh, '>', $logfile) or die "Cannot open log '$logfile': $!\n";
+}
 
-my ($passed, $failed, $warned) = (0, 0, 0);
-my @results;
+my $stamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+out("CDP/LLDP Neighbor Discovery Report  —  $stamp\n" . "=" x 68 . "\n");
 
-foreach my $device (@devices) {
-    my $start = time;
-    printf "[*] %-25s ", $device;
-    
-    my ($status, $msg, $auth_type) = test_device($device);
-    my $elapsed = time - $start;
-    
-    if ($status eq 'PASS') {
-        print "OK ";
-        $passed++;
-    } elsif ($status eq 'WARN') {
-        print "WARN ";
-        $warned++;
+for my $dev (@devices) {
+    out("\n[*] Connecting to $dev ...\n");
+
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host       => $dev,
+            user       => $user,
+            password   => $pass,
+            raw_pty    => 1,
+            timeout    => $timeout,
+            ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+        );
+    };
+    if ($@ || !$ssh) { out("[!] SSH init failed for $dev: $@\n"); next; }
+
+    my $logged_in = eval { $ssh->login() };
+    if ($@ || !$logged_in) { out("[!] Auth failed for $dev\n"); next; }
+
+    $ssh->exec("terminal length 0");
+
+    out("-" x 68 . "\nDevice: $dev\n" . "-" x 68 . "\n");
+
+    unless ($lldp_only) {
+        my $cdp = $ssh->exec("show cdp neighbors detail");
+        out("\n--- CDP Neighbors ---\n");
+        if ($cdp && $cdp !~ /CDP is not enabled|% Invalid/i) {
+            print_neighbors(parse_cdp($cdp));
+        } else {
+            out("  CDP not enabled or no neighbors found\n");
+        }
+    }
+
+    my $lldp = $ssh->exec("show lldp neighbors detail");
+    out("\n--- LLDP Neighbors ---\n");
+    if ($lldp && $lldp !~ /LLDP is not enabled|% Invalid/i) {
+        print_neighbors(parse_lldp($lldp));
     } else {
-        print "FAIL ";
-        $failed++;
+        out("  LLDP not enabled or no neighbors found\n");
     }
-    printf "(%.2fs)\n", $elapsed;
-    
-    push @results, {
-        device => $device,
-        status => $status,
-        message => $msg,
-        auth => $auth_type,
-        time => $elapsed
-    };
+
+    $ssh->close();
 }
 
-print "\n" . "="x60 . "\n";
-print "SUMMARY: Passed=$passed  Warned=$warned  Failed=$failed\n";
-print "="x60 . "\n";
+out("\n" . "=" x 68 . "\nDone. Scanned " . scalar(@devices) . " device(s).\n");
+close($log_fh) if $log_fh;
 
-if ($opts{verbose} || $opts{logfile}) {
-    foreach my $r (@results) {
-        my $line = sprintf("%s [%s] %s (auth: %s)",
-            $r->{device}, $r->{status}, $r->{message}, $r->{auth});
-        print "$line\n" if $opts{verbose};
-        print $logfh "$line\n" if $logfh;
+# ---- Parsers ----------------------------------------------------------------
+
+sub parse_cdp {
+    my @rows; my %cur;
+    for (split /\n/, $_[0]) {
+        if (/^Device ID:\s*(.+)/)                    { push @rows, {%cur} if %cur; %cur = (id => $1); }
+        elsif (/IP address:\s*(\S+)/i)               { $cur{ip}  ||= $1; }
+        elsif (/Interface:\s*(\S+),.*Port ID.*?:\s*(\S+)/i) { @cur{qw(local remote)} = ($1,$2); }
+        elsif (/Platform:\s*([^,]+)/)                { ($cur{plat} = $1) =~ s/\s+$//; }
+    }
+    push @rows, {%cur} if %cur;
+    return @rows;
+}
+
+sub parse_lldp {
+    my @rows; my %cur;
+    for (split /\n/, $_[0]) {
+        if (/System Name:\s*(.+)/)                   { push @rows, {%cur} if %cur; %cur = (id => $1); }
+        elsif (/Management Addr.*?(\d+\.\d+\.\d+\.\d+)/i) { $cur{ip} ||= $1; }
+        elsif (/Local Intf:\s*(\S+)/i)               { $cur{local}  = $1; }
+        elsif (/Port id:\s*(\S+)/i)                  { $cur{remote} = $1; }
+        elsif (/System Description:\s*(.+)/)         { ($cur{plat} = $1) =~ s/\s+$//; }
+    }
+    push @rows, {%cur} if %cur;
+    return @rows;
+}
+
+sub print_neighbors {
+    my @rows = @_;
+    unless (@rows) { out("  No neighbors found\n"); return; }
+    out(sprintf("  %-32s %-16s %-20s %-18s\n", "Neighbor", "IP", "Local Port", "Remote Port"));
+    out("  " . "-" x 88 . "\n");
+    for my $n (@rows) {
+        out(sprintf("  %-32s %-16s %-20s %-18s\n",
+            substr($n->{id}     // 'N/A', 0, 31),
+            substr($n->{ip}     // 'N/A', 0, 15),
+            substr($n->{local}  // 'N/A', 0, 19),
+            substr($n->{remote} // 'N/A', 0, 17),
+        ));
     }
 }
 
-close $logfh if $logfh;
-
-sub test_device {
-    my ($device) = @_;
-    
-    return ('FAIL', 'Invalid device name', 'none') unless $device;
-    
-    my $ssh = Net::SSH::Expect->new(
-        host => $device,
-        user => $opts{username},
-        password => $opts{password} || '',
-        timeout => $opts{timeout},
-        ($opts{keyfile} ? (key_path => $opts{keyfile}) : ()),
-    );
-    
-    my $auth_type = 'unknown';
-    
-    eval {
-        $ssh->login();
-        $auth_type = $opts{keyfile} ? 'key' : ($opts{password} ? 'password' : 'key');
-    };
-    
-    return ('FAIL', "Connection error: $@", $auth_type) if $@;
-    return ('FAIL', 'Authentication failed', $auth_type) unless $ssh->{_connected};
-    
-    if ($opts{quick}) {
-        eval { $ssh->close() };
-        return ('PASS', 'SSH access OK', $auth_type);
-    }
-    
-    my $test_ok = 0;
-    eval {
-        my $output = $ssh->exec('show version 2>/dev/null || uname -a');
-        $test_ok = 1 if $output && length($output) > 20;
-    };
-    
-    eval { $ssh->close() };
-    
-    return ('FAIL', 'Command execution failed', $auth_type) unless $test_ok;
-    return ('PASS', 'SSH and shell verified', $auth_type);
+sub out {
+    print $_[0];
+    print $log_fh $_[0] if $log_fh;
 }
-```
+
+sub usage { "Usage: $0 -h <host>|-f <file> -u <user> -p <pass> [-l log] [-t sec] [--lldp-only]\n" }
