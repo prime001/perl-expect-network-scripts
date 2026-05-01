@@ -1,168 +1,152 @@
+```perl
 #!/usr/bin/perl
-#
-# stp_audit.pl - Spanning Tree Protocol Root Bridge and Port State Audit
-#
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE switches via SSH and audits the STP topology
-#   per VLAN. Identifies root bridges, flags unexpected root elections, and
-#   reports blocking port counts. Useful for verifying STP convergence after
-#   topology changes or validating a reference root bridge across the fleet.
-#
-# Usage:
-#   ./stp_audit.pl -h <host> [-u user] [-p pass] [-r root_mac] [-l logfile]
-#   ./stp_audit.pl -f <device_file> [-u user] [-p pass] [-r root_mac] [-l logfile]
-#
-# Options:
-#   -h <host>      Single device IP or hostname
-#   -f <file>      File with one device per line (# lines are comments)
-#   -u <user>      SSH username (default: SSH_USER env, then 'admin')
-#   -p <pass>      SSH password (default: SSH_PASS env)
-#   -r <root_mac>  Expected root bridge MAC (e.g. 0011.2233.4455); warns if any
-#                  VLAN has a different root
-#   -l <logfile>   Append output to this file in addition to STDOUT
-#
-# Prerequisites:
-#   Perl modules: Expect, Getopt::Long
-#   SSH access with privilege level sufficient for 'show spanning-tree'
-#   Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x
-#
-# Exit codes: 0=clean, 1=warnings (unexpected root), 2=connection errors
-
 use strict;
 use warnings;
 use Expect;
 use Getopt::Long;
-use POSIX qw(strftime);
+use Time::Piece;
+use IO::Handle;
 
-my ($host, $device_file, $username, $password, $expected_root, $logfile);
-my $timeout = 30;
+=head1 PORT CHANNEL AUDIT SCRIPT
+
+Purpose:
+  Audits port channel (EtherChannel/LAG) configurations and status on network devices.
+  Reports channel status, member interfaces, protocol type, and identifies misconfigurations.
+
+Usage:
+  ./port_channel_audit.pl --host <device_ip> [--user <username>] [--pass <password>] [--log <file>]
+  ./port_channel_audit.pl --file <device_list.txt>
+
+Prerequisites:
+  - Expect Perl module (install via: cpan Expect)
+  - SSH access to network devices
+  - Valid username/password credentials
+  - Devices must support 'show etherchannel' commands (Cisco IOS/IOS-XE/NX-OS)
+
+Examples:
+  perl port_channel_audit.pl --host 192.168.1.1 --user netadmin --pass mypass123
+  perl port_channel_audit.pl --file devices.txt --log port_channels_$(date +%Y%m%d).log
+
+=cut
+
+my ($host, $hostfile, $username, $password, $logfile, $timeout, $help);
 
 GetOptions(
-    'h=s' => \$host,
-    'f=s' => \$device_file,
-    'u=s' => \$username,
-    'p=s' => \$password,
-    'r=s' => \$expected_root,
-    'l=s' => \$logfile,
-) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-r root_mac] [-l logfile]\n";
+    'host=s'     => \$host,
+    'file=s'     => \$hostfile,
+    'user=s'     => \$username,
+    'pass=s'     => \$password,
+    'log=s'      => \$logfile,
+    'timeout=i'  => \$timeout,
+    'help'       => \$help,
+) or die "Error in command line arguments\n";
 
-$username ||= $ENV{SSH_USER} || 'admin';
-$password ||= $ENV{SSH_PASS} or die "Error: password required via -p or SSH_PASS env\n";
+if ($help) {
+    print "Port Channel Audit Tool\n";
+    print "Usage: $0 --host <ip> | --file <devices.txt> [--user u] [--pass p] [--log l]\n";
+    exit 0;
+}
 
-my @devices;
+die "Specify --host or --file\n" unless $host || $hostfile;
+
+$timeout //= 30;
+$username //= 'admin';
+
+my @targets;
 if ($host) {
-    @devices = ($host);
-} elsif ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open '$device_file': $!\n";
-    @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
-    close $fh;
+    push @targets, $host;
 } else {
-    die "Error: specify -h <host> or -f <file>\n";
+    open my $fh, '<', $hostfile or die "Cannot open $hostfile: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^#|^\s*$/;
+        push @targets, $_;
+    }
+    close $fh;
 }
 
-my $log_fh;
+my $logfh = \*STDOUT;
 if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log '$logfile': $!\n";
+    open $logfh, '>>', $logfile or die "Cannot open $logfile: $!\n";
+    $logfh->autoflush(1);
 }
 
-my $stamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-out("=" x 68);
-out("STP Root Bridge Audit  --  $stamp");
-out("=" x 68);
+my $timestamp = localtime->strftime('%Y-%m-%d %H:%M:%S');
+print $logfh "[*] Port Channel Audit - $timestamp\n";
+print $logfh "=" x 70 . "\n";
 
-my ($total, $ok_count, $warn_count, $err_count) = (0, 0, 0, 0);
+foreach my $target (@targets) {
+    audit_device($target, $logfh);
+}
 
-for my $device (@devices) {
-    $total++;
-    out("\n--- $device ---");
+close $logfh if $logfile;
 
+sub audit_device {
+    my ($device, $fh) = @_;
+    
+    print $fh "\n[TARGET] $device\n";
+    print STDOUT "[*] Auditing $device...\n";
+    
     my $exp = Expect->new();
-    $exp->raw_pty(1);
     $exp->log_stdout(0);
-
-    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -l $username $device")) {
-        out("  ERROR: spawn failed: $!");
-        $err_count++;
-        next;
-    }
-
-    my $authed = 0;
-    $exp->expect($timeout,
-        [ qr/[Pp]assword:\s*/      => sub { $exp->send("$password\n"); exp_continue; } ],
-        [ qr/[>#]\s*$/             => sub { $authed = 1; } ],
-        [ qr/[Dd]enied|[Ff]ailed/ => sub { out("  ERROR: authentication failed"); } ],
-        [ timeout                  => sub { out("  ERROR: connection timed out"); } ],
-    );
-
-    unless ($authed) {
-        $exp->soft_close();
-        $err_count++;
-        next;
-    }
-
-    $exp->send("terminal length 0\n");
-    $exp->expect($timeout, qr/[>#]\s*$/);
-
-    $exp->send("show spanning-tree summary\n");
-    my $summary = '';
-    $exp->expect($timeout,
-        [ qr/[>#]\s*$/ => sub { $summary = $exp->before(); } ],
-        [ timeout       => sub { out("  ERROR: timeout on summary command"); } ],
-    );
-
-    $exp->send("show spanning-tree root\n");
-    my $root_out = '';
-    $exp->expect($timeout,
-        [ qr/[>#]\s*$/ => sub { $root_out = $exp->before(); } ],
-        [ timeout       => sub { out("  ERROR: timeout on root command"); } ],
-    );
-
-    $exp->send("exit\n");
-    $exp->soft_close();
-
-    if ($summary =~ /Switch is in (\S+) mode/i) {
-        out("  STP mode: $1");
-    }
-
-    # Parse "show spanning-tree root" tabular output
-    # Columns: Root ID | Priority | MAC | Hello | MaxAge | FwdDly | Interface
-    my $device_warn = 0;
-    my @rows;
-    for my $line (split /\n/, $root_out) {
-        next unless $line =~ /^VLAN(\d+)\s+\d+\s+([0-9a-f.]{14})\s+\d+\s+\d+\s+\d+\s*(\S*)/i;
-        my ($vid, $mac, $port) = ($1, lc $2, $3 || 'local (this sw is root)');
-        my $flag = '';
-        if ($expected_root && lc($expected_root) ne $mac) {
-            $flag = '  <-- UNEXPECTED ROOT';
-            $device_warn = 1;
+    $exp->timeout($timeout);
+    
+    eval {
+        $exp->spawn("ssh", "-o", "StrictHostKeyChecking=no",
+                   "-o", "UserKnownHostsFile=/dev/null", "$username\@$device")
+            or die "SSH spawn failed: $!\n";
+        
+        $exp->expect($timeout,
+            [qr/[Pp]assword:/, sub { $_[0]->send("$password\n"); exp_continue; }],
+            [qr/[>#]/, sub { }],
+        ) or die "Login timeout\n";
+        
+        $exp->send("enable\n");
+        $exp->expect(1, [qr/[Pp]assword:/, sub { $_[0]->send("$password\n"); exp_continue; }],
+                       [qr/#/, sub { }]);
+        
+        $exp->send("terminal length 0\n");
+        $exp->expect(1, qr/#/);
+        
+        $exp->send("show etherchannel summary\n");
+        $exp->expect($timeout, qr/#/);
+        my $output = $exp->before();
+        
+        print $fh "[SUMMARY]\n";
+        foreach my $line (split /\n/, $output) {
+            next if $line =~ /^show etherchannel|^#|^\s*$/;
+            print $fh "  $line\n";
         }
-        push @rows, sprintf("  VLAN %-5s  root %-17s  via %-22s%s", $vid, $mac, $port, $flag);
-    }
-
-    if (@rows) {
-        out($_) for @rows;
-    } else {
-        out("  No STP VLAN data found (no active VLANs or unsupported output format)");
-    }
-
-    if ($summary =~ /(\d+)\s+forwarding\s+(\d+)\s+blocking/i ||
-        $summary =~ /(\d+)\s+in\s+STP\s+forwarding.*?(\d+)\s+in\s+STP\s+blocking/si) {
-        out("  Ports -- forwarding: $1  blocking: $2");
-    }
-
-    if ($device_warn) { $warn_count++; } else { $ok_count++; }
+        
+        if ($output =~ /\(D\)|down|fail|suspend/i) {
+            print $fh "[ALERT] Down or suspended members detected\n";
+        }
+        
+        $exp->send("show etherchannel detail | include 'Protocol\\|Group'\n");
+        $exp->expect($timeout, qr/#/);
+        my $detail = $exp->before();
+        
+        my %protocols;
+        foreach my $line (split /\n/, $detail) {
+            $protocols{$1}++ if $line =~ /Protocol\s*:\s+(\w+)/i;
+        }
+        
+        print $fh "[PROTOCOL] " . join(", ", sort keys %protocols) . "\n" if %protocols;
+        
+        $exp->send("exit\n");
+        $exp->expect(1);
+        $exp->close();
+        
+        print $fh "[+] Completed successfully\n";
+        
+    } or do {
+        my $error = $@;
+        chomp $error;
+        print $fh "[-] Error: $error\n";
+        print STDOUT "[!] Error on $device: $error\n";
+        $exp->close() if defined $exp;
+    };
 }
 
-out("\n" . "=" x 68);
-out(sprintf("Done: %d devices | clean: %d | root warnings: %d | errors: %d",
-    $total, $ok_count, $warn_count, $err_count));
-out("=" x 68);
-
-close $log_fh if $log_fh;
-exit($err_count ? 2 : $warn_count ? 1 : 0);
-
-sub out {
-    my ($msg) = @_;
-    print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
-}
+1;
+```
