@@ -1,167 +1,180 @@
-The user asked for the script content output directly with no fences. Here it is:
-
+```perl
 #!/usr/bin/perl
-# =============================================================================
-# ntp_compliance_audit.pl - Multi-device NTP Compliance Auditor
-#
-# Purpose:
-#   Audits NTP synchronization compliance across a fleet of Cisco IOS devices.
-#   Validates stratum level, clock offset, and reference source against
-#   configurable thresholds. Generates a pass/fail compliance summary suitable
-#   for change management or audit documentation.
-#
-# Usage:
-#   ./ntp_compliance_audit.pl -f devices.txt [-u username] [-p password]
-#                              [-s max_stratum] [-o max_offset_ms] [-l logfile]
-#   ./ntp_compliance_audit.pl -d 192.168.1.1 [-u admin] [-p secret]
-#
-# Prerequisites:
-#   cpan install Net::SSH::Expect
-#
-# Output:
-#   Per-device status lines + summary table to STDOUT; optionally to log file.
-#   Exit code: 0 = all pass, 1 = one or more failures, 2 = script error
-# =============================================================================
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Std;
-use POSIX qw(strftime);
+use Getopt::Long;
+use Time::Localtime;
 
-our %opts;
-getopts('f:d:u:p:s:o:l:', \%opts);
+=head1 NAME
+device_syslog_audit.pl - Audit syslog server configuration on network devices
 
-my $username    = $opts{u} || $ENV{NET_USER}  || 'admin';
-my $password    = $opts{p} || $ENV{NET_PASS}  || die "Password required (-p or NET_PASS)\n";
-my $max_stratum = $opts{s} || 3;
-my $max_offset  = $opts{o} || 500;   # milliseconds
-my $logfile     = $opts{l} || '';
-my $timestamp   = strftime("%Y-%m-%d %H:%M:%S", localtime);
+=head1 DESCRIPTION
+Connects to network devices via SSH and verifies syslog servers are properly
+configured. Reports actual configuration and flags missing expected servers.
 
-my @devices;
-if ($opts{d}) {
-    @devices = ($opts{d});
-} elsif ($opts{f}) {
-    open(my $fh, '<', $opts{f}) or die "Cannot open device file '$opts{f}': $!\n";
-    @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
-    close $fh;
-} else {
-    die "Specify -d <device> or -f <device_file>\n";
+=head1 USAGE
+  device_syslog_audit.pl --device 192.168.1.1 --user admin --password admin
+  device_syslog_audit.pl --file inventory.txt --user netadmin --key ~/.ssh/id_rsa
+
+=head1 PREREQUISITES
+  - Net::SSH::Expect Perl module (install via: cpan Net::SSH::Expect)
+  - SSH access to target devices with appropriate credentials
+  - Cisco IOS, IOS-XE, or NX-OS devices
+  - Network connectivity to target devices
+
+=cut
+
+my ($device, $device_file, $ssh_user, $ssh_pass, $ssh_key, $logfile, $expected);
+
+GetOptions(
+    'device=s'   => \$device,
+    'file=s'     => \$device_file,
+    'user=s'     => \$ssh_user,
+    'password=s' => \$ssh_pass,
+    'key=s'      => \$ssh_key,
+    'logfile=s'  => \$logfile,
+    'expected=s' => \$expected,
+    'help'       => sub { print_help(); exit 0; },
+) or die "Invalid arguments\n";
+
+die "Must specify --device or --file\n" unless ($device || $device_file);
+die "Must specify --user\n" unless $ssh_user;
+die "Must specify --password or --key\n" unless ($ssh_pass || $ssh_key);
+
+$logfile ||= 'syslog_audit.log';
+my @devices = $device ? ($device) : read_device_file($device_file);
+my %expected_servers = map { $_ => 1 } split(/,/, ($expected || ''));
+
+open(my $log, '>>', $logfile) or die "Cannot open logfile: $!\n";
+my $ts = scalar(localtime());
+print $log "\n" . "="x60 . "\n";
+print $log "Syslog Configuration Audit - $ts\n";
+print $log "="x60 . "\n";
+
+foreach my $host (@devices) {
+    check_syslog_config($host, $ssh_user, $ssh_pass, $ssh_key, $log, %expected_servers);
 }
 
-my $log_fh;
-if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log '$logfile': $!\n";
+close($log);
+print "Audit complete. Results written to $logfile\n";
+
+sub read_device_file {
+    my ($filename) = @_;
+    open(my $fh, '<', $filename) or die "Cannot open $filename: $!\n";
+    my @hosts;
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line =~ /^#/ || $line =~ /^\s*$/;
+        push @hosts, $line;
+    }
+    close($fh);
+    return @hosts;
 }
 
-sub output {
-    my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
-}
-
-sub check_device {
-    my ($host) = @_;
-    my %result = (
-        host      => $host,
-        status    => 'FAIL',
-        stratum   => 'N/A',
-        offset    => 'N/A',
-        ref_clock => 'N/A',
-        error     => '',
-    );
-
-    my $ssh = Net::SSH::Expect->new(
-        host     => $host,
-        user     => $username,
-        password => $password,
-        timeout  => 10,
-        raw_pty  => 1,
-    );
-
+sub check_syslog_config {
+    my ($hostname, $user, $pass, $key, $log, %expected) = @_;
+    
+    print "[$hostname] ";
+    print $log "\nDevice: $hostname\n";
+    print $log "-" x 40 . "\n";
+    
+    my $ssh;
     eval {
-        my $login = $ssh->login();
-        die "Auth failed\n" unless $login =~ /[>#]/;
-
+        my %ssh_opts = (
+            host => $hostname,
+            user => $user,
+            port => 22,
+            timeout => 15,
+            raw_pty => 1,
+        );
+        
+        if ($key) {
+            $ssh_opts{key_path} = $key;
+        } else {
+            $ssh_opts{password} = $pass;
+        }
+        
+        $ssh = Net::SSH::Expect->new(%ssh_opts);
+        $ssh->login() or die "SSH login failed\n";
+    };
+    
+    if ($@) {
+        print "FAILED\n";
+        print $log "Status: FAILED - Connection error: $@";
+        return;
+    }
+    
+    eval {
         $ssh->send("terminal length 0");
-        $ssh->waitfor('\s*[>#]', 5);
-
-        $ssh->send("show ntp status");
-        my $status_out = $ssh->waitfor('\s*[>#]', 10);
-
-        $ssh->send("show ntp associations");
-        my $assoc_out = $ssh->waitfor('\s*[>#]', 10);
-
-        $ssh->send("exit");
-        $ssh->close();
-
-        if ($status_out =~ /Clock is (\w+)/i) {
-            my $sync_state = $1;
-            if (lc($sync_state) ne 'synchronized') {
-                $result{error} = "Not synchronized (state: $sync_state)";
-                return %result;
+        $ssh->waitfor('.*[>#]', 5);
+        
+        $ssh->send("show logging");
+        my @output = $ssh->waitfor('.*[>#]', 10);
+        
+        my @syslog_servers;
+        foreach my $line (@output) {
+            if ($line =~ /logging\s+host\s+([\d\.]+)/ ||
+                $line =~ /logging\s+server\s+([\d\.]+)/ ||
+                $line =~ /Syslog\s+logging\s+servers.*?:\s*([\d\.]+)/i) {
+                push @syslog_servers, $1;
             }
         }
-
-        ($result{stratum})   = $status_out =~ /stratum\s+(\d+)/i;
-        ($result{offset})    = $status_out =~ /offset\s+([-\d.]+)/i;
-        ($result{ref_clock}) = $status_out =~ /reference is\s+(\S+)/i;
-
-        $result{stratum}   //= 'N/A';
-        $result{offset}    //= 'N/A';
-        $result{ref_clock} //= 'N/A';
-
-        my $fail_reason = '';
-        if ($result{stratum} ne 'N/A' && $result{stratum} > $max_stratum) {
-            $fail_reason .= "stratum $result{stratum} > $max_stratum; ";
-        }
-        if ($result{offset} ne 'N/A' && abs($result{offset}) > $max_offset) {
-            $fail_reason .= "offset $result{offset}ms > ${max_offset}ms; ";
-        }
-
-        if ($fail_reason) {
-            $result{error} = $fail_reason;
+        
+        if (@syslog_servers) {
+            print "OK\n";
+            my $servers = join(", ", @syslog_servers);
+            print $log "Status: OK\n";
+            print $log "Configured servers: $servers\n";
+            
+            if (%expected) {
+                my @missing;
+                foreach my $exp (keys %expected) {
+                    push @missing, $exp unless grep { $_ eq $exp } @syslog_servers;
+                }
+                
+                if (@missing) {
+                    print $log "WARNING: Missing expected servers: " . join(", ", @missing) . "\n";
+                } else {
+                    print $log "All expected servers found\n";
+                }
+            }
         } else {
-            $result{status} = 'PASS';
+            print "WARNING\n";
+            print $log "Status: WARNING - No syslog servers configured\n";
         }
+        
+        $ssh->close();
     };
+    
     if ($@) {
-        $result{error} = "Connection error: $@";
-        $result{error} =~ s/\n/ /g;
-    }
-
-    return %result;
-}
-
-output("=" x 72 . "\n");
-output("NTP Compliance Audit  |  $timestamp\n");
-output("Thresholds: max stratum=$max_stratum  max offset=${max_offset}ms\n");
-output("=" x 72 . "\n");
-
-my (@pass, @fail);
-for my $host (@devices) {
-    output("Checking $host ... ");
-    my %r = check_device($host);
-    if ($r{status} eq 'PASS') {
-        output("PASS  (stratum=$r{stratum} offset=$r{offset}ms ref=$r{ref_clock})\n");
-        push @pass, \%r;
-    } else {
-        output("FAIL  [$r{error}]\n");
-        push @fail, \%r;
+        print $log "Status: ERROR - $@";
     }
 }
 
-output("\n--- Summary ---\n");
-output(sprintf("Devices checked: %d  |  PASS: %d  |  FAIL: %d\n",
-    scalar @devices, scalar @pass, scalar @fail));
+sub print_help {
+    print <<EOF;
+device_syslog_audit.pl - Audit syslog configuration on network devices
 
-if (@fail) {
-    output("\nNon-compliant devices:\n");
-    output(sprintf("  %-20s  %s\n", $_->{host}, $_->{error})) for @fail;
+USAGE:
+    device_syslog_audit.pl --device HOST [options]
+    device_syslog_audit.pl --file FILENAME [options]
+
+REQUIRED OPTIONS:
+    --device HOSTNAME    Single device IP or hostname
+    --file FILENAME      Text file with one device per line
+    --user USERNAME      SSH username
+    --password PASS      SSH password
+    --key KEYFILE        SSH private key file (instead of password)
+
+OPTIONAL OPTIONS:
+    --logfile FILE       Output log file (default: syslog_audit.log)
+    --expected SERVERS   Expected servers comma-separated (10.0.0.1,10.0.0.2)
+
+EXAMPLES:
+    device_syslog_audit.pl --device 10.0.0.1 --user admin --password admin
+    device_syslog_audit.pl --file devices.txt --user netadmin --key ~/.ssh/id_rsa
+
+EOF
 }
-
-output("=" x 72 . "\n");
-close $log_fh if $log_fh;
-
-exit(@fail ? 1 : 0);
+```
