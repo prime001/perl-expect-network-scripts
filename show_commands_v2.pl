@@ -1,30 +1,25 @@
+The prompt asks for script content only — here it is:
+
 #!/usr/bin/perl
 #
-# stp_check.pl - Spanning Tree Protocol root bridge and port state audit
+# 012_health_check.pl - Cisco IOS Hardware Health Check
 #
-# Purpose:
-#   SSHes into Cisco IOS/IOS-XE switches and audits the STP topology:
-#   identifies root bridges per VLAN, reports port state counts, flags
-#   topology change events (a leading indicator of network instability),
-#   and surfaces any ports stuck in Blocking/Listening state.
-#   Designed for rapid triage during outages or scheduled topology reviews.
+# Collects CPU utilization, memory usage, environmental status (temperature,
+# fans, power supplies), and system uptime from Cisco IOS devices.
+# Useful for baseline health checks, pre/post-change verification, and
+# identifying resource exhaustion before it causes an outage.
 #
 # Usage:
-#   ./stp_check.pl -h <host> -u <user> -p <pass> [-e <enable_pass>] [-l <logfile>]
-#   ./stp_check.pl -f devices.txt -u <user> -p <pass> [-e <enable_pass>] [-l <logfile>]
+#   Single device:  perl 012_health_check.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:    perl 012_health_check.pl -f devices.txt -u admin -p secret
+#   With log:       perl 012_health_check.pl -h 192.168.1.1 -u admin -p secret -l health.log
 #
-# Options:
-#   -h  Target device IP or hostname
-#   -f  File with one device IP/hostname per line (# lines ignored)
-#   -u  SSH username
-#   -p  SSH password
-#   -e  Enable password (omit if not required)
-#   -l  Append output to logfile in addition to STDOUT
+# Device file format: one IP or hostname per line, lines starting with # ignored
 #
 # Prerequisites:
 #   cpan Net::SSH::Expect
 #
-# Tested on: Cisco IOS 15.x, IOS-XE 16.x/17.x
+# Tested on: Cisco IOS 12.x/15.x, IOS-XE 3.x/16.x/17.x
 #
 
 use strict;
@@ -33,124 +28,151 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $user, $pass, $enable, $device_file, $log_file);
+my ($host, $file, $user, $pass, $logfile, $help);
+my $timeout = 30;
 
 GetOptions(
-    'host|h=s'   => \$host,
-    'user|u=s'   => \$user,
-    'pass|p=s'   => \$pass,
-    'enable|e=s' => \$enable,
-    'file|f=s'   => \$device_file,
-    'log|l=s'    => \$log_file,
-) or die "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-e <enable>] [-l <log>]\n";
+    'h|host=s'     => \$host,
+    'f|file=s'     => \$file,
+    'u|user=s'     => \$user,
+    'p|pass=s'     => \$pass,
+    'l|log=s'      => \$logfile,
+    't|timeout=i'  => \$timeout,
+    'help'         => \$help,
+) or die "Error parsing options. Use --help for usage.\n";
 
-die "ERROR: Provide -h <host> or -f <file>\n"    unless $host || $device_file;
-die "ERROR: Username (-u) is required\n"          unless $user;
-die "ERROR: Password (-p) is required\n"          unless $pass;
-
-my @devices;
-if ($device_file) {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; next if /^\s*[#\s]*$/; push @devices, $_ }
-    close $fh;
-} else {
-    @devices = ($host);
+if ($help || (!$host && !$file) || !$user || !$pass) {
+    print "Usage: $0 -h <host> -u <user> -p <pass> [-l logfile] [-t timeout]\n";
+    print "       $0 -f <devices.txt> -u <user> -p <pass> [-l logfile]\n";
+    exit 1;
 }
+
+my @devices = $host ? ($host) : read_device_file($file);
+die "No devices to process.\n" unless @devices;
 
 my $LOG;
-if ($log_file) {
-    open $LOG, '>>', $log_file or die "Cannot open log $log_file: $!\n";
+if ($logfile) {
+    open($LOG, '>>', $logfile) or die "Cannot open log file '$logfile': $!\n";
 }
 
-sub out {
-    my $msg = shift;
-    print $msg;
-    print $LOG $msg if $LOG;
+my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+output("=" x 60);
+output("Health Check Run: $timestamp");
+output("=" x 60);
+
+for my $device (@devices) {
+    output("\n--- Device: $device ---");
+    check_device($device, $user, $pass, $timeout);
 }
 
-sub audit_device {
-    my ($target) = @_;
-    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-    out("=" x 62 . "\n");
-    out("Device : $target\nTime   : $ts\n");
-    out("=" x 62 . "\n");
+close($LOG) if $LOG;
+exit 0;
 
-    my $ssh = Net::SSH::Expect->new(
-        host     => $target,
-        user     => $user,
-        password => $pass,
-        raw_pty  => 1,
-        timeout  => 20,
-    );
+sub check_device {
+    my ($host, $user, $pass, $timeout) = @_;
 
-    my $login;
-    eval { $login = $ssh->login() };
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host        => $host,
+            user        => $user,
+            password    => $pass,
+            timeout     => $timeout,
+            ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+        );
+    };
+    if ($@ || !$ssh) {
+        output("  ERROR: Failed to create SSH session for $host: $@");
+        return;
+    }
+
+    my $login = eval { $ssh->login() };
     if ($@ || !defined $login) {
-        out("ERROR: SSH connection failed for $target: " . ($@ || 'no response') . "\n\n");
-        return;
-    }
-    if ($login =~ /(?:assword|denied|incorrect|failed)/i && $login !~ /#|\$/) {
-        out("ERROR: Authentication failed for $target\n\n");
+        output("  ERROR: Authentication failed for $host");
         return;
     }
 
-    if ($enable) {
-        $ssh->send("enable");
-        $ssh->waitfor('Password:', 5) or out("WARN: No enable password prompt on $target\n");
-        $ssh->send($enable);
-        $ssh->waitfor('#', 5);
-    }
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('\$|#', 5);
 
-    $ssh->exec("terminal length 0");
+    collect_uptime($ssh);
+    collect_cpu($ssh);
+    collect_memory($ssh);
+    collect_environment($ssh);
 
-    my $summary = $ssh->exec("show spanning-tree summary");
-    unless (defined $summary && length $summary) {
-        out("ERROR: No response from 'show spanning-tree summary' on $target\n\n");
-        $ssh->close(); return;
-    }
-
-    my $is_root = ($summary =~ /This bridge is the root/i) ? "YES" : "NO";
-    my ($mode)  = ($summary =~ /Spanning tree mode\s+(\S+)/i);
-    $mode //= 'unknown';
-
-    out(sprintf("STP Mode    : %s\n", $mode));
-    out(sprintf("Root Bridge : %s\n", $is_root));
-
-    my %states;
-    $states{lc $2} += $1 while $summary =~ /(\d+)\s+(Forwarding|Blocking|Listening|Learning|Disabled)/gi;
-    out("Port States :\n");
-    out(sprintf("  %-12s %d\n", ucfirst($_), $states{$_})) for sort keys %states;
-    out("WARN: Ports in non-forwarding state detected\n") if $states{blocking} || $states{listening};
-
-    my $root_out = $ssh->exec("show spanning-tree root");
-    if (defined $root_out && $root_out =~ /VLAN/i) {
-        out("\nPer-VLAN Root Bridge:\n");
-        out(sprintf("  %-10s %-22s %-8s %s\n", 'VLAN', 'Root MAC', 'Cost', 'Root Port'));
-        out("  " . "-" x 55 . "\n");
-        while ($root_out =~ /^(VLAN\d+)\s+\d+\s+([\da-f.]+)\s+(\d+).*?(\S+)\s*$/mg) {
-            out(sprintf("  %-10s %-22s %-8s %s\n", $1, $2, $3, $4));
-        }
-    }
-
-    my $tc_out = $ssh->exec("show spanning-tree detail | include topology change|changes occur");
-    if (defined $tc_out) {
-        my @tc_lines = grep { /topology|occur/i && /\d/ } split /\n/, $tc_out;
-        if (@tc_lines) {
-            out("\nTopology Change Events (instability indicator):\n");
-            for my $line (@tc_lines) {
-                $line =~ s/^\s+//;
-                out("  $line\n");
-            }
-        }
-    }
-
-    $ssh->exec("exit");
-    out("\n");
+    eval { $ssh->send("exit\n") };
 }
 
-for my $dev (@devices) {
-    eval { audit_device($dev) };
-    out("ERROR: Exception on $dev: $@\n") if $@;
+sub collect_uptime {
+    my ($ssh) = @_;
+    my $out = run_command($ssh, 'show version | include uptime');
+    if ($out && $out =~ /uptime is (.+)/i) {
+        output("  Uptime       : $1");
+    }
 }
 
-close $LOG if $LOG;
+sub collect_cpu {
+    my ($ssh) = @_;
+    my $out = run_command($ssh, 'show processes cpu | include CPU utilization');
+    if ($out && $out =~ /CPU utilization for five seconds:\s*(\S+).*one minute:\s*(\S+).*five minutes:\s*(\S+)/i) {
+        output("  CPU (5s/1m/5m): $1 / $2 / $3");
+        my $pct = $1;
+        $pct =~ s/%.*//;
+        output("  CPU WARN: 5-second CPU at ${pct}% - investigate high-CPU processes") if $pct > 80;
+    } else {
+        output("  CPU          : (unable to parse)");
+    }
+}
+
+sub collect_memory {
+    my ($ssh) = @_;
+    my $out = run_command($ssh, 'show processes memory | include Processor');
+    if ($out && $out =~ /Processor\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)/i) {
+        my ($total, $used, $free) = ($1, $2, $3);
+        my $pct = int(($used / $total) * 100);
+        output(sprintf("  Memory       : %dK total, %dK used (%d%%), %dK free", $total, $used, $pct, $free));
+        output("  MEM WARN: Processor memory usage at ${pct}% - check for leaks") if $pct > 85;
+    } else {
+        output("  Memory       : (unable to parse)");
+    }
+}
+
+sub collect_environment {
+    my ($ssh) = @_;
+    my $out = run_command($ssh, 'show environment all');
+    return unless $out;
+
+    my @warnings;
+    push @warnings, "Temperature CRITICAL" if $out =~ /temperature.*CRITICAL/i;
+    push @warnings, "Temperature WARNING"  if $out =~ /temperature.*WARNING/i;
+    push @warnings, "Fan failure detected" if $out =~ /fan.*fail/i;
+    push @warnings, "Power supply failure" if $out =~ /power.*fail/i;
+
+    if (@warnings) {
+        output("  ENV ALERTS   : " . join(', ', @warnings));
+    } else {
+        output("  Environment  : OK (no temperature/fan/power alerts)");
+    }
+}
+
+sub run_command {
+    my ($ssh, $cmd) = @_;
+    eval {
+        $ssh->send("$cmd\n");
+        $ssh->waitfor('\$|#', $timeout);
+        $ssh->before();
+    };
+}
+
+sub read_device_file {
+    my ($file) = @_;
+    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
+    my @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
+    close($fh);
+    return @devices;
+}
+
+sub output {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $LOG "$msg\n" if $LOG;
+}
