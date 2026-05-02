@@ -4,149 +4,176 @@ use strict;
 use warnings;
 use Expect;
 use Getopt::Long;
-use Time::Piece;
-use IO::Handle;
+use Time::HiRes qw(time);
 
-=head1 PORT CHANNEL AUDIT SCRIPT
+=head1 NAME
+device_reachability.pl - Network device reachability and SSH connectivity monitor
 
-Purpose:
-  Audits port channel (EtherChannel/LAG) configurations and status on network devices.
-  Reports channel status, member interfaces, protocol type, and identifies misconfigurations.
+=head1 SYNOPSIS
+device_reachability.pl [OPTIONS] device_ip
+device_reachability.pl -f devices.txt -u admin -l reach_report.log
 
-Usage:
-  ./port_channel_audit.pl --host <device_ip> [--user <username>] [--pass <password>] [--log <file>]
-  ./port_channel_audit.pl --file <device_list.txt>
+=head1 DESCRIPTION
+Monitors network device reachability via SSH, verifies authentication,
+collects device uptime information, and generates connectivity reports.
 
-Prerequisites:
-  - Expect Perl module (install via: cpan Expect)
-  - SSH access to network devices
-  - Valid username/password credentials
-  - Devices must support 'show etherchannel' commands (Cisco IOS/IOS-XE/NX-OS)
-
-Examples:
-  perl port_channel_audit.pl --host 192.168.1.1 --user netadmin --pass mypass123
-  perl port_channel_audit.pl --file devices.txt --log port_channels_$(date +%Y%m%d).log
-
+=head1 OPTIONS
+  -f, --file FILE      Read device list from file (one per line)
+  -u, --user USER      SSH username (default: admin)
+  -p, --pass PASS      SSH password (prompts if omitted)
+  -l, --log FILE       Output log file (default: device_reach.log)
+  -t, --timeout SEC    SSH connection timeout (default: 20 seconds)
 =cut
 
-my ($host, $hostfile, $username, $password, $logfile, $timeout, $help);
+my ($device, $file, $user, $pass, $log_file, $timeout);
 
 GetOptions(
-    'host=s'     => \$host,
-    'file=s'     => \$hostfile,
-    'user=s'     => \$username,
-    'pass=s'     => \$password,
-    'log=s'      => \$logfile,
-    'timeout=i'  => \$timeout,
-    'help'       => \$help,
-) or die "Error in command line arguments\n";
+    'file|f=s'      => \$file,
+    'user|u=s'      => \$user,
+    'pass|p=s'      => \$pass,
+    'log|l=s'       => \$log_file,
+    'timeout|t=i'   => \$timeout,
+) or die "Invalid command line arguments\n";
 
-if ($help) {
-    print "Port Channel Audit Tool\n";
-    print "Usage: $0 --host <ip> | --file <devices.txt> [--user u] [--pass p] [--log l]\n";
-    exit 0;
+$device = shift @ARGV;
+die "Usage: $0 device_ip or $0 -f device_file\n" unless $device || $file;
+
+$user //= 'admin';
+$log_file //= 'device_reach.log';
+$timeout //= 20;
+
+open(my $LOG, '>>', $log_file) or die "Cannot open $log_file: $!";
+select($LOG); $| = 1; select(STDOUT); $| = 1;
+
+sub timestamp {
+    return scalar localtime;
 }
 
-die "Specify --host or --file\n" unless $host || $hostfile;
-
-$timeout //= 30;
-$username //= 'admin';
-
-my @targets;
-if ($host) {
-    push @targets, $host;
-} else {
-    open my $fh, '<', $hostfile or die "Cannot open $hostfile: $!\n";
-    while (<$fh>) {
-        chomp;
-        next if /^#|^\s*$/;
-        push @targets, $_;
-    }
-    close $fh;
+sub log_msg {
+    my $msg = shift;
+    my $ts = timestamp();
+    printf "%s - %s\n", $ts, $msg;
+    printf $LOG "%s - %s\n", $ts, $msg;
 }
 
-my $logfh = \*STDOUT;
-if ($logfile) {
-    open $logfh, '>>', $logfile or die "Cannot open $logfile: $!\n";
-    $logfh->autoflush(1);
+sub get_password {
+    system('stty', '-echo') if $^O !~ /MSWin/;
+    print "SSH Password: ";
+    chomp(my $pwd = <STDIN>);
+    system('stty', 'echo') if $^O !~ /MSWin/;
+    print "\n";
+    return $pwd;
 }
 
-my $timestamp = localtime->strftime('%Y-%m-%d %H:%M:%S');
-print $logfh "[*] Port Channel Audit - $timestamp\n";
-print $logfh "=" x 70 . "\n";
-
-foreach my $target (@targets) {
-    audit_device($target, $logfh);
-}
-
-close $logfh if $logfile;
-
-sub audit_device {
-    my ($device, $fh) = @_;
-    
-    print $fh "\n[TARGET] $device\n";
-    print STDOUT "[*] Auditing $device...\n";
+sub check_device {
+    my ($host, $user, $pwd) = @_;
+    my $start = time();
+    my $success = 0;
+    my $uptime_info = '';
     
     my $exp = Expect->new();
     $exp->log_stdout(0);
+    
+    unless ($exp->spawn("ssh -o ConnectTimeout=$timeout -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $user\@$host")) {
+        log_msg("ERROR [$host]: SSH spawn failed - $!");
+        return (0, -1, '');
+    }
+    
     $exp->timeout($timeout);
+    my $authenticated = 0;
     
     eval {
-        $exp->spawn("ssh", "-o", "StrictHostKeyChecking=no",
-                   "-o", "UserKnownHostsFile=/dev/null", "$username\@$device")
-            or die "SSH spawn failed: $!\n";
-        
         $exp->expect($timeout,
-            [qr/[Pp]assword:/, sub { $_[0]->send("$password\n"); exp_continue; }],
-            [qr/[>#]/, sub { }],
-        ) or die "Login timeout\n";
-        
-        $exp->send("enable\n");
-        $exp->expect(1, [qr/[Pp]assword:/, sub { $_[0]->send("$password\n"); exp_continue; }],
-                       [qr/#/, sub { }]);
-        
-        $exp->send("terminal length 0\n");
-        $exp->expect(1, qr/#/);
-        
-        $exp->send("show etherchannel summary\n");
-        $exp->expect($timeout, qr/#/);
-        my $output = $exp->before();
-        
-        print $fh "[SUMMARY]\n";
-        foreach my $line (split /\n/, $output) {
-            next if $line =~ /^show etherchannel|^#|^\s*$/;
-            print $fh "  $line\n";
-        }
-        
-        if ($output =~ /\(D\)|down|fail|suspend/i) {
-            print $fh "[ALERT] Down or suspended members detected\n";
-        }
-        
-        $exp->send("show etherchannel detail | include 'Protocol\\|Group'\n");
-        $exp->expect($timeout, qr/#/);
-        my $detail = $exp->before();
-        
-        my %protocols;
-        foreach my $line (split /\n/, $detail) {
-            $protocols{$1}++ if $line =~ /Protocol\s*:\s+(\w+)/i;
-        }
-        
-        print $fh "[PROTOCOL] " . join(", ", sort keys %protocols) . "\n" if %protocols;
-        
-        $exp->send("exit\n");
-        $exp->expect(1);
-        $exp->close();
-        
-        print $fh "[+] Completed successfully\n";
-        
-    } or do {
-        my $error = $@;
-        chomp $error;
-        print $fh "[-] Error: $error\n";
-        print STDOUT "[!] Error on $device: $error\n";
-        $exp->close() if defined $exp;
+            [ qr/password/i, sub {
+                $exp->send("$pwd\r");
+                exp_continue;
+            }],
+            [ qr/[#>%]/, sub {
+                $authenticated = 1;
+            }],
+            [ qr/(Permission denied|Authentication failed)/i, sub {
+                die "Authentication failed for $host";
+            }],
+            [ qr/(refused|timeout|unreachable|unknown host)/i, sub {
+                die "Connection failed: $&";
+            }],
+            [ timeout => sub {
+                die "SSH timeout connecting to $host";
+            }]
+        );
     };
+    
+    if ($@) {
+        log_msg("FAIL [$host]: $@");
+        $exp->soft_close();
+        return (0, -1, '');
+    }
+    
+    if ($authenticated) {
+        log_msg("OK [$host]: SSH authentication successful");
+        $success = 1;
+        
+        $exp->send("terminal length 0\r");
+        $exp->expect(2, qr/[#>%]/);
+        
+        $exp->send("show version | include uptime\r");
+        eval {
+            $exp->expect(5, [ qr/[#>%]/, sub { 
+                $uptime_info = $exp->before(); 
+                $uptime_info =~ s/[\r\n]+/ /g;
+            }]);
+        };
+        
+        if ($uptime_info =~ /\S/) {
+            log_msg("UPTIME [$host]: $uptime_info");
+        }
+    }
+    
+    $exp->send("exit\r");
+    $exp->soft_close();
+    
+    my $elapsed = sprintf("%.2f", time() - $start);
+    return ($success, $elapsed, $uptime_info);
 }
 
-1;
+my @hosts;
+if ($file) {
+    open(my $fh, '<', $file) or die "Cannot open $file: $!";
+    @hosts = grep { /\S/ } map { chomp; $_ } <$fh>;
+    close($fh);
+} else {
+    @hosts = ($device);
+}
+
+$pass //= get_password();
+
+log_msg("=" x 70);
+log_msg("Device Reachability Monitor: " . scalar(@hosts) . " device(s)");
+log_msg("=" x 70);
+
+my ($reachable, $total) = (0, 0);
+my @response_times;
+
+foreach my $host (@hosts) {
+    next unless $host =~ /\S/;
+    $total++;
+    my ($status, $time, $info) = check_device($host, $user, $pass);
+    $reachable++ if $status;
+    push(@response_times, $time) if $time > 0;
+}
+
+log_msg("=" x 70);
+log_msg("SUMMARY: $reachable/$total devices reachable (" . int(100*$reachable/$total) . "%)");
+
+if (@response_times) {
+    my $sum = 0;
+    $sum += $_ for @response_times;
+    my $avg = sprintf("%.2f", $sum / @response_times);
+    log_msg("Average SSH connection time: ${avg}s");
+}
+
+log_msg("=" x 70);
+close($LOG);
+
+exit($reachable == $total ? 0 : 1);
 ```
