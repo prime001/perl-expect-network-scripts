@@ -1,160 +1,186 @@
+```perl
 #!/usr/bin/perl
 use strict;
 use warnings;
-use Expect;
+use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
 # =============================================================================
-# bgp_route_monitor.pl - BGP Prefix Count Monitor with Threshold Alerting
+# bgp_route_analysis.pl - BGP Route Table Analyzer
 #
 # Purpose:
-#   Connects to IOS/IOS-XE routers via SSH and checks BGP peer prefix counts
-#   against configurable thresholds. Flags peers with anomalous route counts
-#   (too few suggesting a filter problem, too many suggesting a route leak).
-#   Useful for capacity planning audits and change-window pre/post checks.
+#   Connects to Cisco IOS/IOS-XE routers and analyzes the BGP routing table
+#   for operational insights: prefix counts, AS path lengths, origin types,
+#   and routes with anomalous attributes. Complements bgp_peers scripts which
+#   focus on neighbor state; this script focuses on the route table itself.
 #
 # Usage:
-#   Single device:  perl bgp_route_monitor.pl -h 10.0.0.1 -u admin -p secret
-#   Device file:    perl bgp_route_monitor.pl -f devices.txt -u admin -p secret
-#   With logging:   perl bgp_route_monitor.pl -h 10.0.0.1 -u admin -p secret -l bgp_audit.log
-#   Set thresholds: perl bgp_route_monitor.pl -h 10.0.0.1 -u admin -p secret --min 100 --max 900000
-#
-# Device file format (one entry per line):
-#   10.0.0.1
-#   router2.example.com
+#   ./bgp_route_analysis.pl -h 192.168.1.1 -u admin -p secret
+#   ./bgp_route_analysis.pl -f devices.txt -u admin -p secret -l bgp_routes.log
+#   ./bgp_route_analysis.pl -h 10.0.0.1 -u admin -p secret --max-aspath 5
 #
 # Prerequisites:
-#   - Perl modules: Expect, Getopt::Long (cpan install Expect)
-#   - SSH key-based auth recommended; password auth supported via -p flag
-#   - Router must have 'ip ssh' enabled and user with appropriate privilege
+#   cpan Net::SSH::Expect
 #
-# Output:
-#   Prints per-peer prefix counts with WARN/ALERT flags to STDOUT and log file.
+# devices.txt format (one IP or hostname per line, # for comments):
+#   192.168.1.1
+#   10.0.0.254
+#   # core-router-1
 # =============================================================================
 
-my ($host, $username, $password, $device_file, $log_file);
-my $min_prefixes = 1;
-my $max_prefixes = 750000;
-my $timeout      = 30;
+my ($host, $user, $pass, $device_file, $log_file, $max_aspath, $timeout);
+$max_aspath = 5;
+$timeout    = 30;
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'u|user=s'     => \$username,
-    'p|pass=s'     => \$password,
-    'f|file=s'     => \$device_file,
-    'l|log=s'      => \$log_file,
-    'min=i'        => \$min_prefixes,
-    'max=i'        => \$max_prefixes,
-    't|timeout=i'  => \$timeout,
-) or die "Usage: $0 -h <host> | -f <file> -u <user> [-p <pass>] [-l <logfile>] [--min N] [--max N]\n";
+    'h|host=s'       => \$host,
+    'f|file=s'       => \$device_file,
+    'u|user=s'       => \$user,
+    'p|pass=s'       => \$pass,
+    'l|log=s'        => \$log_file,
+    'max-aspath=i'   => \$max_aspath,
+    't|timeout=i'    => \$timeout,
+) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOG] [--max-aspath N]\n";
 
-die "Specify -h <host> or -f <file>\n" unless $host || $device_file;
-die "Username required (-u)\n"         unless $username;
+die "Provide -h HOST or -f FILE\n" unless $host || $device_file;
+die "Username (-u) required\n"     unless $user;
+die "Password (-p) required\n"     unless $pass;
 
 my @devices;
-if ($host) {
-    push @devices, $host;
-} else {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; push @devices, $_ if /\S/ && !/^#/ }
+if ($device_file) {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        push @devices, $_;
+    }
     close $fh;
+} else {
+    push @devices, $host;
 }
 
 my $log_fh;
 if ($log_file) {
-    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
+    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
 }
 
-sub log_print {
+sub log_output {
     my ($msg) = @_;
-    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-    print "[$ts] $msg\n";
-    print $log_fh "[$ts] $msg\n" if $log_fh;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
 
-sub audit_device {
-    my ($device) = @_;
+sub analyze_device {
+    my ($target) = @_;
+    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    log_output("\n[$ts] Connecting to $target\n");
+    log_output("=" x 60 . "\n");
 
-    log_print("Connecting to $device ...");
-
-    my @cmd = ('ssh', '-o', 'StrictHostKeyChecking=no',
-                      '-o', 'ConnectTimeout=10',
-                      "$username\@$device");
-
-    my $exp = Expect->new;
-    $exp->raw_pty(1);
-    $exp->log_stdout(0);
-    $exp->spawn(@cmd) or do { log_print("ERROR: Cannot spawn SSH for $device: $!"); return };
-
-    my $authed = 0;
-    $exp->expect($timeout,
-        [ qr/[Pp]assword[:\s]/,         sub { $exp->send("$password\r"); exp_continue } ],
-        [ qr/[#>]\s*$/,                 sub { $authed = 1 } ],
-        [ qr/Connection refused/,       sub { log_print("ERROR: SSH refused on $device") } ],
-        [ qr/No route to host/,         sub { log_print("ERROR: No route to $device") } ],
-        [ qr/Host key verification/,    sub { log_print("ERROR: Host key mismatch on $device") } ],
-        [ timeout => sub { log_print("ERROR: Timeout connecting to $device") } ],
+    my $ssh = Net::SSH::Expect->new(
+        host        => $target,
+        user        => $user,
+        password    => $pass,
+        raw_pty     => 1,
+        timeout     => $timeout,
     );
 
-    unless ($authed) {
-        $exp->soft_close;
+    my $login_output = eval { $ssh->login() };
+    if ($@ || !defined $login_output) {
+        log_output("  ERROR: Connection failed to $target - $@\n");
         return;
     }
 
-    $exp->send("terminal length 0\r");
-    $exp->expect($timeout, qr/[#>]\s*$/);
-
-    $exp->send("show ip bgp summary\r");
-    my $summary = '';
-    $exp->expect($timeout,
-        [ qr/[#>]\s*$/m, sub { $summary = $exp->before() . $exp->match() } ],
-        [ timeout        => sub { log_print("WARN: Timeout on bgp summary from $device") } ],
-    );
-
-    unless ($summary) {
-        log_print("WARN: No BGP summary output from $device");
-        $exp->send("exit\r");
-        $exp->soft_close;
+    if ($login_output =~ /password|denied/i) {
+        log_output("  ERROR: Authentication failed on $target\n");
+        $ssh->close();
         return;
     }
 
-    log_print("--- BGP Prefix Audit: $device ---");
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('(#|\$)\s*$', $timeout) or do {
+        log_output("  ERROR: No prompt after terminal length 0\n");
+        $ssh->close();
+        return;
+    };
 
-    my @peers;
-    for my $line (split /\n/, $summary) {
-        # IOS bgp summary peer lines: IP state/up-time PfxRcd
-        if ($line =~ /^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\S+\s+(\d+|NoNeg|Active|Idle|Connect)\s*$/) {
-            push @peers, { ip => $1, pfx => $2 };
+    $ssh->send("show ip bgp summary\n");
+    my ($summary) = $ssh->waitfor('(#|\$)\s*$', $timeout);
+    unless (defined $summary) {
+        log_output("  ERROR: Timeout waiting for BGP summary on $target\n");
+        $ssh->close();
+        return;
+    }
+
+    my ($router_id, $as_number, $total_peers, $up_peers) = ('unknown', 'unknown', 0, 0);
+    if ($summary =~ /BGP router identifier ([\d.]+), local AS number (\d+)/i) {
+        ($router_id, $as_number) = ($1, $2);
+    }
+    my @peer_lines = grep { /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s/ } split(/\n/, $summary);
+    $total_peers = scalar @peer_lines;
+    $up_peers    = grep { /\s+\d+\s*$/ } @peer_lines;
+
+    log_output("  Router ID : $router_id\n");
+    log_output("  Local AS  : $as_number\n");
+    log_output("  BGP Peers : $total_peers total, $up_peers established\n\n");
+
+    $ssh->send("show ip bgp\n");
+    my ($bgp_table) = $ssh->waitfor('(#|\$)\s*$', $timeout + 60);
+    unless (defined $bgp_table) {
+        log_output("  ERROR: Timeout waiting for BGP table on $target\n");
+        $ssh->close();
+        return;
+    }
+
+    my (%origin_count, @long_paths, $total_prefixes);
+    $total_prefixes = 0;
+
+    for my $line (split /\n/, $bgp_table) {
+        next unless $line =~ /^\s*[*>isdhRSFf]/;
+        $total_prefixes++;
+
+        if ($line =~ /\s+([iIeE?])\s*$/) {
+            my $origin = $1;
+            $origin_count{i}++ if $origin eq 'i';
+            $origin_count{e}++ if lc($origin) eq 'e';
+            $origin_count{'?'}++ if $origin eq '?';
+        }
+
+        if ($line =~ /((?:\d+\s+){$max_aspath,}[iIeE?])/) {
+            my $path_str = $1;
+            my @asns = grep { /^\d+$/ } split /\s+/, $path_str;
+            if (@asns >= $max_aspath) {
+                if ($line =~ /\s+([\d.]+\/\d+)\s/) {
+                    push @long_paths, { prefix => $1, length => scalar @asns, path => join(' ', @asns) };
+                }
+            }
         }
     }
 
-    unless (@peers) {
-        log_print("  No established BGP peers found on $device");
-        $exp->send("exit\r");
-        $exp->soft_close;
-        return;
-    }
+    log_output("  BGP Table Summary:\n");
+    log_output(sprintf("    Total prefixes : %d\n", $total_prefixes));
+    log_output(sprintf("    IGP origin (i) : %d\n", $origin_count{i}  // 0));
+    log_output(sprintf("    EGP origin (e) : %d\n", $origin_count{e}  // 0));
+    log_output(sprintf("    Incomplete (?) : %d\n", $origin_count{'?'} // 0));
 
-    for my $peer (@peers) {
-        my $ip  = $peer->{ip};
-        my $pfx = $peer->{pfx};
-
-        if ($pfx =~ /^\d+$/) {
-            my $flag = '';
-            $flag = ' [WARN: below minimum]' if $pfx < $min_prefixes;
-            $flag = ' [ALERT: exceeds maximum - possible route leak!]' if $pfx > $max_prefixes;
-            log_print(sprintf("  Peer %-18s  PfxRcd: %7d%s", $ip, $pfx, $flag));
-        } else {
-            log_print(sprintf("  Peer %-18s  State: %s [not established]", $ip, $pfx));
+    if (@long_paths) {
+        log_output("\n  Routes with AS-path length >= $max_aspath hops:\n");
+        for my $r (sort { $b->{length} <=> $a->{length} } @long_paths) {
+            log_output(sprintf("    %-20s  hops=%-3d  path=%s\n",
+                $r->{prefix}, $r->{length}, $r->{path}));
         }
+    } else {
+        log_output("\n  No routes with AS-path >= $max_aspath hops found.\n");
     }
 
-    $exp->send("exit\r");
-    $exp->soft_close;
+    $ssh->send("exit\n");
+    $ssh->close();
+    log_output("\n  Done: $target\n");
 }
 
-log_print("BGP route monitor started — min=$min_prefixes max=$max_prefixes");
-audit_device($_) for @devices;
-log_print("BGP route monitor complete.");
+for my $dev (@devices) {
+    analyze_device($dev);
+}
+
 close $log_fh if $log_fh;
+```
