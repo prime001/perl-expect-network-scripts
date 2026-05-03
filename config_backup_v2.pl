@@ -1,136 +1,162 @@
-```perl
-#!/usr/bin/perl
-# Device Health Check - collects CPU, memory, uptime, temperature from network devices
-# Usage: device_health_check.pl <host> | -f devices.txt [-o output.log]
-# Requirements: Perl 5.10+, Net::SSH::Expect, SSH access with sufficient privileges
-
+#!/usr/bin/env perl
 use strict;
 use warnings;
+use Expect;
 use Getopt::Long;
-use Net::SSH::Expect;
 use Time::HiRes qw(time);
 
-my ($device_file, $output_file, $username, $password, $timeout);
-my $single_host = shift @ARGV if @ARGV && $ARGV[0] !~ /^-/;
+=head1 NAME
+device_health_check.pl - Monitor CPU, memory, temperature on network devices
 
+=head1 SYNOPSIS
+    device_health_check.pl --host <ip|hostname> [--user <username>] [--pass <password>] [--logfile <path>]
+    device_health_check.pl --file <device_list.txt> [--user <username>] [--pass <password>]
+
+=head1 DESCRIPTION
+Connects to network devices via SSH and collects health metrics:
+- CPU utilization percentage
+- Memory usage percentage  
+- System uptime
+- Temperature readings (if available)
+
+Supports Cisco IOS, IOS-XE, NX-OS devices. Reports thresholds exceeded to STDOUT and optional logfile.
+
+=head1 PREREQUISITES
+    Expect.pm (Net::Expect or standard Expect)
+    SSH access to target devices
+    Cisco network engineer credentials
+
+=head1 OPTIONS
+    --host         Device IP/hostname (required unless --file)
+    --file         Text file with one device per line
+    --user         SSH username (default: env SSH_USER or 'admin')
+    --pass         SSH password (default: prompts if needed)
+    --logfile      Optional log file for results
+    --timeout      SSH timeout in seconds (default: 30)
+
+=cut
+
+my ($host, $file, $user, $password, $logfile, $timeout);
 GetOptions(
-    'f|file=s'    => \$device_file,
-    'o|output=s'  => \$output_file,
-    'u|user=s'    => \$username,
-    'p|pass=s'    => \$password,
-    't|timeout=i' => \$timeout,
+    'host=s'    => \$host,
+    'file=s'    => \$file,
+    'user=s'    => \$user,
+    'pass=s'    => \$password,
+    'logfile=s' => \$logfile,
+    'timeout=i' => \$timeout,
 ) or die "Error in command line arguments\n";
 
-$output_file ||= 'health_check.log';
-$username    ||= $ENV{NETDEV_USER} || 'admin';
-$password    ||= $ENV{NETDEV_PASS} || 'password';
-$timeout     ||= 30;
+$timeout //= 30;
+$user //= $ENV{SSH_USER} // 'admin';
+die "Must specify --host or --file\n" unless ($host || $file);
 
-my @devices;
-if ($device_file) {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    @devices = grep { chomp; $_ } <$fh>;
-    close $fh;
-} elsif ($single_host) {
-    @devices = ($single_host);
-} else {
-    die "Usage: $0 <host> | -f <file> [-o <output>] [-u <user>] [-p <pass>] [-t <timeout>]\n";
+my @devices = $host ? ($host) : read_devices($file);
+die "No valid devices found\n" unless @devices;
+
+my $log;
+open($log, '>>', $logfile) if $logfile;
+
+foreach my $dev (@devices) {
+    check_health($dev, $user, $password, $log);
 }
+close($log) if $log;
+print "Health check complete\n";
 
-die "No devices specified\n" unless @devices;
-
-open my $log, '>>', $output_file or die "Cannot open $output_file: $!\n";
-
-foreach my $device (@devices) {
-    next unless $device;
-    print "\n[$device] Connecting...\n";
-    print $log "\n" . ("=" x 70) . "\n";
-    print $log "Device: $device\n";
-    print $log "Timestamp: " . scalar(localtime) . "\n";
-    print $log ("=" x 70) . "\n";
+sub check_health {
+    my ($device, $user, $pass, $log) = @_;
+    my $exp = Expect->new();
+    $exp->log_stdout(0);
+    $exp->debug(0);
+    $exp->timeout($timeout);
     
-    my $start = time();
-    my $ssh = Net::SSH::Expect->new(
-        host    => $device,
-        user    => $username,
-        password=> $password,
-        timeout => $timeout,
-        raw_pty => 1,
-    );
+    print "\n=== $device ===\n";
+    write_log($log, "[$device] Health check started at " . scalar localtime);
     
     eval {
-        $ssh->login() or die "SSH login failed\n";
+        $exp->spawn("ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $user\@$device")
+            or die "Cannot spawn SSH: $!\n";
         
-        # Disable paging on Cisco devices
-        $ssh->exec_cmd('terminal length 0');
-        $ssh->exec_cmd('terminal width 0');
+        $exp->expect(
+            [ 'password:', sub { $exp->send("$pass\n") if $pass } ],
+            [ 'Password:', sub { $exp->send("$pass\n") if $pass } ],
+        );
         
-        # Collect version and uptime
-        my $version = $ssh->exec_cmd('show version');
-        if ($version =~ /System uptime is (.+?)[\r\n]/i) {
-            print "  Uptime: $1\n";
-            print $log "Uptime: $1\n";
+        my $prompt = qr/[\w\-]+[#>]/;
+        $exp->expect($timeout, $prompt) or die "No device prompt\n";
+        
+        $exp->send("terminal length 0\n");
+        $exp->expect($timeout, $prompt);
+        
+        # CPU check
+        $exp->send("show processes cpu | include CPU utilization\n");
+        $exp->expect($timeout, $prompt);
+        if ($exp->before =~ /(\d+)%\s*Busy/) {
+            my $cpu = $1;
+            my $alert = $cpu > 80 ? " [WARN]" : "";
+            print "CPU Usage: $cpu%$alert\n";
+            write_log($log, "[$device] CPU: $cpu%");
         }
         
-        # CPU utilization
-        my $proc = $ssh->exec_cmd('show processes cpu');
-        if ($proc =~ /CPU utilization[^:]*:\s*(\d+)%/i) {
-            print "  CPU Utilization: $1%\n";
-            print $log "CPU Utilization: $1%\n";
+        # Memory check
+        $exp->send("show memory statistics\n");
+        $exp->expect($timeout, $prompt);
+        if ($exp->before =~ /(\d+)\s+bytes\s+total.*?(\d+)\s+bytes\s+free/s) {
+            my ($total, $free) = ($1, $2);
+            my $used_pct = int((($total - $free) / $total) * 100);
+            my $alert = $used_pct > 85 ? " [WARN]" : "";
+            print "Memory Usage: $used_pct%$alert\n";
+            write_log($log, "[$device] Memory: $used_pct%");
         }
         
-        # Memory usage
-        my $mem = $ssh->exec_cmd('show memory');
-        if ($mem =~ /Processor\s+Pool\s+Total\s+(\d+)(?:\s+Used\s+(\d+))?/is) {
-            my $total = $1;
-            if ($mem =~ /Free\s+(\d+)/i) {
-                my $free = $1;
-                my $pct = int(100 * ($total - $free) / $total);
-                print "  Memory: ${pct}% used\n";
-                print $log "Memory: ${pct}% used\n";
-            }
+        # Uptime check
+        $exp->send("show version | include uptime\n");
+        $exp->expect($timeout, $prompt);
+        if ($exp->before =~ /uptime is\s+(.+?)[\r\n]/) {
+            my $uptime = $1;
+            print "Uptime: $uptime\n";
+            write_log($log, "[$device] Uptime: $uptime");
         }
         
-        # Temperature sensors
-        my $env = $ssh->exec_cmd('show environment');
-        my $temp_count = 0;
-        while ($env =~ /(?:Temperature|Temp):\s*([0-9.]+)\s*(?:C|°C|degrees)/ig) {
-            print "  Temperature: $1°C\n" if $temp_count == 0;
-            print $log "Temperature: $1°C\n" if $temp_count == 0;
-            $temp_count++;
+        # Temperature (optional)
+        $exp->send("show environment | include Temperature\n");
+        $exp->expect($timeout, $prompt);
+        my @temps = $exp->before =~ /(\d+)\s*[°C|C]/gi;
+        if (@temps) {
+            my $max_t = (sort { $b <=> $a } @temps)[0];
+            my $alert = $max_t > 70 ? " [WARN]" : "";
+            print "Max Temperature: ${max_t}C$alert\n";
+            write_log($log, "[$device] Temp: ${max_t}C");
         }
         
-        # Interface status summary
-        my $intf = $ssh->exec_cmd('show interfaces summary');
-        if ($intf =~ /(\d+)\s+Shutdown/i) {
-            print "  Shutdown Interfaces: $1\n";
-            print $log "Shutdown Interfaces: $1\n";
-        }
-        
-        # Log full output for troubleshooting
-        print $log "\n--- Full Output ---\n";
-        print $log "VERSION:\n$version\n";
-        print $log "\nPROCESSES:\n$proc\n";
-        print $log "\nMEMORY:\n$mem\n";
-        
-        $ssh->close();
-        print "  Connected successfully\n";
+        $exp->send("exit\n");
+        $exp->soft_close();
+        write_log($log, "[$device] Completed successfully");
     };
     
     if ($@) {
-        my $error = $@;
-        chomp $error;
-        print "  ERROR: $error\n";
-        print $log "ERROR: $error\n";
+        print "[ERROR] $@\n";
+        write_log($log, "[$device] ERROR: $@");
+        $exp->hard_close() if $exp;
     }
-    
-    my $elapsed = int((time() - $start) * 1000);
-    print "  Completed in ${elapsed}ms\n";
-    print $log "Duration: ${elapsed}ms\n";
 }
 
-close $log;
-print "\n" . ("=" x 70) . "\n";
-print "Health check complete. Results saved to: $output_file\n";
-exit 0;
-```
+sub read_devices {
+    my ($filepath) = @_;
+    return () unless -f $filepath;
+    open(my $fh, '<', $filepath) or die "Cannot open $filepath: $!\n";
+    my @devices;
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line =~ /^#/ || $line =~ /^\s*$/;
+        push @devices, $line;
+    }
+    close($fh);
+    return @devices;
+}
+
+sub write_log {
+    my ($log, $msg) = @_;
+    return unless $log;
+    print $log "$msg\n";
+    $log->flush;
+}
