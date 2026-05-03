@@ -1,178 +1,148 @@
-The prompt asks for script content only — here it is:
+Writing the Perl script now.
 
 #!/usr/bin/perl
 #
-# 012_health_check.pl - Cisco IOS Hardware Health Check
+# cdp_lldp_neighbors.pl - CDP/LLDP Neighbor Discovery and Topology Tool
 #
-# Collects CPU utilization, memory usage, environmental status (temperature,
-# fans, power supplies), and system uptime from Cisco IOS devices.
-# Useful for baseline health checks, pre/post-change verification, and
-# identifying resource exhaustion before it causes an outage.
+# Purpose:
+#   Connects to one or more Cisco/IOS/NX-OS devices via SSH and collects
+#   CDP and LLDP neighbor detail. Useful for topology documentation, verifying
+#   physical adjacencies before maintenance windows, and validating cabling
+#   after rack-and-stack work.
 #
 # Usage:
-#   Single device:  perl 012_health_check.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:    perl 012_health_check.pl -f devices.txt -u admin -p secret
-#   With log:       perl 012_health_check.pl -h 192.168.1.1 -u admin -p secret -l health.log
+#   Single device:  ./cdp_lldp_neighbors.pl -h 10.0.0.1 -u admin -p secret
+#   Device list:    ./cdp_lldp_neighbors.pl -f devices.txt -u admin -p secret
+#   With log:       ./cdp_lldp_neighbors.pl -f devices.txt -u admin -p secret -o neighbors.log
+#   Custom timeout: ./cdp_lldp_neighbors.pl -h 10.0.0.1 -u admin -p secret -t 60
 #
-# Device file format: one IP or hostname per line, lines starting with # ignored
+# Device file format: one IP or hostname per line; lines starting with # are ignored
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
+#   Perl modules: Net::SSH::Expect, Getopt::Long
+#   Devices must have SSH v2 enabled and CDP and/or LLDP configured
 #
-# Tested on: Cisco IOS 12.x/15.x, IOS-XE 3.x/16.x/17.x
-#
+# Install modules: cpan Net::SSH::Expect
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case bundling);
 use POSIX qw(strftime);
 
-my ($host, $file, $user, $pass, $logfile, $help);
-my $timeout = 30;
+my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_out, $opt_help);
+my $opt_timeout = 30;
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'f|file=s'     => \$file,
-    'u|user=s'     => \$user,
-    'p|pass=s'     => \$pass,
-    'l|log=s'      => \$logfile,
-    't|timeout=i'  => \$timeout,
-    'help'         => \$help,
-) or die "Error parsing options. Use --help for usage.\n";
+    'h|host=s'    => \$opt_host,
+    'f|file=s'    => \$opt_file,
+    'u|user=s'    => \$opt_user,
+    'p|pass=s'    => \$opt_pass,
+    'o|output=s'  => \$opt_out,
+    't|timeout=i' => \$opt_timeout,
+    'help'        => \$opt_help,
+) or usage(1);
 
-if ($help || (!$host && !$file) || !$user || !$pass) {
-    print "Usage: $0 -h <host> -u <user> -p <pass> [-l logfile] [-t timeout]\n";
-    print "       $0 -f <devices.txt> -u <user> -p <pass> [-l logfile]\n";
-    exit 1;
+usage(0) if $opt_help;
+usage(1) unless ($opt_host || $opt_file) && $opt_user && $opt_pass;
+
+my @devices;
+push @devices, $opt_host if $opt_host;
+
+if ($opt_file) {
+    open my $fh, '<', $opt_file or die "Cannot open device file '$opt_file': $!\n";
+    while (<$fh>) {
+        chomp; s/^\s+|\s+$//g;
+        push @devices, $_ unless /^#/ || /^$/;
+    }
+    close $fh;
 }
-
-my @devices = $host ? ($host) : read_device_file($file);
 die "No devices to process.\n" unless @devices;
 
-my $LOG;
-if ($logfile) {
-    open($LOG, '>>', $logfile) or die "Cannot open log file '$logfile': $!\n";
+my $log_fh;
+if ($opt_out) {
+    open $log_fh, '>', $opt_out or die "Cannot write to '$opt_out': $!\n";
 }
 
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-output("=" x 60);
-output("Health Check Run: $timestamp");
-output("=" x 60);
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+log_out("=" x 65);
+log_out("CDP/LLDP Neighbor Discovery  |  $ts");
+log_out("Devices: " . scalar(@devices) . "  |  Timeout: ${opt_timeout}s");
+log_out("=" x 65);
+
+my ($ok, $fail) = (0, 0);
 
 for my $device (@devices) {
-    output("\n--- Device: $device ---");
-    check_device($device, $user, $pass, $timeout);
-}
+    log_out("\nDevice: $device");
+    log_out("-" x 45);
 
-close($LOG) if $LOG;
-exit 0;
+    my $ssh = Net::SSH::Expect->new(
+        host     => $device,
+        user     => $opt_user,
+        password => $opt_pass,
+        raw_pty  => 1,
+        timeout  => $opt_timeout,
+    );
 
-sub check_device {
-    my ($host, $user, $pass, $timeout) = @_;
-
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host        => $host,
-            user        => $user,
-            password    => $pass,
-            timeout     => $timeout,
-            ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
-        );
-    };
-    if ($@ || !$ssh) {
-        output("  ERROR: Failed to create SSH session for $host: $@");
-        return;
+    eval { $ssh->login() };
+    if ($@) {
+        (my $err = $@) =~ s/\n.*//s;
+        log_out("  FAILED: $err");
+        $fail++;
+        next;
     }
 
-    my $login = eval { $ssh->login() };
-    if ($@ || !defined $login) {
-        output("  ERROR: Authentication failed for $host");
-        return;
+    $ssh->exec("terminal length 0");
+    $ssh->exec("terminal width 200");
+
+    for my $proto ('cdp', 'lldp') {
+        log_out("\n  [show $proto neighbors detail]");
+        my $out = eval { $ssh->exec("show $proto neighbors detail") };
+        if ($@) {
+            log_out("  Timeout collecting $proto output");
+            next;
+        }
+        my $printed = 0;
+        for my $line (split /\r?\n/, $out) {
+            next if $line =~ /^\s*$/ || $line =~ /show $proto neighbors|terminal/;
+            log_out("  $line");
+            $printed++;
+        }
+        log_out("  (no $proto neighbors or protocol not enabled)") unless $printed;
     }
 
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('\$|#', 5);
-
-    collect_uptime($ssh);
-    collect_cpu($ssh);
-    collect_memory($ssh);
-    collect_environment($ssh);
-
-    eval { $ssh->send("exit\n") };
+    eval { $ssh->close() };
+    $ok++;
 }
 
-sub collect_uptime {
-    my ($ssh) = @_;
-    my $out = run_command($ssh, 'show version | include uptime');
-    if ($out && $out =~ /uptime is (.+)/i) {
-        output("  Uptime       : $1");
-    }
+log_out("\n" . "=" x 65);
+log_out(sprintf("Complete: %d succeeded, %d failed, %d total", $ok, $fail, scalar(@devices)));
+log_out("=" x 65);
+
+if ($log_fh) {
+    close $log_fh;
+    print "Output written to: $opt_out\n";
 }
 
-sub collect_cpu {
-    my ($ssh) = @_;
-    my $out = run_command($ssh, 'show processes cpu | include CPU utilization');
-    if ($out && $out =~ /CPU utilization for five seconds:\s*(\S+).*one minute:\s*(\S+).*five minutes:\s*(\S+)/i) {
-        output("  CPU (5s/1m/5m): $1 / $2 / $3");
-        my $pct = $1;
-        $pct =~ s/%.*//;
-        output("  CPU WARN: 5-second CPU at ${pct}% - investigate high-CPU processes") if $pct > 80;
-    } else {
-        output("  CPU          : (unable to parse)");
-    }
-}
-
-sub collect_memory {
-    my ($ssh) = @_;
-    my $out = run_command($ssh, 'show processes memory | include Processor');
-    if ($out && $out =~ /Processor\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)/i) {
-        my ($total, $used, $free) = ($1, $2, $3);
-        my $pct = int(($used / $total) * 100);
-        output(sprintf("  Memory       : %dK total, %dK used (%d%%), %dK free", $total, $used, $pct, $free));
-        output("  MEM WARN: Processor memory usage at ${pct}% - check for leaks") if $pct > 85;
-    } else {
-        output("  Memory       : (unable to parse)");
-    }
-}
-
-sub collect_environment {
-    my ($ssh) = @_;
-    my $out = run_command($ssh, 'show environment all');
-    return unless $out;
-
-    my @warnings;
-    push @warnings, "Temperature CRITICAL" if $out =~ /temperature.*CRITICAL/i;
-    push @warnings, "Temperature WARNING"  if $out =~ /temperature.*WARNING/i;
-    push @warnings, "Fan failure detected" if $out =~ /fan.*fail/i;
-    push @warnings, "Power supply failure" if $out =~ /power.*fail/i;
-
-    if (@warnings) {
-        output("  ENV ALERTS   : " . join(', ', @warnings));
-    } else {
-        output("  Environment  : OK (no temperature/fan/power alerts)");
-    }
-}
-
-sub run_command {
-    my ($ssh, $cmd) = @_;
-    eval {
-        $ssh->send("$cmd\n");
-        $ssh->waitfor('\$|#', $timeout);
-        $ssh->before();
-    };
-}
-
-sub read_device_file {
-    my ($file) = @_;
-    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
-    my @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
-    close($fh);
-    return @devices;
-}
-
-sub output {
+sub log_out {
     my ($msg) = @_;
     print "$msg\n";
-    print $LOG "$msg\n" if $LOG;
+    print {$log_fh} "$msg\n" if $log_fh;
+}
+
+sub usage {
+    my $exit = shift;
+    print <<'USAGE';
+Usage: cdp_lldp_neighbors.pl -h <host> | -f <file> -u <user> -p <pass> [options]
+
+  -h, --host     Single device IP or hostname
+  -f, --file     File with device list (one per line, # for comments)
+  -u, --user     SSH username
+  -p, --pass     SSH password
+  -o, --output   Write output to log file (optional)
+  -t, --timeout  SSH timeout in seconds (default: 30)
+      --help     Show this help
+
+USAGE
+    exit $exit;
 }
