@@ -1,180 +1,180 @@
-```perl
+The perl-expect-network-scripts repo isn't on this machine — the user wants the script content as output. Writing it now.
+
 #!/usr/bin/perl
+#
+# ntp_compliance_audit.pl - NTP Policy Compliance Audit for Cisco IOS/IOS-XE
+#
+# Purpose:
+#   Connects to one or more network devices via SSH and audits NTP compliance
+#   against a defined policy: maximum allowed stratum level, acceptable clock
+#   offset threshold (ms), and optionally an approved NTP server whitelist.
+#   Flags any device that is unsynchronized, exceeds drift thresholds, uses an
+#   unauthorized reference, or cannot be reached. Distinct from ntp_check.pl /
+#   ntp_check_v2.pl, which verify NTP is configured — this script enforces a
+#   site-wide NTP security and accuracy policy across a fleet.
+#
+# Usage:
+#   Single device:  perl ntp_compliance_audit.pl -h 10.0.0.1 -u admin -p secret
+#   Device list:    perl ntp_compliance_audit.pl -f devices.txt -u admin -p secret
+#   With log:       perl ntp_compliance_audit.pl -f devices.txt -u admin -p secret -l audit.log
+#   Full policy:    perl ntp_compliance_audit.pl -f devices.txt -u admin -p secret \
+#                     -s 3 -d 200 --servers 10.0.0.5,10.0.0.6
+#
+# Options:
+#   -h <host>        Single device IP or hostname
+#   -f <file>        File with one device per line (# = comment)
+#   -u <user>        SSH username
+#   -p <pass>        SSH password
+#   -e <pass>        Enable password (defaults to SSH password)
+#   -l <file>        Log file path (optional)
+#   -s <n>           Max allowed stratum (default: 3)
+#   -d <ms>          Max allowed clock offset in ms (default: 500)
+#   --servers <csv>  Comma-separated approved NTP server IPs (optional)
+#
+# Prerequisites:
+#   cpan Net::SSH::Expect
+#   cpan Getopt::Long   (usually bundled)
+#
+# Exit codes:  0 = all compliant,  1 = one or more non-compliant or unreachable
+#
+
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
-use Time::Localtime;
+use Getopt::Long qw(:config no_ignore_case);
+use POSIX qw(strftime);
 
-=head1 NAME
-device_syslog_audit.pl - Audit syslog server configuration on network devices
-
-=head1 DESCRIPTION
-Connects to network devices via SSH and verifies syslog servers are properly
-configured. Reports actual configuration and flags missing expected servers.
-
-=head1 USAGE
-  device_syslog_audit.pl --device 192.168.1.1 --user admin --password admin
-  device_syslog_audit.pl --file inventory.txt --user netadmin --key ~/.ssh/id_rsa
-
-=head1 PREREQUISITES
-  - Net::SSH::Expect Perl module (install via: cpan Net::SSH::Expect)
-  - SSH access to target devices with appropriate credentials
-  - Cisco IOS, IOS-XE, or NX-OS devices
-  - Network connectivity to target devices
-
-=cut
-
-my ($device, $device_file, $ssh_user, $ssh_pass, $ssh_key, $logfile, $expected);
+my ($opt_host, $opt_file, $username, $password, $enable_pass, $log_file);
+my $max_stratum      = 3;
+my $max_offset_ms    = 500;
+my $approved_csv     = '';
 
 GetOptions(
-    'device=s'   => \$device,
-    'file=s'     => \$device_file,
-    'user=s'     => \$ssh_user,
-    'password=s' => \$ssh_pass,
-    'key=s'      => \$ssh_key,
-    'logfile=s'  => \$logfile,
-    'expected=s' => \$expected,
-    'help'       => sub { print_help(); exit 0; },
-) or die "Invalid arguments\n";
+    'h=s'       => \$opt_host,
+    'f=s'       => \$opt_file,
+    'u=s'       => \$username,
+    'p=s'       => \$password,
+    'e=s'       => \$enable_pass,
+    'l=s'       => \$log_file,
+    's=i'       => \$max_stratum,
+    'd=f'       => \$max_offset_ms,
+    'servers=s' => \$approved_csv,
+) or die "Option error. See script header for usage.\n";
 
-die "Must specify --device or --file\n" unless ($device || $device_file);
-die "Must specify --user\n" unless $ssh_user;
-die "Must specify --password or --key\n" unless ($ssh_pass || $ssh_key);
+die "Username required (-u)\n"               unless $username;
+die "Password required (-p)\n"               unless $password;
+die "Specify -h <host> or -f <file>\n"       unless $opt_host || $opt_file;
 
-$logfile ||= 'syslog_audit.log';
-my @devices = $device ? ($device) : read_device_file($device_file);
-my %expected_servers = map { $_ => 1 } split(/,/, ($expected || ''));
+$enable_pass //= $password;
+my @approved = $approved_csv ? split /,/, $approved_csv : ();
 
-open(my $log, '>>', $logfile) or die "Cannot open logfile: $!\n";
-my $ts = scalar(localtime());
-print $log "\n" . "="x60 . "\n";
-print $log "Syslog Configuration Audit - $ts\n";
-print $log "="x60 . "\n";
-
-foreach my $host (@devices) {
-    check_syslog_config($host, $ssh_user, $ssh_pass, $ssh_key, $log, %expected_servers);
+my @devices;
+push @devices, $opt_host if $opt_host;
+if ($opt_file) {
+    open my $fh, '<', $opt_file or die "Cannot open '$opt_file': $!\n";
+    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_ }
+    close $fh;
 }
 
-close($log);
-print "Audit complete. Results written to $logfile\n";
-
-sub read_device_file {
-    my ($filename) = @_;
-    open(my $fh, '<', $filename) or die "Cannot open $filename: $!\n";
-    my @hosts;
-    while (my $line = <$fh>) {
-        chomp $line;
-        next if $line =~ /^#/ || $line =~ /^\s*$/;
-        push @hosts, $line;
-    }
-    close($fh);
-    return @hosts;
+my $log_fh;
+if ($log_file) {
+    open $log_fh, '>', $log_file or die "Cannot open log '$log_file': $!\n";
 }
 
-sub check_syslog_config {
-    my ($hostname, $user, $pass, $key, $log, %expected) = @_;
-    
-    print "[$hostname] ";
-    print $log "\nDevice: $hostname\n";
-    print $log "-" x 40 . "\n";
-    
-    my $ssh;
-    eval {
-        my %ssh_opts = (
-            host => $hostname,
-            user => $user,
-            port => 22,
-            timeout => 15,
-            raw_pty => 1,
+sub out {
+    my ($msg) = @_;
+    print $msg;
+    print $log_fh $msg if $log_fh;
+}
+
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+out("NTP Compliance Audit  $ts\n");
+out("Policy: stratum<=$max_stratum  offset<=${max_offset_ms}ms");
+out(@approved ? "  servers=" . join(',', @approved) : "  servers=any");
+out("\n" . "=" x 68 . "\n\n");
+
+my $fail_count = 0;
+
+for my $dev (@devices) {
+    out("[$dev]\n");
+
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host       => $dev,
+            user       => $username,
+            password   => $password,
+            raw_pty    => 1,
+            timeout    => 15,
+            ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
         );
-        
-        if ($key) {
-            $ssh_opts{key_path} = $key;
-        } else {
-            $ssh_opts{password} = $pass;
-        }
-        
-        $ssh = Net::SSH::Expect->new(%ssh_opts);
-        $ssh->login() or die "SSH login failed\n";
     };
-    
-    if ($@) {
-        print "FAILED\n";
-        print $log "Status: FAILED - Connection error: $@";
-        return;
+    if ($@ || !$ssh || !eval { $ssh->login() }) {
+        out("  RESULT: UNREACHABLE - " . ($@ // 'login failed') . "\n\n");
+        $fail_count++;
+        next;
     }
-    
-    eval {
-        $ssh->send("terminal length 0");
-        $ssh->waitfor('.*[>#]', 5);
-        
-        $ssh->send("show logging");
-        my @output = $ssh->waitfor('.*[>#]', 10);
-        
-        my @syslog_servers;
-        foreach my $line (@output) {
-            if ($line =~ /logging\s+host\s+([\d\.]+)/ ||
-                $line =~ /logging\s+server\s+([\d\.]+)/ ||
-                $line =~ /Syslog\s+logging\s+servers.*?:\s*([\d\.]+)/i) {
-                push @syslog_servers, $1;
-            }
+
+    $ssh->exec("terminal length 0");
+    my $prompt = $ssh->exec("") // '';
+    if ($prompt =~ />\s*$/) {
+        $ssh->send("enable");
+        my $r = $ssh->waitfor('Password:|#', 5);
+        if ($r && $r =~ /Password:/) {
+            $ssh->send($enable_pass);
+            $ssh->waitfor('#', 5);
         }
-        
-        if (@syslog_servers) {
-            print "OK\n";
-            my $servers = join(", ", @syslog_servers);
-            print $log "Status: OK\n";
-            print $log "Configured servers: $servers\n";
-            
-            if (%expected) {
-                my @missing;
-                foreach my $exp (keys %expected) {
-                    push @missing, $exp unless grep { $_ eq $exp } @syslog_servers;
-                }
-                
-                if (@missing) {
-                    print $log "WARNING: Missing expected servers: " . join(", ", @missing) . "\n";
-                } else {
-                    print $log "All expected servers found\n";
-                }
-            }
-        } else {
-            print "WARNING\n";
-            print $log "Status: WARNING - No syslog servers configured\n";
-        }
-        
-        $ssh->close();
-    };
-    
-    if ($@) {
-        print $log "Status: ERROR - $@";
     }
+
+    my $status_out = $ssh->exec("show ntp status")              // '';
+    my $assoc_out  = $ssh->exec("show ntp associations detail")  // '';
+    $ssh->close();
+
+    my @issues;
+
+    my $synced = ($status_out =~ /Clock is synchronized/i);
+    push @issues, 'clock not synchronized' unless $synced;
+
+    my ($stratum) = ($status_out =~ /stratum\s+(\d+)/i);
+    if (defined $stratum) {
+        out(sprintf("  stratum  : %d\n", $stratum));
+        push @issues, "stratum $stratum > policy $max_stratum" if $stratum > $max_stratum;
+    } else {
+        push @issues, 'stratum not parseable';
+    }
+
+    my ($offset) = ($status_out =~ /offset\s+([-\d.]+)\s+msec/i);
+    if (defined $offset) {
+        out(sprintf("  offset   : %s ms\n", $offset));
+        push @issues, sprintf("offset %.1fms > policy %.0fms", abs($offset), $max_offset_ms)
+            if abs($offset) > $max_offset_ms;
+    } else {
+        push @issues, 'offset not parseable';
+    }
+
+    my ($ref) = ($status_out =~ /reference is\s+([\d.]+)/i);
+    ($ref)    = ($assoc_out  =~ /our mode client.*?\nref ID\s+([\d.]+)/si) unless $ref;
+    if ($ref) {
+        out("  reference: $ref\n");
+        if (@approved && !grep { $_ eq $ref } @approved) {
+            push @issues, "reference $ref not in approved list";
+        }
+    } else {
+        out("  reference: (unknown)\n");
+    }
+
+    if (@issues) {
+        out("  RESULT: NON-COMPLIANT\n");
+        out("    - $_\n") for @issues;
+        $fail_count++;
+    } else {
+        out("  RESULT: COMPLIANT\n");
+    }
+    out("\n");
 }
 
-sub print_help {
-    print <<EOF;
-device_syslog_audit.pl - Audit syslog configuration on network devices
+out("=" x 68 . "\n");
+out(sprintf("AUDIT COMPLETE: %d device(s), %d non-compliant\n",
+    scalar(@devices), $fail_count));
 
-USAGE:
-    device_syslog_audit.pl --device HOST [options]
-    device_syslog_audit.pl --file FILENAME [options]
-
-REQUIRED OPTIONS:
-    --device HOSTNAME    Single device IP or hostname
-    --file FILENAME      Text file with one device per line
-    --user USERNAME      SSH username
-    --password PASS      SSH password
-    --key KEYFILE        SSH private key file (instead of password)
-
-OPTIONAL OPTIONS:
-    --logfile FILE       Output log file (default: syslog_audit.log)
-    --expected SERVERS   Expected servers comma-separated (10.0.0.1,10.0.0.2)
-
-EXAMPLES:
-    device_syslog_audit.pl --device 10.0.0.1 --user admin --password admin
-    device_syslog_audit.pl --file devices.txt --user netadmin --key ~/.ssh/id_rsa
-
-EOF
-}
-```
+close $log_fh if $log_fh;
+exit($fail_count ? 1 : 0);
