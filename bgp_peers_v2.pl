@@ -1,186 +1,144 @@
 ```perl
 #!/usr/bin/perl
+# =============================================================================
+# bgp_prefix_monitor.pl - BGP Prefix Count Threshold Monitor
+#
+# Purpose:
+#   Connects to Cisco IOS/IOS-XE routers and audits BGP neighbor prefix counts
+#   against configurable high/low thresholds. Flags peers with prefix counts
+#   outside expected ranges -- useful for detecting route leaks, peer failures,
+#   or misconfigured filters before they impact traffic.
+#
+# Usage:
+#   ./bgp_prefix_monitor.pl -h <host> [-u <user>] [-p <pass>] [-l <logfile>]
+#                            [-H <high_thresh>] [-L <low_thresh>]
+#   ./bgp_prefix_monitor.pl -f <device_file> [-u <user>] [-p <pass>] [-l <logfile>]
+#
+#   Device file format (one per line): <ip_or_hostname>
+#   Example: ./bgp_prefix_monitor.pl -f routers.txt -u admin -p secret -H 800000 -L 100
+#
+# Prerequisites:
+#   cpan Net::SSH::Expect
+#   SSH key auth recommended; password auth supported via -p flag
+#
+# Output:
+#   STDOUT + optional log file. Exit code 1 if any threshold violations found.
+# =============================================================================
+
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-# =============================================================================
-# bgp_route_analysis.pl - BGP Route Table Analyzer
-#
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE routers and analyzes the BGP routing table
-#   for operational insights: prefix counts, AS path lengths, origin types,
-#   and routes with anomalous attributes. Complements bgp_peers scripts which
-#   focus on neighbor state; this script focuses on the route table itself.
-#
-# Usage:
-#   ./bgp_route_analysis.pl -h 192.168.1.1 -u admin -p secret
-#   ./bgp_route_analysis.pl -f devices.txt -u admin -p secret -l bgp_routes.log
-#   ./bgp_route_analysis.pl -h 10.0.0.1 -u admin -p secret --max-aspath 5
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#
-# devices.txt format (one IP or hostname per line, # for comments):
-#   192.168.1.1
-#   10.0.0.254
-#   # core-router-1
-# =============================================================================
-
-my ($host, $user, $pass, $device_file, $log_file, $max_aspath, $timeout);
-$max_aspath = 5;
-$timeout    = 30;
+my ($host, $device_file, $username, $password, $logfile);
+my $high_thresh = 900000;
+my $low_thresh  = 1;
 
 GetOptions(
-    'h|host=s'       => \$host,
-    'f|file=s'       => \$device_file,
-    'u|user=s'       => \$user,
-    'p|pass=s'       => \$pass,
-    'l|log=s'        => \$log_file,
-    'max-aspath=i'   => \$max_aspath,
-    't|timeout=i'    => \$timeout,
-) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOG] [--max-aspath N]\n";
+    'h=s' => \$host,
+    'f=s' => \$device_file,
+    'u=s' => \$username,
+    'p=s' => \$password,
+    'l=s' => \$logfile,
+    'H=i' => \$high_thresh,
+    'L=i' => \$low_thresh,
+) or die "Usage: $0 -h <host>|-f <file> [-u user] [-p pass] [-l logfile] [-H high] [-L low]\n";
 
-die "Provide -h HOST or -f FILE\n" unless $host || $device_file;
-die "Username (-u) required\n"     unless $user;
-die "Password (-p) required\n"     unless $pass;
+die "Specify -h <host> or -f <file>\n" unless $host || $device_file;
 
-my @devices;
-if ($device_file) {
+$username //= $ENV{NET_USER} // 'admin';
+
+my @devices = $host ? ($host) : do {
     open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    while (<$fh>) {
-        chomp;
-        next if /^\s*#/ || /^\s*$/;
-        push @devices, $_;
-    }
-    close $fh;
-} else {
-    push @devices, $host;
-}
+    grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
+};
 
 my $log_fh;
-if ($log_file) {
-    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
+if ($logfile) {
+    open $log_fh, '>>', $logfile or warn "Cannot open logfile $logfile: $!\n";
 }
 
-sub log_output {
-    my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
+my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+my $violations = 0;
+
+sub log_line {
+    my $line = shift;
+    print $line, "\n";
+    print $log_fh $line, "\n" if $log_fh;
 }
 
-sub analyze_device {
-    my ($target) = @_;
-    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-    log_output("\n[$ts] Connecting to $target\n");
-    log_output("=" x 60 . "\n");
+log_line("=" x 70);
+log_line("BGP Prefix Threshold Audit  [$timestamp]");
+log_line("Thresholds: LOW < $low_thresh  |  HIGH > $high_thresh");
+log_line("=" x 70);
 
-    my $ssh = Net::SSH::Expect->new(
-        host        => $target,
-        user        => $user,
-        password    => $pass,
-        raw_pty     => 1,
-        timeout     => $timeout,
-    );
+for my $device (@devices) {
+    log_line("\n>>> Device: $device");
 
-    my $login_output = eval { $ssh->login() };
-    if ($@ || !defined $login_output) {
-        log_output("  ERROR: Connection failed to $target - $@\n");
-        return;
-    }
-
-    if ($login_output =~ /password|denied/i) {
-        log_output("  ERROR: Authentication failed on $target\n");
-        $ssh->close();
-        return;
-    }
-
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('(#|\$)\s*$', $timeout) or do {
-        log_output("  ERROR: No prompt after terminal length 0\n");
-        $ssh->close();
-        return;
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host        => $device,
+            user        => $username,
+            defined $password ? (password => $password) : (),
+            raw_pty     => 1,
+            timeout     => 20,
+        );
     };
+    if ($@ || !$ssh) {
+        log_line("  ERROR: SSH object creation failed for $device: $@");
+        $violations++;
+        next;
+    }
 
-    $ssh->send("show ip bgp summary\n");
-    my ($summary) = $ssh->waitfor('(#|\$)\s*$', $timeout);
-    unless (defined $summary) {
-        log_output("  ERROR: Timeout waiting for BGP summary on $target\n");
+    my $login_out = eval { $ssh->login() };
+    if ($@ || !defined $login_out) {
+        log_line("  ERROR: Login failed for $device (auth error or timeout)");
+        $violations++;
+        next;
+    }
+
+    $ssh->exec("terminal length 0");
+
+    my $output = $ssh->exec("show ip bgp summary");
+    unless (defined $output && $output =~ /Neighbor/i) {
+        log_line("  WARNING: No BGP summary output received (BGP may not be running)");
         $ssh->close();
-        return;
+        next;
     }
 
-    my ($router_id, $as_number, $total_peers, $up_peers) = ('unknown', 'unknown', 0, 0);
-    if ($summary =~ /BGP router identifier ([\d.]+), local AS number (\d+)/i) {
-        ($router_id, $as_number) = ($1, $2);
-    }
-    my @peer_lines = grep { /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s/ } split(/\n/, $summary);
-    $total_peers = scalar @peer_lines;
-    $up_peers    = grep { /\s+\d+\s*$/ } @peer_lines;
+    my $found_peer = 0;
+    for my $line (split /\n/, $output) {
+        next unless $line =~ /^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\S+\s+(\S+)/;
+        my ($neighbor, $pfx_field) = ($1, $2);
+        $found_peer = 1;
 
-    log_output("  Router ID : $router_id\n");
-    log_output("  Local AS  : $as_number\n");
-    log_output("  BGP Peers : $total_peers total, $up_peers established\n\n");
-
-    $ssh->send("show ip bgp\n");
-    my ($bgp_table) = $ssh->waitfor('(#|\$)\s*$', $timeout + 60);
-    unless (defined $bgp_table) {
-        log_output("  ERROR: Timeout waiting for BGP table on $target\n");
-        $ssh->close();
-        return;
-    }
-
-    my (%origin_count, @long_paths, $total_prefixes);
-    $total_prefixes = 0;
-
-    for my $line (split /\n/, $bgp_table) {
-        next unless $line =~ /^\s*[*>isdhRSFf]/;
-        $total_prefixes++;
-
-        if ($line =~ /\s+([iIeE?])\s*$/) {
-            my $origin = $1;
-            $origin_count{i}++ if $origin eq 'i';
-            $origin_count{e}++ if lc($origin) eq 'e';
-            $origin_count{'?'}++ if $origin eq '?';
+        if ($pfx_field !~ /^\d+$/) {
+            log_line(sprintf("  %-18s  state=%-10s  (not established)", $neighbor, $pfx_field));
+            $violations++;
+            next;
         }
 
-        if ($line =~ /((?:\d+\s+){$max_aspath,}[iIeE?])/) {
-            my $path_str = $1;
-            my @asns = grep { /^\d+$/ } split /\s+/, $path_str;
-            if (@asns >= $max_aspath) {
-                if ($line =~ /\s+([\d.]+\/\d+)\s/) {
-                    push @long_paths, { prefix => $1, length => scalar @asns, path => join(' ', @asns) };
-                }
-            }
+        my $pfx_count = int($pfx_field);
+        my $status = "OK";
+        if ($pfx_count > $high_thresh) {
+            $status = "ALERT:HIGH";
+            $violations++;
+        } elsif ($pfx_count < $low_thresh) {
+            $status = "ALERT:LOW";
+            $violations++;
         }
+        log_line(sprintf("  %-18s  prefixes=%-8d  %s", $neighbor, $pfx_count, $status));
     }
 
-    log_output("  BGP Table Summary:\n");
-    log_output(sprintf("    Total prefixes : %d\n", $total_prefixes));
-    log_output(sprintf("    IGP origin (i) : %d\n", $origin_count{i}  // 0));
-    log_output(sprintf("    EGP origin (e) : %d\n", $origin_count{e}  // 0));
-    log_output(sprintf("    Incomplete (?) : %d\n", $origin_count{'?'} // 0));
-
-    if (@long_paths) {
-        log_output("\n  Routes with AS-path length >= $max_aspath hops:\n");
-        for my $r (sort { $b->{length} <=> $a->{length} } @long_paths) {
-            log_output(sprintf("    %-20s  hops=%-3d  path=%s\n",
-                $r->{prefix}, $r->{length}, $r->{path}));
-        }
-    } else {
-        log_output("\n  No routes with AS-path >= $max_aspath hops found.\n");
-    }
-
-    $ssh->send("exit\n");
+    log_line("  (no established BGP neighbors found)") unless $found_peer;
     $ssh->close();
-    log_output("\n  Done: $target\n");
 }
 
-for my $dev (@devices) {
-    analyze_device($dev);
-}
+log_line("\n" . "=" x 70);
+log_line("Audit complete. Violations: $violations");
+log_line("=" x 70);
 
 close $log_fh if $log_fh;
+exit($violations ? 1 : 0);
 ```
