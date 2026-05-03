@@ -1,163 +1,154 @@
-```perl
 #!/usr/bin/perl
+#
+# interface_utilization_audit.pl
+#
+# PURPOSE: Audits interface utilization and error counters on Cisco IOS/IOS-XE
+#          devices. Flags overutilized links and interfaces with elevated CRC,
+#          input error, or output drop rates that indicate hardware faults or
+#          duplex mismatches. Complements interface_audit_v2.pl (status/config)
+#          with real-time traffic and error-rate data.
+#
+# USAGE:   ./interface_utilization_audit.pl --host 10.0.0.1 --user admin --pass s3cr3t
+#          ./interface_utilization_audit.pl --file devices.txt --user admin --pass s3cr3t \
+#                                           --enable en_pass --log audit.log --threshold 80
+#
+# PREREQS: Net::SSH::Expect  (cpan install Net::SSH::Expect)
+#          SSH enabled on target device; read-only (priv-1) credentials sufficient.
+#          Tested on Cisco IOS 12.4+, IOS-XE 16.x/17.x.
+#
+# OUTPUT:  Columnar utilization report to STDOUT; appended to --log if specified.
+
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use Time::Piece;
-use File::Basename;
+use POSIX qw(strftime);
 
-=head1 CRITICAL SYSLOG MONITOR
-Audit network device syslog for critical events, errors, and potential failures.
-Identifies stability issues, hardware faults, routing problems, and configuration
-errors. Generates compliance-ready audit reports.
-
-USAGE:
-  ./critical_syslog_monitor.pl --device 192.168.1.100 --user admin --pass secret
-  ./critical_syslog_monitor.pl --file devices.txt --user admin --pass secret --log audit.log
-
-PREREQUISITES:
-  - Net::SSH::Expect Perl module installed
-  - SSH access to devices (Cisco IOS/NX-OS, Juniper, Arista compatible)
-  - Credentials with read/view permissions
-  - Device must support 'show log' or 'show messages' commands
-
-EXAMPLES:
-  # Check single device, output to STDOUT
-  ./critical_syslog_monitor.pl --device 10.0.1.1 --user admin --pass admin123
-
-  # Audit multiple devices, save to log file with custom severity filter
-  ./critical_syslog_monitor.pl --file inventory.txt --user netadmin --pass P@ssw0rd \
-    --log /var/log/syslog_audit_$(date +%Y%m%d).log --severity "CRITICAL|ERROR|FAIL|DOWN"
-
-  # Quick connectivity check with 15 second timeout
-  ./critical_syslog_monitor.pl --device 10.0.1.5 --user admin --pass secret --timeout 15
-
-=cut
-
-my ($device, $device_file, $username, $password, $logfile, $timeout, $severity);
-my @devices;
+my ($host, $device_file, $username, $password, $enable_pass, $log_file);
+my $threshold = 70;
 
 GetOptions(
-    'device=s'    => \$device,
+    'host=s'      => \$host,
     'file=s'      => \$device_file,
     'user=s'      => \$username,
     'pass=s'      => \$password,
-    'log=s'       => \$logfile,
-    'timeout=i'   => \$timeout,
-    'severity=s'  => \$severity,
-) or die "Error in command line arguments\n";
+    'enable=s'    => \$enable_pass,
+    'log=s'       => \$log_file,
+    'threshold=i' => \$threshold,
+) or die usage();
 
-$timeout  ||= 30;
-$severity ||= 'CRITICAL|ERROR|FAIL|DOWN';
+die usage() unless ($host || $device_file) && $username && $password;
 
-if ($device) {
-    push @devices, $device;
-} elsif ($device_file) {
-    unless (open my $fh, '<', $device_file) {
-        die "Cannot open device file $device_file: $!\n";
-    }
-    while (<$fh>) {
-        chomp;
-        next if /^#/ || /^\s*$/;
-        push @devices, $_;
-    }
-    close $fh;
+my @devices;
+if ($host) {
+    push @devices, $host;
 } else {
-    die "Must specify either --device or --file\n";
+    open my $fh, '<', $device_file or die "Cannot open '$device_file': $!\n";
+    while (<$fh>) { chomp; next if /^\s*[#;]/ || /^\s*$/; push @devices, $_; }
+    close $fh;
 }
 
-unless ($username && $password) {
-    die "Username and password required (--user and --pass)\n";
+my $LOG;
+if ($log_file) {
+    open $LOG, '>>', $log_file or die "Cannot open log '$log_file': $!\n";
+    printf $LOG "\n=== Interface Utilization Audit: %s ===\n", strftime("%Y-%m-%d %H:%M:%S", localtime);
 }
 
-my $report_fh = \*STDOUT;
-if ($logfile) {
-    unless (open $report_fh, '>', $logfile) {
-        die "Cannot create log file $logfile: $!\n";
-    }
-}
+audit_device($_) for @devices;
+close $LOG if $LOG;
 
-my $script_name = basename($0);
-my $timestamp = Time::Piece->new()->strftime("%Y-%m-%d %H:%M:%S");
-
-print $report_fh "$script_name - Critical Syslog Audit Report\n";
-print $report_fh "=" x 85 . "\n";
-print $report_fh "Generated: $timestamp\n";
-print $report_fh "Devices: " . scalar(@devices) . "\n";
-print $report_fh "Severity Filter: $severity\n";
-print $report_fh "=" x 85 . "\n\n";
-
-my ($total_devices, $devices_ok, $devices_failed, $total_issues) = (0, 0, 0, 0);
-
-foreach my $dev (@devices) {
-    $total_devices++;
-    print "Auditing $dev...\n";
-    
+sub audit_device {
+    my ($dev) = @_;
     my $ssh = Net::SSH::Expect->new(
         host     => $dev,
         user     => $username,
         password => $password,
-        timeout  => $timeout,
         raw_pty  => 1,
+        timeout  => 15,
     );
-    
-    unless ($ssh->login()) {
-        print $report_fh "[FAIL] $dev - SSH authentication failed\n";
-        $devices_failed++;
-        print STDERR "Authentication failed on $dev\n";
-        next;
+
+    my $login;
+    eval { $login = $ssh->login() };
+    if ($@ || $login =~ /password|denied/i) {
+        warn "[$dev] Connection/auth failed: " . ($@ // "bad credentials") . "\n";
+        return;
     }
-    
-    print $report_fh "\n[Device] $dev\n";
-    print $report_fh "-" x 85 . "\n";
-    
-    my $device_issues = 0;
-    
-    eval {
-        my $log_output = $ssh->exec("show log | include $severity");
-        unless ($log_output) {
-            $log_output = $ssh->exec("show messages | include $severity");
-        }
-        
-        my @lines = split /\n/, $log_output;
-        foreach my $line (@lines) {
-            $line =~ s/^\s+|\s+$//g;
-            next if !$line || $line =~ /^--More--/ || $line =~ /No entries/i;
-            
-            if ($line =~ /($severity)/i) {
-                print $report_fh "  $line\n";
-                $device_issues++;
-                $total_issues++;
-            }
-        }
-    };
-    
-    if ($@) {
-        print $report_fh "[ERROR] Exception: $@\n";
-        $devices_failed++;
-    } else {
-        if ($device_issues == 0) {
-            print $report_fh "  [OK] No critical events detected\n";
-            $devices_ok++;
-        } else {
-            print $report_fh "  [ALERT] $device_issues critical event(s) found\n";
-        }
+
+    if ($enable_pass) {
+        $ssh->send("enable");
+        $ssh->waitfor('Password:', 5) or warn "[$dev] No enable prompt\n";
+        $ssh->send($enable_pass);
+        $ssh->waitfor('#', 5)         or warn "[$dev] Enable mode failed\n";
     }
-    
+
+    $ssh->exec("terminal length 0");
+
+    my $hostname = $dev;
+    my $ver = $ssh->exec("show version | include uptime");
+    $hostname = $1 if $ver =~ /^(\S+)\s+uptime/m;
+
+    my $raw = $ssh->exec("show interfaces");
     $ssh->close();
+
+    my @ifaces = parse_interfaces($raw);
+
+    my $hdr = sprintf "\n[%s] Interface Utilization (threshold: %d%%)\n%-22s %-6s %-12s %-12s %-8s %-8s %-8s %s\n%s\n",
+        $hostname, $threshold,
+        "Interface", "Status", "In Rate", "Out Rate", "InErr", "CRC", "OutDrop", "Flags",
+        "-" x 88;
+    out($hdr);
+
+    for my $i (@ifaces) {
+        my $flags = join ' ', grep { $_ }
+            ($i->{in_pct} >= $threshold || $i->{out_pct} >= $threshold) ? 'UTIL'  : '',
+            $i->{in_errors} > 0                                         ? 'INERR' : '',
+            $i->{crc}       > 0                                         ? 'CRC'   : '',
+            $i->{out_drops} > 0                                         ? 'DROPS' : '';
+        out(sprintf "%-22s %-6s %-12s %-12s %-8d %-8d %-8d %s\n",
+            $i->{name}, $i->{status},
+            fmt_rate($i->{in_rate}), fmt_rate($i->{out_rate}),
+            $i->{in_errors}, $i->{crc}, $i->{out_drops}, $flags);
+    }
 }
 
-print $report_fh "\n" . "=" x 85 . "\n";
-print $report_fh "[SUMMARY]\n";
-print $report_fh "  Total devices: $total_devices\n";
-print $report_fh "  Devices checked successfully: $devices_ok\n";
-print $report_fh "  Devices with connection failures: $devices_failed\n";
-print $report_fh "  Total critical events found: $total_issues\n";
-print $report_fh "  Completed: " . Time::Piece->new()->strftime("%Y-%m-%d %H:%M:%S") . "\n";
+sub parse_interfaces {
+    my ($raw) = @_;
+    my (@result, %cur);
+    for my $line (split /\n/, $raw) {
+        if ($line =~ /^(\S+) is (up|down|administratively down)/) {
+            push @result, {%cur} if $cur{name};
+            %cur = (name => $1, status => ($2 eq 'up' ? 'up' : 'down'),
+                    in_rate => 0, out_rate => 0, bandwidth => 0,
+                    in_pct => 0, out_pct => 0, in_errors => 0, crc => 0, out_drops => 0);
+        }
+        $cur{bandwidth}  = $1 * 1000 if $line =~ /BW (\d+) Kbit/;
+        if ($line =~ /input rate (\d+) bits/) {
+            $cur{in_rate} = $1;
+            $cur{in_pct}  = $cur{bandwidth} ? int($1 / $cur{bandwidth} * 100) : 0;
+        }
+        if ($line =~ /output rate (\d+) bits/) {
+            $cur{out_rate} = $1;
+            $cur{out_pct}  = $cur{bandwidth} ? int($1 / $cur{bandwidth} * 100) : 0;
+        }
+        $cur{in_errors} = $1 if $line =~ /(\d+) input errors/;
+        $cur{crc}       = $1 if $line =~ /(\d+) CRC/;
+        $cur{out_drops} = $1 if $line =~ /(\d+) output drops/;
+    }
+    push @result, {%cur} if $cur{name};
+    return grep { $_->{status} eq 'up' } @result;
+}
 
-close $report_fh if $logfile;
+sub fmt_rate {
+    my ($b) = @_;
+    return '0 bps'                          if $b == 0;
+    return sprintf "%.1f Kbps", $b / 1e3   if $b < 1e6;
+    return sprintf "%.1f Mbps", $b / 1e6   if $b < 1e9;
+    return sprintf "%.1f Gbps", $b / 1e9;
+}
 
-my $exit_code = ($total_issues > 0 || $devices_failed > 0) ? 1 : 0;
-exit($exit_code);
-```
+sub out {
+    print $_[0];
+    print $LOG $_[0] if $LOG;
+}
+
+sub usage { "Usage: $0 --host <ip> | --file <file> --user <u> --pass <p> [--enable <p>] [--log <f>] [--threshold <pct>]\n" }
