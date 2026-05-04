@@ -1,185 +1,163 @@
-The write was blocked — please approve it and I'll retry, or let me know if you'd prefer I output the script content directly here for you to save manually.
-
-Here's the complete script (131 lines):
-
-```
+```perl
 #!/usr/bin/perl
 #
-# acl_log_parser.pl - Parse ACL hit logs from Cisco IOS devices via SSH
+# security_log_analyzer.pl - Cisco IOS Security Event Log Analyzer
 #
 # Purpose:
-#   Connects to one or more Cisco IOS devices, retrieves the syslog buffer
-#   filtered to ACL match events (SEC-6-IPACCESSLOG*), and produces a
-#   statistical summary: hit counts per ACL (permitted vs. denied) and a
-#   top-10 source IP table.  Useful for firewall policy audits, identifying
-#   top talkers, and investigating unexpected traffic patterns without
-#   requiring a dedicated syslog server.
+#   SSHes into one or more Cisco IOS devices, retrieves the buffered syslog
+#   via 'show logging', and categorizes security-relevant events: ACL deny
+#   hits, authentication failures, port-security violations, err-disabled
+#   ports, and STP topology changes. Produces a prioritized report suitable
+#   for daily NOC triage or incident response.
 #
 # Usage:
-#   Single device:  ./acl_log_parser.pl -h 10.0.0.1 -u admin [-p pass] [-e enable_pass] [-o report.txt]
-#   Device list:    ./acl_log_parser.pl -f devices.txt -u admin [-p pass] [-o report.txt]
-#
-#   Credentials may also be supplied via environment variables:
-#     NET_USER, NET_PASS, NET_ENABLE
-#
-# Device list file format:
-#   One IP or hostname per line.  Blank lines and lines starting with # ignored.
+#   ./security_log_analyzer.pl <device_ip> [username] [password]
+#   ./security_log_analyzer.pl --file devices.txt [--user admin] [--pass s3cr3t]
+#   ./security_log_analyzer.pl --file devices.txt --logdir /var/log/netaudit
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect Getopt::Long
+#   cpan Net::SSH::Expect
+#   IOS 'logging buffered' must be configured on target devices
+#   NET_USER / NET_PASS env vars can substitute for --user / --pass
 #
-# Tested against: Cisco IOS 12.4+, IOS-XE 3.x+
+# Output:
+#   STDOUT: categorized event summary per device
+#   File:   security_events_<device>_<timestamp>.log  (in --logdir, default '.')
 #
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
-use POSIX qw(strftime);
+use POSIX        qw(strftime);
+use Getopt::Long qw(GetOptions);
 
-my ($host, $user, $pass, $enable, $outfile, $device_file);
-my $timeout = 30;
+my $timeout  = 15;
+my $log_dir  = '.';
+my $username = $ENV{NET_USER} // 'admin';
+my $password = $ENV{NET_PASS} // '';
+my $file;
 
 GetOptions(
-    'h=s' => \$host,
-    'u=s' => \$user,
-    'p=s' => \$pass,
-    'e=s' => \$enable,
-    'o=s' => \$outfile,
-    'f=s' => \$device_file,
-) or die "Usage: $0 -h <host> | -f <file> -u <user> [-p <pass>] [-e <enable>] [-o <outfile>]\n";
+    'file=s'    => \$file,
+    'user=s'    => \$username,
+    'pass=s'    => \$password,
+    'logdir=s'  => \$log_dir,
+    'timeout=i' => \$timeout,
+) or die "Invalid options. See header for usage.\n";
 
-$user   //= $ENV{NET_USER}   or die "Username required: -u or NET_USER env\n";
-$pass   //= $ENV{NET_PASS}   or die "Password required: -p or NET_PASS env\n";
-$enable //= $ENV{NET_ENABLE} // '';
-
-my @hosts;
-if ($device_file) {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+my @devices;
+if ($file) {
+    open my $fh, '<', $file or die "Cannot open device file '$file': $!\n";
     while (<$fh>) {
         chomp;
-        s/#.*//;
-        s/^\s+|\s+$//g;
-        push @hosts, $_ if length $_;
+        s/#.*//; s/^\s+|\s+$//g;
+        push @devices, $_ if $_;
     }
     close $fh;
-    die "No devices found in $device_file\n" unless @hosts;
-} elsif ($host) {
-    @hosts = ($host);
+} elsif (@ARGV) {
+    push @devices, shift @ARGV;
+    $username = shift @ARGV if @ARGV;
+    $password = shift @ARGV if @ARGV;
 } else {
-    die "Specify -h <host> or -f <device_file>\n";
+    die "Usage: $0 <device_ip> [user] [pass]\n       $0 --file devices.txt\n";
 }
 
-my $log_fh;
-if ($outfile) {
-    open $log_fh, '>', $outfile or die "Cannot write to $outfile: $!\n";
+die "No devices specified.\n" unless @devices;
+
+my %patterns = (
+    auth_fail   => qr/\%(?:SEC|AAA|LOGIN)-\d+-(?:AUTHFAIL|BADAUTH|LOGIN_FAILED|IPACCESSLOGP?):/i,
+    port_sec    => qr/\%PORT_SECURITY-\d+-PSECURE_VIOLATION:/i,
+    err_disable => qr/\%PM-\d+-ERR_DISABLE:/i,
+    acl_deny    => qr/\%SEC-\d+-IPACCESSLOG(?:P|DP|SP)?:.*denied/i,
+    stp_change  => qr/\%SPANTREE-\d+-(?:TOPOLOGY_CHANGE|BLOCK_BPDUGUARD|ROOTGUARD_CONFIG_CHANGE):/i,
+);
+
+my %labels = (
+    auth_fail   => 'Authentication Failures',
+    port_sec    => 'Port Security Violations',
+    err_disable => 'Err-Disabled Ports',
+    acl_deny    => 'ACL Deny Hits',
+    stp_change  => 'STP Events',
+);
+
+my $stamp = strftime('%Y%m%d_%H%M%S', localtime);
+
+for my $device (@devices) {
+    print "\n" . ('=' x 70) . "\n";
+    print "Device: $device\n";
+    print ('=' x 70) . "\n";
+    analyze_device($device);
 }
 
-sub out {
-    my $line = shift;
-    print "$line\n";
-    print $log_fh "$line\n" if $log_fh;
-}
-
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-out("ACL Hit Log Report — $ts");
-out('=' x 62);
-
-for my $device (@hosts) {
-    out("\nDevice: $device");
-    out('-' x 40);
+sub analyze_device {
+    my ($host) = @_;
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $device,
-        user        => $user,
-        password    => $pass,
-        raw_pty     => 1,
-        timeout     => $timeout,
+        host       => $host,
+        user       => $username,
+        password   => $password,
+        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+        timeout    => $timeout,
+        raw_pty    => 1,
     );
 
-    my $login;
-    eval { $login = $ssh->login() };
-    if ($@ || !defined $login) {
-        out("  ERROR: SSH failed — " . ($@ || 'no response'));
-        next;
-    }
-    if ($login =~ /Password:|incorrect|denied/i) {
-        out("  ERROR: Authentication failed");
-        $ssh->close();
-        next;
+    unless (eval { $ssh->login() }) {
+        warn "  [CONNECT ERROR] $host: " . ($@ || 'login failed') . "\n";
+        return;
     }
 
-    if ($enable) {
-        $ssh->send("enable");
-        $ssh->waitfor('Password:', 5);
-        $ssh->send($enable);
-        my $en = $ssh->waitfor('#', 10);
-        if (!$en || $en =~ /incorrect/i) {
-            out("  ERROR: Enable authentication failed");
-            $ssh->close();
-            next;
+    $ssh->exec("terminal length 0");
+    my $output = $ssh->exec("show logging");
+    $ssh->close();
+
+    unless (defined $output && $output =~ /\S/) {
+        warn "  [ERROR] Empty response from 'show logging' on $host\n";
+        return;
+    }
+
+    my %events;
+    $events{$_} = [] for keys %patterns;
+
+    for my $line (split /\n/, $output) {
+        $line =~ s/\r//g;
+        next unless $line =~ /^\S/;
+        for my $cat (keys %patterns) {
+            push @{ $events{$cat} }, $line if $line =~ $patterns{$cat};
         }
     }
 
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('#', 10);
-
-    $ssh->send("show logging | include IPACCESSLOG");
-    my $raw = $ssh->waitfor('#', $timeout);
-    $ssh->send("exit");
-    $ssh->close();
-
-    unless ($raw) {
-        out("  No output received from device.");
-        next;
-    }
-
-    my (%acl_hits, %src_hits);
     my $total = 0;
+    $total += @{ $events{$_} } for keys %events;
 
-    for my $line (split /\n/, $raw) {
-        next unless $line =~ /IPACCESSLOG/;
+    my $log_path = "$log_dir/security_events_${host}_${stamp}.log";
+    open my $log, '>', $log_path or do {
+        warn "  [WARN] Cannot write log file '$log_path': $!\n";
+        undef $log;
+    };
 
-        my ($acl)    = $line =~ /list\s+(\S+)/;
-        my ($action) = $line =~ /\b(permitted|denied)\b/i;
-        my ($src_ip) = $line =~ /\s(\d{1,3}(?:\.\d{1,3}){3})(?:\(\d+\))?(?:\s+->|\s+\d)/;
-        my ($count)  = $line =~ /,\s*(\d+)\s+packets?/;
+    my $report_time = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    _out($log, "Report Time : $report_time\n");
+    _out($log, "Total Events: $total\n");
+    _out($log, ('-' x 70) . "\n");
 
-        next unless $acl && $action;
-        $count //= 1;
-
-        $acl_hits{$acl}{lc $action} += $count;
-        $src_hits{$src_ip}          += $count if defined $src_ip;
-        $total                      += $count;
+    if ($total == 0) {
+        _out($log, "No security events found in logging buffer.\n");
+    } else {
+        for my $cat (qw(auth_fail port_sec err_disable acl_deny stp_change)) {
+            my @hits = @{ $events{$cat} };
+            next unless @hits;
+            _out($log, sprintf("\n[%s] — %d event%s\n", $labels{$cat}, scalar @hits, @hits == 1 ? '' : 's'));
+            _out($log, "  $_\n") for @hits;
+        }
     }
 
-    if (!$total) {
-        out("  No ACL log entries in syslog buffer.");
-        next;
-    }
-
-    out(sprintf("  %-32s %10s %10s", "ACL Name", "Permitted", "Denied"));
-    out("  " . '-' x 54);
-    for my $acl (sort keys %acl_hits) {
-        my $p = $acl_hits{$acl}{permitted} // 0;
-        my $d = $acl_hits{$acl}{denied}    // 0;
-        out(sprintf("  %-32s %10d %10d", $acl, $p, $d));
-    }
-
-    out(sprintf("\n  %-22s %10s", "Top Source IPs", "Packets"));
-    out("  " . '-' x 34);
-    my $rank = 0;
-    for my $ip (sort { $src_hits{$b} <=> $src_hits{$a} } keys %src_hits) {
-        last if ++$rank > 10;
-        out(sprintf("  %-22s %10d", $ip, $src_hits{$ip}));
-    }
-
-    out("\n  Total logged packets: $total");
+    close $log if $log;
+    print "  Log: $log_path\n" if $log && -f $log_path;
 }
 
-out("\n" . '=' x 62);
-out("Report complete — $ts");
-close $log_fh if $log_fh;
+sub _out {
+    my ($fh, $msg) = @_;
+    print $msg;
+    print $fh $msg if $fh;
+}
 ```
-
-The script parses `%SEC-6-IPACCESSLOG*` syslog entries — the three Cisco variants (plain, with source port, with dest port) — and produces a per-ACL permitted/denied table plus a top-10 source IP ranking. Distinct from the existing generic log parsers in that it's security/ACL-specific and produces aggregated statistics rather than raw log replay.
