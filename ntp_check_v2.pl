@@ -1,180 +1,140 @@
-The perl-expect-network-scripts repo isn't on this machine — the user wants the script content as output. Writing it now.
-
 #!/usr/bin/perl
-#
-# ntp_compliance_audit.pl - NTP Policy Compliance Audit for Cisco IOS/IOS-XE
-#
-# Purpose:
-#   Connects to one or more network devices via SSH and audits NTP compliance
-#   against a defined policy: maximum allowed stratum level, acceptable clock
-#   offset threshold (ms), and optionally an approved NTP server whitelist.
-#   Flags any device that is unsynchronized, exceeds drift thresholds, uses an
-#   unauthorized reference, or cannot be reached. Distinct from ntp_check.pl /
-#   ntp_check_v2.pl, which verify NTP is configured — this script enforces a
-#   site-wide NTP security and accuracy policy across a fleet.
-#
-# Usage:
-#   Single device:  perl ntp_compliance_audit.pl -h 10.0.0.1 -u admin -p secret
-#   Device list:    perl ntp_compliance_audit.pl -f devices.txt -u admin -p secret
-#   With log:       perl ntp_compliance_audit.pl -f devices.txt -u admin -p secret -l audit.log
-#   Full policy:    perl ntp_compliance_audit.pl -f devices.txt -u admin -p secret \
-#                     -s 3 -d 200 --servers 10.0.0.5,10.0.0.6
-#
-# Options:
-#   -h <host>        Single device IP or hostname
-#   -f <file>        File with one device per line (# = comment)
-#   -u <user>        SSH username
-#   -p <pass>        SSH password
-#   -e <pass>        Enable password (defaults to SSH password)
-#   -l <file>        Log file path (optional)
-#   -s <n>           Max allowed stratum (default: 3)
-#   -d <ms>          Max allowed clock offset in ms (default: 500)
-#   --servers <csv>  Comma-separated approved NTP server IPs (optional)
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#   cpan Getopt::Long   (usually bundled)
-#
-# Exit codes:  0 = all compliant,  1 = one or more non-compliant or unreachable
-#
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
+use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($opt_host, $opt_file, $username, $password, $enable_pass, $log_file);
-my $max_stratum      = 3;
-my $max_offset_ms    = 500;
-my $approved_csv     = '';
+# =============================================================================
+# ntp_compliance_check.pl - NTP Stratum & Offset Compliance Auditor
+#
+# Purpose:
+#   Connects to Cisco IOS/IOS-XE devices and validates NTP synchronization
+#   against policy thresholds: max stratum level and max clock offset (ms).
+#   Generates a pass/fail compliance report across a device fleet.
+#
+# Usage:
+#   Single device:  perl ntp_compliance_check.pl -h 192.168.1.1 -u admin -p secret
+#   Device list:    perl ntp_compliance_check.pl -f devices.txt -u admin -p secret
+#   Custom limits:  perl ntp_compliance_check.pl -f devices.txt -u admin -p secret \
+#                     --max-stratum 3 --max-offset 50
+#
+# Prerequisites:
+#   cpan Net::SSH::Expect
+#
+# Device list format (devices.txt): one IP or hostname per line, # for comments
+# =============================================================================
+
+my ($host, $file, $user, $pass, $logfile);
+my $max_stratum = 4;
+my $max_offset  = 100;
+my $timeout     = 15;
 
 GetOptions(
-    'h=s'       => \$opt_host,
-    'f=s'       => \$opt_file,
-    'u=s'       => \$username,
-    'p=s'       => \$password,
-    'e=s'       => \$enable_pass,
-    'l=s'       => \$log_file,
-    's=i'       => \$max_stratum,
-    'd=f'       => \$max_offset_ms,
-    'servers=s' => \$approved_csv,
-) or die "Option error. See script header for usage.\n";
+    'h|host=s'       => \$host,
+    'f|file=s'       => \$file,
+    'u|user=s'       => \$user,
+    'p|pass=s'       => \$pass,
+    'l|log=s'        => \$logfile,
+    'max-stratum=i'  => \$max_stratum,
+    'max-offset=f'   => \$max_offset,
+) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [--max-stratum N] [--max-offset MS]\n";
 
-die "Username required (-u)\n"               unless $username;
-die "Password required (-p)\n"               unless $password;
-die "Specify -h <host> or -f <file>\n"       unless $opt_host || $opt_file;
+die "Provide -h HOST or -f FILE\n" unless $host || $file;
+die "Provide -u USER and -p PASS\n" unless $user && $pass;
 
-$enable_pass //= $password;
-my @approved = $approved_csv ? split /,/, $approved_csv : ();
-
-my @devices;
-push @devices, $opt_host if $opt_host;
-if ($opt_file) {
-    open my $fh, '<', $opt_file or die "Cannot open '$opt_file': $!\n";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_ }
-    close $fh;
-}
+my @devices = $host ? ($host) : do {
+    open(my $fh, '<', $file) or die "Cannot open $file: $!\n";
+    grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
+};
 
 my $log_fh;
-if ($log_file) {
-    open $log_fh, '>', $log_file or die "Cannot open log '$log_file': $!\n";
+if ($logfile) {
+    open($log_fh, '>>', $logfile) or warn "Cannot open log $logfile: $!\n";
 }
 
-sub out {
-    my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
+sub output {
+    print @_;
+    print $log_fh @_ if $log_fh;
 }
 
 my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-out("NTP Compliance Audit  $ts\n");
-out("Policy: stratum<=$max_stratum  offset<=${max_offset_ms}ms");
-out(@approved ? "  servers=" . join(',', @approved) : "  servers=any");
-out("\n" . "=" x 68 . "\n\n");
+output("=" x 70 . "\n");
+output("NTP Compliance Audit  |  $ts\n");
+output(sprintf("Policy: max_stratum=%d  max_offset=%.1fms\n", $max_stratum, $max_offset));
+output("=" x 70 . "\n\n");
 
-my $fail_count = 0;
+my ($pass_count, $fail_count) = (0, 0);
 
 for my $dev (@devices) {
-    out("[$dev]\n");
-
     my $ssh = eval {
         Net::SSH::Expect->new(
-            host       => $dev,
-            user       => $username,
-            password   => $password,
-            raw_pty    => 1,
-            timeout    => 15,
-            ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+            host        => $dev,
+            user        => $user,
+            password    => $pass,
+            raw_pty     => 1,
+            timeout     => $timeout,
         );
     };
-    if ($@ || !$ssh || !eval { $ssh->login() }) {
-        out("  RESULT: UNREACHABLE - " . ($@ // 'login failed') . "\n\n");
+    if ($@ || !$ssh) {
+        output("[$dev] ERROR: SSH init failed - $@\n");
         $fail_count++;
         next;
     }
 
-    $ssh->exec("terminal length 0");
-    my $prompt = $ssh->exec("") // '';
-    if ($prompt =~ />\s*$/) {
-        $ssh->send("enable");
-        my $r = $ssh->waitfor('Password:|#', 5);
-        if ($r && $r =~ /Password:/) {
-            $ssh->send($enable_pass);
-            $ssh->waitfor('#', 5);
-        }
+    my $login = eval { $ssh->login() };
+    if ($@ || !$login) {
+        output("[$dev] ERROR: Authentication failed\n");
+        $fail_count++;
+        next;
     }
 
-    my $status_out = $ssh->exec("show ntp status")              // '';
-    my $assoc_out  = $ssh->exec("show ntp associations detail")  // '';
-    $ssh->close();
+    $ssh->send("terminal length 0");
+    $ssh->waitfor('\$|#', 5);
+
+    $ssh->send("show ntp status");
+    my $ntp_status = $ssh->waitfor('\$|#', 10) // '';
+
+    $ssh->send("show ntp associations");
+    my $ntp_assoc = $ssh->waitfor('\$|#', 10) // '';
+
+    $ssh->send("exit");
+
+    my %result = (synced => 0, stratum => 'N/A', offset => 'N/A', ref => 'N/A');
+
+    if ($ntp_status =~ /Clock is synchronized/i) {
+        $result{synced} = 1;
+    }
+    if ($ntp_status =~ /stratum\s+(\d+)/i) {
+        $result{stratum} = $1;
+    }
+    if ($ntp_status =~ /offset\s+([+-]?\d+\.\d+)/i) {
+        $result{offset} = $1;
+    }
+    if ($ntp_status =~ /reference is\s+(\S+)/i) {
+        $result{ref} = $1;
+    }
 
     my @issues;
+    push @issues, "NOT SYNCHRONIZED" unless $result{synced};
+    push @issues, "stratum $result{stratum} > max $max_stratum"
+        if $result{stratum} =~ /^\d+$/ && $result{stratum} > $max_stratum;
+    push @issues, sprintf("offset %.1fms > max %.1fms", $result{offset}, $max_offset)
+        if $result{offset} =~ /^[+-]?\d/ && abs($result{offset}) > $max_offset;
 
-    my $synced = ($status_out =~ /Clock is synchronized/i);
-    push @issues, 'clock not synchronized' unless $synced;
+    my $status = @issues ? "FAIL" : "PASS";
+    $status eq 'PASS' ? $pass_count++ : $fail_count++;
 
-    my ($stratum) = ($status_out =~ /stratum\s+(\d+)/i);
-    if (defined $stratum) {
-        out(sprintf("  stratum  : %d\n", $stratum));
-        push @issues, "stratum $stratum > policy $max_stratum" if $stratum > $max_stratum;
-    } else {
-        push @issues, 'stratum not parseable';
-    }
-
-    my ($offset) = ($status_out =~ /offset\s+([-\d.]+)\s+msec/i);
-    if (defined $offset) {
-        out(sprintf("  offset   : %s ms\n", $offset));
-        push @issues, sprintf("offset %.1fms > policy %.0fms", abs($offset), $max_offset_ms)
-            if abs($offset) > $max_offset_ms;
-    } else {
-        push @issues, 'offset not parseable';
-    }
-
-    my ($ref) = ($status_out =~ /reference is\s+([\d.]+)/i);
-    ($ref)    = ($assoc_out  =~ /our mode client.*?\nref ID\s+([\d.]+)/si) unless $ref;
-    if ($ref) {
-        out("  reference: $ref\n");
-        if (@approved && !grep { $_ eq $ref } @approved) {
-            push @issues, "reference $ref not in approved list";
-        }
-    } else {
-        out("  reference: (unknown)\n");
-    }
-
-    if (@issues) {
-        out("  RESULT: NON-COMPLIANT\n");
-        out("    - $_\n") for @issues;
-        $fail_count++;
-    } else {
-        out("  RESULT: COMPLIANT\n");
-    }
-    out("\n");
+    output(sprintf("[%s] %-4s | stratum=%-3s offset=%-10s ref=%-15s",
+        $dev, $status, $result{stratum}, $result{offset}, $result{ref}));
+    output(@issues ? " | " . join(", ", @issues) : "");
+    output("\n");
 }
 
-out("=" x 68 . "\n");
-out(sprintf("AUDIT COMPLETE: %d device(s), %d non-compliant\n",
-    scalar(@devices), $fail_count));
+output("\n" . "-" x 70 . "\n");
+output(sprintf("Summary: %d PASS  %d FAIL  %d total\n",
+    $pass_count, $fail_count, $pass_count + $fail_count));
+output("=" x 70 . "\n");
 
-close $log_fh if $log_fh;
+close($log_fh) if $log_fh;
 exit($fail_count ? 1 : 0);
