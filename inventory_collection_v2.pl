@@ -1,125 +1,154 @@
+I'll write a CDP/LLDP neighbor discovery script — that's a practical inventory-collection task not covered by the existing scripts.
+
+```perl
 #!/usr/bin/perl
 #
-# arp_table.pl - Network ARP Table Collection
+# cdp_lldp_neighbors.pl — Cisco CDP/LLDP Neighbor Discovery
 #
-# PURPOSE:
-#   Connects to Cisco IOS/IOS-XE/NX-OS devices via SSH and collects ARP table
-#   entries. Generates IP-to-MAC mapping reports useful for endpoint tracking,
-#   duplicate IP detection, and network forensics.
+# Purpose:
+#   Connects to one or more network devices via SSH and collects CDP and LLDP
+#   neighbor tables. Useful for topology documentation, audit prep, and verifying
+#   neighbor relationships after network changes.
 #
-# USAGE:
-#   Single device:   ./arp_table.pl -h 192.168.1.1 -u admin -p secret
-#   Device list:     ./arp_table.pl -f hosts.txt -u admin -p secret
-#   With CSV output: ./arp_table.pl -f hosts.txt -u admin -p secret -o arp_report.csv
-#   Custom timeout:  ./arp_table.pl -h 10.0.0.1 -u admin -p secret -t 30
+# Usage:
+#   perl cdp_lldp_neighbors.pl -h 192.168.1.1 [-u admin] [-p secret] [-o neighbors.txt]
+#   perl cdp_lldp_neighbors.pl -f devices.txt [-u admin] [-p secret] [-o neighbors.txt]
 #
-# HOST FILE FORMAT:
-#   One IP or hostname per line. Lines beginning with # are skipped.
+# devices.txt format (one per line):
+#   192.168.1.1
+#   192.168.1.2  admin  mysecret
 #
-# PREREQUISITES:
-#   cpan Net::SSH::Expect Getopt::Long
-#
-# SUPPORTED PLATFORMS:
-#   Cisco IOS, IOS-XE, NX-OS (show ip arp)
+# Prerequisites:
+#   cpanm Net::SSH::Expect
+#   SSH key auth or password auth must be configured on target devices
+#   'terminal length 0' privilege required (enable not needed for show commands)
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
+use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $user, $pass, $hosts_file, $output_file);
+my ($host, $username, $password, $device_file, $output_file, $help);
 my $timeout = 20;
 
 GetOptions(
-    'h|host=s'    => \$host,
-    'u|user=s'    => \$user,
-    'p|pass=s'    => \$pass,
-    'f|file=s'    => \$hosts_file,
-    'o|output=s'  => \$output_file,
-    't|timeout=i' => \$timeout,
+    'host|h=s'    => \$host,
+    'user|u=s'    => \$username,
+    'pass|p=s'    => \$password,
+    'file|f=s'    => \$device_file,
+    'output|o=s'  => \$output_file,
+    'timeout|t=i' => \$timeout,
+    'help'        => \$help,
 ) or die usage();
 
-die usage() unless $user && $pass && ($host || $hosts_file);
+print usage() and exit 0 if $help;
+die usage() unless $host || $device_file;
 
-sub usage {
-    return "Usage: $0 -h HOST | -f FILE -u USER -p PASS [-o OUTPUT.csv] [-t SECS]\n";
+$username //= $ENV{NET_USER} // die "Username required (-u or NET_USER env)\n";
+$password //= $ENV{NET_PASS} // die "Password required (-p or NET_PASS env)\n";
+
+my $log_fh;
+if ($output_file) {
+    open($log_fh, '>', $output_file) or die "Cannot open $output_file: $!\n";
 }
 
 my @devices;
-if ($hosts_file) {
-    open my $fh, '<', $hosts_file or die "Cannot open $hosts_file: $!\n";
+if ($device_file) {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
     while (<$fh>) {
-        chomp;
-        next if /^\s*$/ || /^\s*#/;
-        push @devices, $_;
+        chomp; next if /^\s*#/ || /^\s*$/;
+        my ($dev_host, $dev_user, $dev_pass) = split /\s+/, $_, 3;
+        push @devices, {
+            host => $dev_host,
+            user => $dev_user // $username,
+            pass => $dev_pass // $password,
+        };
     }
     close $fh;
 } else {
-    @devices = ($host);
+    push @devices, { host => $host, user => $username, pass => $password };
 }
 
-my $logfh;
-if ($output_file) {
-    open $logfh, '>', $output_file or die "Cannot open $output_file: $!\n";
-    print $logfh "timestamp,device,ip_address,mac_address,age_min,interface\n";
-}
+my $stamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+output("# CDP/LLDP Neighbor Report — $stamp\n");
 
-my $run_ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-print "ARP Table Collection  $run_ts\n";
-printf "%-20s %-18s %-17s %-8s %s\n", 'Device', 'IP Address', 'MAC Address', 'Age', 'Interface';
-print '-' x 78 . "\n";
+for my $dev (@devices) {
+    output("\n" . "=" x 60 . "\n");
+    output("Device: $dev->{host}\n");
+    output("=" x 60 . "\n");
 
-my $total = 0;
-
-for my $device (@devices) {
-    my $ssh = Net::SSH::Expect->new(
-        host     => $device,
-        user     => $user,
-        password => $pass,
-        raw_pty  => 1,
-        timeout  => $timeout,
-    );
-
-    my $prompt = eval { $ssh->login() };
-    if ($@ || !defined $prompt) {
-        warn "SKIP $device: authentication failed\n";
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host        => $dev->{host},
+            user        => $dev->{user},
+            password    => $dev->{pass},
+            raw_pty     => 1,
+            timeout     => $timeout,
+        );
+    };
+    if ($@) {
+        output("ERROR: Failed to create SSH session — $@\n");
         next;
     }
 
-    $ssh->exec("terminal length 0");
-
-    my $raw = eval { $ssh->exec("show ip arp") };
-    if ($@ || !defined $raw || $raw eq '') {
-        warn "SKIP $device: no output received\n";
-        $ssh->close();
+    my $login = eval { $ssh->login() };
+    if ($@ || !defined $login) {
+        output("ERROR: Authentication failed for $dev->{host}\n");
+        next;
+    }
+    if ($login =~ /[Pp]assword|[Aa]uth/i && $login !~ /[>#]/) {
+        output("ERROR: Bad credentials for $dev->{host}\n");
         next;
     }
 
-    my $count = 0;
-    for my $line (split /\n/, $raw) {
-        # Cisco format: Internet  10.0.0.1   5   001a.2b3c.4d5e  ARPA  Gi0/1
-        next unless $line =~ /^Internet\s+
-            (\d+\.\d+\.\d+\.\d+)\s+
-            (\d+|-)\s+
-            ([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+
-            \S+\s+(\S+)/xi;
+    $ssh->send('terminal length 0');
+    $ssh->waitfor('[>#]', $timeout) or output("WARN: prompt timeout after terminal length 0\n");
 
-        my ($ip, $age, $mac, $intf) = ($1, $2, $3, $4);
-        printf "%-20s %-18s %-17s %-8s %s\n", $device, $ip, $mac, $age, $intf;
-        print $logfh "$run_ts,$device,$ip,$mac,$age,$intf\n" if $logfh;
-        $count++;
+    for my $cmd ('show cdp neighbors detail', 'show lldp neighbors detail') {
+        $ssh->send($cmd);
+        my $out = $ssh->waitfor('[>#]', $timeout);
+        if (!defined $out) {
+            output("WARN: Timeout waiting for output of '$cmd'\n");
+            next;
+        }
+        if ($out =~ /(?:Invalid|error|not enabled)/i) {
+            output("  [$cmd] not available or disabled\n");
+            next;
+        }
+        output("\n--- $cmd ---\n");
+        output(clean_output($out, $cmd));
     }
 
-    printf "  [%s: %d entries]\n", $device, $count;
-    $total += $count;
+    $ssh->send('exit');
     $ssh->close();
 }
 
-print '-' x 78 . "\n";
-printf "Total: %d ARP entries across %d device(s)\n", $total, scalar @devices;
+close $log_fh if $log_fh;
+print "\nOutput written to $output_file\n" if $output_file;
 
-if ($logfh) {
-    close $logfh;
-    print "CSV saved to $output_file\n";
+sub clean_output {
+    my ($text, $cmd) = @_;
+    $text =~ s/\r//g;
+    my @lines = grep { !/^\s*$cmd\s*$/ && !/^[A-Za-z0-9\-]+[>#]\s*$/ } split /\n/, $text;
+    return join("\n", @lines) . "\n";
 }
+
+sub output {
+    my $text = shift;
+    print $text;
+    print $log_fh $text if $log_fh;
+}
+
+sub usage {
+    return <<'END';
+Usage: cdp_lldp_neighbors.pl -h <host> | -f <file> [-u user] [-p pass] [-o outfile] [-t timeout]
+  -h  Single device IP or hostname
+  -f  File with device list (host [user] [pass] per line)
+  -u  SSH username (or set NET_USER env)
+  -p  SSH password (or set NET_PASS env)
+  -o  Output file (also prints to STDOUT)
+  -t  Timeout in seconds (default: 20)
+END
+}
+```
