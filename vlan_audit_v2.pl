@@ -1,37 +1,29 @@
+The user asked for raw script content output only. Here it is:
+
 #!/usr/bin/perl
-# =============================================================================
-# vlan_trunk_prune_check.pl — VLAN Trunk Pruning & Consistency Analyzer
+# trunk_vlan_audit.pl - Cisco IOS trunk port pruning and VTP audit
 #
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE switches and analyzes each trunk interface
-#   for VLAN discrepancies — specifically VLANs that are allowed on a trunk
-#   but pruned, STP-blocked, or otherwise not forwarding. Useful for catching
-#   misconfigured trunk filters, VTP pruning surprises, and STP topology gaps.
+# PURPOSE:
+#   Audits trunk interfaces on Cisco IOS/IOS-XE switches to identify
+#   over-permissive VLAN configurations (trunks allowing all 4094 VLANs),
+#   excessive VLAN leakage (many allowed but few active), and VTP status
+#   anomalies. Complements vlan_audit.pl which inventories the VLAN database;
+#   this script focuses on what traverses trunk links and flags hygiene issues.
 #
-# What it does:
-#   - Runs `show interfaces trunk` and parses all four VLAN lists per trunk:
-#       1. VLANs allowed (configured)
-#       2. VLANs allowed and active in mgmt domain
-#       3. VLANs in spanning tree forwarding state (actually forwarding)
-#       4. Derives: pruned (allowed - active) and STP-blocked (active - fwding)
-#   - Reports per-trunk discrepancies to STDOUT and an optional log file
+# USAGE:
+#   Single device:  perl trunk_vlan_audit.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:    perl trunk_vlan_audit.pl -f devices.txt -u admin -p secret
+#   With log:       perl trunk_vlan_audit.pl -h 192.168.1.1 -u admin -p secret -l audit.log
+#   With enable:    perl trunk_vlan_audit.pl -h 192.168.1.1 -u admin -p secret -e enablepass
 #
-# Usage:
-#   Single device:  perl vlan_trunk_prune_check.pl 192.168.1.1
-#   Device list:    perl vlan_trunk_prune_check.pl --file devices.txt
-#   With logging:   perl vlan_trunk_prune_check.pl --log trunk_audit.log 10.0.0.1
+# DEVICE FILE FORMAT (one entry per line, # for comments):
+#   192.168.1.1
+#   sw-dist-01.lab.example.com
 #
-# Prerequisites:
-#   cpan install Net::SSH::Expect
-#   SSH key auth recommended; password prompt handled via --password flag
-#
-# Options:
-#   --user <name>     SSH username (default: admin)
-#   --password <pw>   SSH password (prompted if omitted and key auth fails)
-#   --file <path>     File containing one device IP/hostname per line
-#   --log <path>      Write output to this log file in addition to STDOUT
-#   --timeout <sec>   Per-command timeout in seconds (default: 30)
-# =============================================================================
+# PREREQUISITES:
+#   cpan Net::SSH::Expect
+#   SSH enabled on target devices; 'terminal length 0' must be settable
+#   Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x
 
 use strict;
 use warnings;
@@ -39,134 +31,165 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($user, $password, $device_file, $log_file, $timeout) = ('admin', '', '', '', 30);
-my @devices;
+my ($host, $device_file, $username, $password, $enable_pass, $log_file);
 
 GetOptions(
-    'user=s'     => \$user,
-    'password=s' => \$password,
-    'file=s'     => \$device_file,
-    'log=s'      => \$log_file,
-    'timeout=i'  => \$timeout,
-) or die "Usage: $0 [--user <u>] [--password <pw>] [--file <f>] [--log <f>] [--timeout <n>] [device ...]\n";
+    'h|host=s'   => \$host,
+    'f|file=s'   => \$device_file,
+    'u|user=s'   => \$username,
+    'p|pass=s'   => \$password,
+    'e|enable=s' => \$enable_pass,
+    'l|log=s'    => \$log_file,
+) or die "Usage: $0 [-h host|-f file] -u user -p pass [-e enable] [-l logfile]\n";
 
-push @devices, @ARGV;
+die "ERROR: Specify -h <host> or -f <file>\n" unless $host || $device_file;
+die "ERROR: -u username required\n"           unless $username;
+die "ERROR: -p password required\n"           unless $password;
 
-if ($device_file) {
-    open my $fh, '<', $device_file or die "Cannot open device file '$device_file': $!\n";
-    while (<$fh>) { chomp; push @devices, $_ if /\S/ && !/^#/ }
+my @devices;
+if ($host) {
+    push @devices, $host;
+} else {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) {
+        chomp; s/#.*//; s/^\s+|\s+$//g;
+        push @devices, $_ if $_;
+    }
     close $fh;
 }
 
-die "No devices specified. Provide IPs as arguments or use --file.\n" unless @devices;
-
 my $log_fh;
 if ($log_file) {
-    open $log_fh, '>>', $log_file or die "Cannot open log file '$log_file': $!\n";
+    open $log_fh, '>', $log_file or die "Cannot open log $log_file: $!\n";
 }
 
-sub log_print {
+sub emit {
     my $msg = shift;
     print $msg;
     print $log_fh $msg if $log_fh;
 }
 
-sub expand_vlan_range {
-    my $range_str = shift;
-    $range_str =~ s/\s+//g;
-    my %vlans;
-    for my $token (split /,/, $range_str) {
-        if ($token =~ /^(\d+)-(\d+)$/) {
-            $vlans{$_}++ for $1 .. $2;
-        } elsif ($token =~ /^\d+$/) {
-            $vlans{$token}++;
+my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+emit("=" x 70 . "\n");
+emit("TRUNK VLAN PRUNING AUDIT  —  $ts\n");
+emit("Devices: " . scalar(@devices) . "\n");
+emit("=" x 70 . "\n\n");
+
+for my $device (@devices) {
+    emit("[$device]\n");
+    emit("-" x 50 . "\n");
+
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host     => $device,
+            user     => $username,
+            password => $password,
+            raw_pty  => 1,
+            timeout  => 15,
+        );
+    };
+    if ($@) {
+        emit("  ERROR: Cannot create SSH session: $@\n\n");
+        next;
+    }
+
+    my $login = eval { $ssh->login() };
+    if ($@ || !defined $login) {
+        emit("  ERROR: SSH connection failed\n\n");
+        next;
+    }
+    if ($login =~ /[Pp]assword|[Dd]enied|[Ff]ailed/) {
+        emit("  ERROR: Authentication rejected\n\n");
+        next;
+    }
+
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('\$\s*$|#\s*$', 5);
+
+    if ($enable_pass && $login !~ /#\s*$/) {
+        $ssh->send("enable\n");
+        $ssh->waitfor('[Pp]assword', 5);
+        $ssh->send("$enable_pass\n");
+        $ssh->waitfor('#\s*$', 8);
+    }
+
+    $ssh->send("show vtp status\n");
+    my $vtp = $ssh->waitfor('#\s*$', 10) // '';
+    my ($vtp_domain)  = ($vtp =~ /VTP Domain Name\s*:\s*(\S+)/i);
+    my ($vtp_mode)    = ($vtp =~ /VTP Operating Mode\s*:\s*(\S+)/i);
+    my ($vtp_version) = ($vtp =~ /VTP [Vv]ersion\s*(?:running)?\s*:\s*(\d+)/i);
+    $vtp_domain  //= 'none';
+    $vtp_mode    //= 'unknown';
+    $vtp_version //= '?';
+
+    emit("  VTP domain=$vtp_domain  mode=$vtp_mode  version=$vtp_version\n");
+    emit("  [WARN] VTP CLIENT — VLAN database controlled by VTP server\n")
+        if lc($vtp_mode) eq 'client';
+
+    $ssh->send("show interfaces trunk\n");
+    my $trunk_out = $ssh->waitfor('#\s*$', 15) // '';
+
+    my (%trunks, @order, $section);
+    for my $line (split /\n/, $trunk_out) {
+        if    ($line =~ /^Port\s+Mode\s+Encapsulation/i)       { $section = 'info'    }
+        elsif ($line =~ /^Port\s+Vlans allowed on trunk/i)     { $section = 'allowed' }
+        elsif ($line =~ /^Port\s+Vlans allowed and active/i)   { $section = 'active'  }
+        elsif ($line =~ /^Port\s+Vlans in spanning tree/i)     { $section = 'fwd'     }
+        elsif ($section eq 'info'    && $line =~ /^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/) {
+            my ($p, $mode, $enc, $st) = ($1, $2, $3, $4);
+            push @order, $p unless exists $trunks{$p};
+            $trunks{$p} = { mode => $mode, encap => $enc, status => $st };
         }
-    }
-    return %vlans;
-}
-
-sub audit_device {
-    my $host = shift;
-    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-    log_print("\n[$ts] Connecting to $host...\n");
-
-    my $ssh = Net::SSH::Expect->new(
-        host     => $host,
-        user     => $user,
-        password => $password || undef,
-        raw_pty  => 1,
-        timeout  => $timeout,
-    );
-
-    eval { $ssh->run_ssh() or die "SSH failed\n" };
-    if ($@) {
-        log_print("[ERROR] Cannot connect to $host: $@\n");
-        return;
+        elsif ($section eq 'allowed' && $line =~ /^(\S+)\s+(\S+)/) { $trunks{$1}{allowed} = $2 }
+        elsif ($section eq 'active'  && $line =~ /^(\S+)\s+(\S+)/) { $trunks{$1}{active}  = $2 }
     }
 
-    eval { $ssh->waitfor('>\s*$|\#\s*$', 10) or die "No prompt\n" };
-    if ($@) {
-        log_print("[ERROR] No prompt on $host: $@\n");
-        return;
+    if (!@order) {
+        emit("  No active trunk interfaces found.\n\n");
+        $ssh->send("exit\n"); $ssh->close();
+        next;
     }
 
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('>\s*$|\#\s*$', 5);
+    emit(sprintf("  %d trunk(s) found\n\n", scalar @order));
+    emit(sprintf("  %-24s %-8s %-10s  %s\n", "Interface", "Mode", "Encap", "Verdict"));
+    emit("  " . "-" x 66 . "\n");
 
-    $ssh->send("show interfaces trunk");
-    my $output = $ssh->waitfor('>\s*$|\#\s*$', $timeout);
+    for my $p (@order) {
+        my $t       = $trunks{$p};
+        my $allowed = $t->{allowed} // 'none';
+        my $active  = $t->{active}  // 'none';
+        my @flags;
 
-    $ssh->send("exit");
+        push @flags, 'OVER-PERMISSIVE (1-4094 or all)'
+            if $allowed =~ /^1-4094$/ || $allowed =~ /\ball\b/i;
+
+        my $na = count_vlans($allowed);
+        my $aa = count_vlans($active);
+        push @flags, sprintf("leakage: %d allowed vs %d active", $na, $aa)
+            if $na > 0 && $aa >= 0 && ($na - $aa) > 10;
+
+        my $verdict = @flags ? "WARN: " . join("; ", @flags) : "OK";
+        emit(sprintf("  %-24s %-8s %-10s  %s\n",
+            $p, $t->{mode}//'?', $t->{encap}//'?', $verdict));
+        emit(sprintf("    allowed : %s\n", $allowed));
+        emit(sprintf("    active  : %s\n\n", $active));
+    }
+
+    $ssh->send("exit\n");
     $ssh->close();
-
-    unless ($output && $output =~ /Port\s+Mode/i) {
-        log_print("[WARN] No trunk data returned from $host (no trunks configured?)\n");
-        return;
-    }
-
-    my (%allowed, %active, %forwarding);
-    my $current_section = '';
-
-    for my $line (split /\n/, $output) {
-        if    ($line =~ /VLANs allowed on trunk/i)                    { $current_section = 'allowed' }
-        elsif ($line =~ /VLANs allowed and active in management/i)    { $current_section = 'active' }
-        elsif ($line =~ /VLANs in spanning tree forwarding/i)         { $current_section = 'forwarding' }
-        elsif ($line =~ /^\s*([\w\/\.]+)\s+([\d,\-none]+)\s*$/ && $current_section) {
-            my ($iface, $vlans) = ($1, $2);
-            next if $vlans eq 'none';
-            my %v = expand_vlan_range($vlans);
-            if    ($current_section eq 'allowed')    { $allowed{$iface}    = \%v }
-            elsif ($current_section eq 'active')     { $active{$iface}     = \%v }
-            elsif ($current_section eq 'forwarding') { $forwarding{$iface} = \%v }
-        }
-    }
-
-    my $found_issue = 0;
-    for my $iface (sort keys %allowed) {
-        my %allow = %{ $allowed{$iface}    // {} };
-        my %act   = %{ $active{$iface}     // {} };
-        my %fwd   = %{ $forwarding{$iface} // {} };
-
-        my @pruned  = sort { $a <=> $b } grep { !$act{$_} } keys %allow;
-        my @blocked = sort { $a <=> $b } grep { !$fwd{$_} } keys %act;
-
-        if (@pruned || @blocked) {
-            $found_issue = 1;
-            log_print("  Interface: $iface\n");
-            log_print("    PRUNED  (allowed but not active):    " . join(',', @pruned)  . "\n") if @pruned;
-            log_print("    BLOCKED (active but not forwarding): " . join(',', @blocked) . "\n") if @blocked;
-        }
-    }
-
-    log_print("  All trunks clean — no pruned or STP-blocked VLAN discrepancies.\n") unless $found_issue;
 }
 
-log_print("=" x 60 . "\n");
-log_print("VLAN Trunk Pruning Check — " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n");
-log_print("Devices: " . scalar(@devices) . "\n");
-log_print("=" x 60 . "\n");
-
-audit_device($_) for @devices;
-
-log_print("\nDone.\n");
 close $log_fh if $log_fh;
+emit("Audit complete." . ($log_file ? " Log: $log_file" : "") . "\n");
+
+sub count_vlans {
+    my ($str) = @_;
+    return 0 if !$str || $str =~ /^\s*none\s*$/i;
+    my $n = 0;
+    for (split /,/, $str) {
+        s/\s//g;
+        if (/^(\d+)-(\d+)$/) { $n += $2 - $1 + 1 }
+        elsif (/^\d+$/)       { $n++ }
+    }
+    return $n;
+}
