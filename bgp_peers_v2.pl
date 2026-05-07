@@ -1,144 +1,154 @@
+The perl-expect-network-scripts repo isn't local — this is a content generation request. Writing the script now.
+
 ```perl
 #!/usr/bin/perl
-# =============================================================================
-# bgp_prefix_monitor.pl - BGP Prefix Count Threshold Monitor
+#
+# bgp_advertised_routes.pl - BGP Advertised Route Verification
 #
 # Purpose:
-#   Connects to Cisco IOS/IOS-XE routers and audits BGP neighbor prefix counts
-#   against configurable high/low thresholds. Flags peers with prefix counts
-#   outside expected ranges -- useful for detecting route leaks, peer failures,
-#   or misconfigured filters before they impact traffic.
+#   Connects to a Cisco IOS/IOS-XE router and audits routes being advertised
+#   to BGP peers. Detects prefix count anomalies and flags potential route leaks
+#   by comparing advertised prefixes against an optional expected-prefixes file.
 #
 # Usage:
-#   ./bgp_prefix_monitor.pl -h <host> [-u <user>] [-p <pass>] [-l <logfile>]
-#                            [-H <high_thresh>] [-L <low_thresh>]
-#   ./bgp_prefix_monitor.pl -f <device_file> [-u <user>] [-p <pass>] [-l <logfile>]
-#
-#   Device file format (one per line): <ip_or_hostname>
-#   Example: ./bgp_prefix_monitor.pl -f routers.txt -u admin -p secret -H 800000 -L 100
+#   bgp_advertised_routes.pl -h <device> -u <user> -p <pass> [-P <peer_ip>]
+#                            [-e <expected_prefixes_file>] [-l <logfile>]
+#                            [-t <threshold_pct>]
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH key auth recommended; password auth supported via -p flag
+#   cpanm Net::SSH::Expect Getopt::Long
 #
-# Output:
-#   STDOUT + optional log file. Exit code 1 if any threshold violations found.
-# =============================================================================
+# Examples:
+#   bgp_advertised_routes.pl -h 10.0.0.1 -u admin -p secret
+#   bgp_advertised_routes.pl -h 10.0.0.1 -u admin -p secret -P 192.168.1.2
+#   bgp_advertised_routes.pl -h 10.0.0.1 -u admin -p secret -e expected.txt -t 20
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case);
 use POSIX qw(strftime);
 
-my ($host, $device_file, $username, $password, $logfile);
-my $high_thresh = 900000;
-my $low_thresh  = 1;
+my ($host, $user, $pass, $peer_filter, $expected_file, $logfile);
+my $threshold_pct = 25;
+my $timeout       = 30;
 
 GetOptions(
-    'h=s' => \$host,
-    'f=s' => \$device_file,
-    'u=s' => \$username,
-    'p=s' => \$password,
-    'l=s' => \$logfile,
-    'H=i' => \$high_thresh,
-    'L=i' => \$low_thresh,
-) or die "Usage: $0 -h <host>|-f <file> [-u user] [-p pass] [-l logfile] [-H high] [-L low]\n";
+    'h|host=s'     => \$host,
+    'u|user=s'     => \$user,
+    'p|pass=s'     => \$pass,
+    'P|peer=s'     => \$peer_filter,
+    'e|expected=s' => \$expected_file,
+    'l|log=s'      => \$logfile,
+    't|threshold=i' => \$threshold_pct,
+) or die "Usage: $0 -h host -u user -p pass [-P peer] [-e file] [-l log] [-t pct]\n";
 
-die "Specify -h <host> or -f <file>\n" unless $host || $device_file;
+die "ERROR: -h, -u, and -p are required\n"
+    unless $host && $user && $pass;
 
-$username //= $ENV{NET_USER} // 'admin';
-
-my @devices = $host ? ($host) : do {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
-};
-
-my $log_fh;
+my $LOG;
 if ($logfile) {
-    open $log_fh, '>>', $logfile or warn "Cannot open logfile $logfile: $!\n";
+    open($LOG, '>>', $logfile) or die "Cannot open log $logfile: $!\n";
 }
 
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-my $violations = 0;
-
-sub log_line {
-    my $line = shift;
+sub out {
+    my ($line) = @_;
     print $line, "\n";
-    print $log_fh $line, "\n" if $log_fh;
+    print $LOG strftime("[%Y-%m-%d %H:%M:%S] ", localtime), $line, "\n" if $LOG;
 }
 
-log_line("=" x 70);
-log_line("BGP Prefix Threshold Audit  [$timestamp]");
-log_line("Thresholds: LOW < $low_thresh  |  HIGH > $high_thresh");
-log_line("=" x 70);
-
-for my $device (@devices) {
-    log_line("\n>>> Device: $device");
-
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host        => $device,
-            user        => $username,
-            defined $password ? (password => $password) : (),
-            raw_pty     => 1,
-            timeout     => 20,
-        );
-    };
-    if ($@ || !$ssh) {
-        log_line("  ERROR: SSH object creation failed for $device: $@");
-        $violations++;
-        next;
+sub load_expected {
+    my ($file) = @_;
+    open(my $fh, '<', $file) or die "Cannot read expected prefixes file $file: $!\n";
+    my %expected;
+    while (<$fh>) {
+        chomp;
+        s/\s*#.*//;
+        next unless /\S/;
+        $expected{$_} = 1;
     }
+    close $fh;
+    return %expected;
+}
 
-    my $login_out = eval { $ssh->login() };
-    if ($@ || !defined $login_out) {
-        log_line("  ERROR: Login failed for $device (auth error or timeout)");
-        $violations++;
-        next;
-    }
+my %expected_prefixes = $expected_file ? load_expected($expected_file) : ();
 
-    $ssh->exec("terminal length 0");
+out("=== BGP Advertised Route Audit: $host ===");
+out("Timestamp: " . strftime("%Y-%m-%d %H:%M:%S", localtime));
 
-    my $output = $ssh->exec("show ip bgp summary");
-    unless (defined $output && $output =~ /Neighbor/i) {
-        log_line("  WARNING: No BGP summary output received (BGP may not be running)");
+my $ssh = Net::SSH::Expect->new(
+    host        => $host,
+    user        => $user,
+    password    => $pass,
+    raw_pty     => 1,
+    timeout     => $timeout,
+    ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+);
+
+eval { $ssh->login() };
+if ($@) {
+    out("ERROR: SSH connection failed to $host: $@");
+    exit 1;
+}
+
+$ssh->send("terminal length 0");
+$ssh->waitfor('\$|#', 5);
+
+# Collect peer list from BGP summary unless a specific peer was given
+my @peers;
+if ($peer_filter) {
+    @peers = ($peer_filter);
+} else {
+    $ssh->send("show ip bgp summary");
+    my $summary = $ssh->waitfor('\$|#', $timeout);
+    @peers = ($summary =~ /^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+/mg);
+    unless (@peers) {
+        out("ERROR: No BGP peers found in 'show ip bgp summary' output.");
         $ssh->close();
+        exit 1;
+    }
+}
+
+my $issues = 0;
+
+for my $peer (@peers) {
+    out("\n--- Peer: $peer ---");
+    $ssh->send("show ip bgp neighbors $peer advertised-routes");
+    my $output = $ssh->waitfor('\$|#', $timeout);
+
+    my @prefixes = ($output =~ /^\s*\*?[>i ]\s*(\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2})/mg);
+    my $count    = scalar @prefixes;
+    out("  Advertised prefixes: $count");
+
+    if ($count == 0) {
+        out("  WARNING: No routes advertised to $peer — check route-map or peer policy.");
+        $issues++;
         next;
     }
 
-    my $found_peer = 0;
-    for my $line (split /\n/, $output) {
-        next unless $line =~ /^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\S+\s+(\S+)/;
-        my ($neighbor, $pfx_field) = ($1, $2);
-        $found_peer = 1;
+    if (%expected_prefixes) {
+        my @unexpected = grep { !$expected_prefixes{$_} } @prefixes;
+        my @missing    = grep { my $e = $_; !grep { $_ eq $e } @prefixes } keys %expected_prefixes;
 
-        if ($pfx_field !~ /^\d+$/) {
-            log_line(sprintf("  %-18s  state=%-10s  (not established)", $neighbor, $pfx_field));
-            $violations++;
-            next;
+        if (@unexpected) {
+            out("  LEAK ALERT: " . scalar(@unexpected) . " unexpected prefix(es):");
+            out("    $_") for @unexpected;
+            $issues++;
         }
-
-        my $pfx_count = int($pfx_field);
-        my $status = "OK";
-        if ($pfx_count > $high_thresh) {
-            $status = "ALERT:HIGH";
-            $violations++;
-        } elsif ($pfx_count < $low_thresh) {
-            $status = "ALERT:LOW";
-            $violations++;
+        if (@missing) {
+            out("  MISSING: " . scalar(@missing) . " expected prefix(es) not advertised:");
+            out("    $_") for @missing;
+            $issues++;
         }
-        log_line(sprintf("  %-18s  prefixes=%-8d  %s", $neighbor, $pfx_count, $status));
+        unless (@unexpected || @missing) {
+            out("  OK: Advertised prefixes match expected set.");
+        }
     }
-
-    log_line("  (no established BGP neighbors found)") unless $found_peer;
-    $ssh->close();
 }
 
-log_line("\n" . "=" x 70);
-log_line("Audit complete. Violations: $violations");
-log_line("=" x 70);
+$ssh->close();
 
-close $log_fh if $log_fh;
-exit($violations ? 1 : 0);
+out("\n=== Audit Complete: $issues issue(s) found ===");
+close $LOG if $LOG;
+exit($issues ? 1 : 0);
 ```
