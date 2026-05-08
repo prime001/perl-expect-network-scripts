@@ -1,191 +1,136 @@
+Writing a CPU/memory health monitoring script — not covered by the existing scripts in the repo.
+
 #!/usr/bin/perl
-# =============================================================================
-# acl_audit.pl — Access Control List Audit Tool
-# =============================================================================
-# Purpose : SSH into one or more Cisco IOS/IOS-XE devices, enumerate all
-#           named and numbered ACLs, map each ACL to its interface bindings
-#           (inbound/outbound), and flag common misconfigurations:
-#             • ACL unbound — defined but not applied to any interface
-#             • Broad permit — "permit any any" present in an extended ACL
-#             • Empty ACL — defined with zero entries
 #
-# Usage   : ./acl_audit.pl -h <host> [options]
-#           ./acl_audit.pl -f devices.txt [options]
+# cpu_memory_monitor.pl — Poll Cisco IOS/IOS-XE devices for CPU and memory
+#                          utilization; alert when configurable thresholds are
+#                          exceeded and dump top offending processes.
 #
-# Options :
-#   -h <host>    Single device IP or hostname
-#   -f <file>    File containing one device per line (# comments ok)
-#   -u <user>    SSH username          (default: admin)
-#   -p <pass>    SSH password          (prompted if omitted)
-#   -e <secret>  Enable secret         (prompted if omitted)
-#   -o <file>    Log file path         (default: acl_audit_YYYYMMDD_HHMMSS.log)
-#   -t <secs>    Per-command timeout   (default: 30)
+# Usage:
+#   ./cpu_memory_monitor.pl -p <password> [options] <device>
+#   ./cpu_memory_monitor.pl -p <password> -f devices.txt [options]
 #
-# Prerequisites (CPAN):
-#   Net::SSH::Expect   Getopt::Long   Term::ReadKey
+#   -u <user>     SSH username            (default: admin)
+#   -p <pass>     SSH password            (required)
+#   -c <pct>      CPU 1-min alert %       (default: 80)
+#   -m <pct>      Memory alert %          (default: 85)
+#   -l <logfile>  Append results here     (optional)
+#   -f            Treat positional arg as device list file, one host per line
 #
-# Tested against : Cisco IOS 15.x, IOS-XE 16.x/17.x
-# =============================================================================
+# Prerequisites:
+#   cpanm Net::SSH::Expect
+#
+# Tested against: Cisco IOS 15.x, IOS-XE 16.x/17.x
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
-use POSIX       qw(strftime);
-use Term::ReadKey;
+use Getopt::Std;
+use POSIX qw(strftime);
 
-# ── argument parsing ─────────────────────────────────────────────────────────
-my ($opt_host, $opt_file, $opt_log, $opt_timeout);
-my ($opt_user, $opt_pass, $opt_enable) = ('admin', undef, undef);
+my %opts;
+getopts('u:p:c:m:l:f', \%opts);
 
-GetOptions(
-    'h=s' => \$opt_host,
-    'f=s' => \$opt_file,
-    'u=s' => \$opt_user,
-    'p=s' => \$opt_pass,
-    'e=s' => \$opt_enable,
-    'o=s' => \$opt_log,
-    't=i' => \$opt_timeout,
-) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-e enable] [-o log] [-t secs]\n";
+my $username   = $opts{u} // 'admin';
+my $password   = $opts{p} or die "ERROR: SSH password required (-p)\n";
+my $cpu_thresh = $opts{c} // 80;
+my $mem_thresh = $opts{m} // 85;
+my $logfile    = $opts{l};
+my $from_file  = $opts{f};
 
-die "Specify -h <host> or -f <file>\n" unless $opt_host || $opt_file;
-$opt_timeout //= 30;
-
-unless (defined $opt_pass) {
-    print 'SSH password: ';
-    ReadMode('noecho');
-    chomp($opt_pass = <STDIN>);
-    ReadMode('restore');
-    print "\n";
-}
-unless (defined $opt_enable) {
-    print 'Enable secret: ';
-    ReadMode('noecho');
-    chomp($opt_enable = <STDIN>);
-    ReadMode('restore');
-    print "\n";
-}
-
-my $ts = strftime('%Y%m%d_%H%M%S', localtime);
-$opt_log //= "acl_audit_$ts.log";
-open(my $log, '>', $opt_log) or die "Cannot open $opt_log: $!\n";
+my $target = shift @ARGV
+    or die "Usage: $0 -p <pass> [-u user] [-c cpu%] [-m mem%] [-l log] [-f] <device|file>\n";
 
 my @devices;
-if ($opt_host) {
-    push @devices, $opt_host;
-} else {
-    open(my $fh, '<', $opt_file) or die "Cannot open $opt_file: $!\n";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if /\S/; }
+if ($from_file) {
+    open my $fh, '<', $target or die "Cannot open device file '$target': $!\n";
+    @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
     close $fh;
+} else {
+    @devices = ($target);
 }
 
-# ── helpers ──────────────────────────────────────────────────────────────────
-my ($total_acls, $total_issues, $ok_count, $fail_count) = (0, 0, 0, 0);
-
-sub tee { print $_[0]; print $log $_[0]; }
-
-sub ssh_cmd {
-    my ($ssh, $cmd) = @_;
-    $ssh->send($cmd);
-    return $ssh->waitfor('#', $opt_timeout) // '';
+my $log_fh;
+if ($logfile) {
+    open $log_fh, '>>', $logfile or die "Cannot open log '$logfile': $!\n";
 }
 
-# ── per-device audit ─────────────────────────────────────────────────────────
-sub audit_device {
-    my ($dev) = @_;
-    tee("\n" . ('=' x 62) . "\nDevice: $dev\n" . ('=' x 62) . "\n");
+sub out {
+    print @_;
+    print $log_fh @_ if $log_fh;
+}
 
-    my $ssh;
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+out("=== CPU/Memory Health Check  $ts ===\n");
+
+for my $host (@devices) {
+    out("\n[$host]\n");
+
+    my $ssh = Net::SSH::Expect->new(
+        host     => $host,
+        user     => $username,
+        password => $password,
+        raw_pty  => 1,
+        timeout  => 20,
+    );
+
     eval {
-        $ssh = Net::SSH::Expect->new(
-            host     => $dev,
-            user     => $opt_user,
-            password => $opt_pass,
-            raw_pty  => 1,
-            timeout  => $opt_timeout,
-        );
-        my $seen = $ssh->login();
-        die "Auth rejected\n" if $seen =~ /denied|fail|incorrect/i;
+        my $banner = $ssh->login();
+        die "Authentication failed (no prompt)\n" unless $banner =~ /[>#]/;
 
-        if ($ssh->before() =~ />\s*$/ || $seen =~ />\s*$/) {
-            $ssh->send("enable");
-            $ssh->waitfor('Password:', 5) or die "No enable prompt\n";
-            $ssh->send($opt_enable);
-            $ssh->waitfor('#', 10)        or die "Enable failed\n";
+        $ssh->exec('terminal length 0');
+
+        # --- CPU ---
+        my $cpu_raw = $ssh->exec('show processes cpu | include CPU utilization');
+        my ($s5, $m1, $m5) = $cpu_raw =~ /(\d+)%\/\d+%;\s+one minute:\s+(\d+)%;\s+five minutes:\s+(\d+)%/;
+        unless (defined $s5) {
+            ($s5, $m1, $m5) = $cpu_raw =~ /(\d+)%\s+(\d+)%\s+(\d+)%/;
         }
-        ssh_cmd($ssh, "terminal length 0");
+        die "Could not parse CPU utilization output\n" unless defined $s5;
+
+        my $cpu_flag = ($m1 >= $cpu_thresh) ? '!! ALERT' : 'OK';
+        out(sprintf("  CPU  5s:%-3s%%  1m:%-3s%%  5m:%-3s%%  [%s]\n",
+                    $s5, $m1, $m5, $cpu_flag));
+
+        if ($m1 >= $cpu_thresh) {
+            out("  Top CPU consumers (1-min >= ${cpu_thresh}%):\n");
+            my $top = $ssh->exec('show processes cpu sorted | head 8');
+            $top =~ s/^/    /mg;
+            out($top . "\n");
+        }
+
+        # --- Memory ---
+        my $mem_raw = $ssh->exec('show processes memory | include ^Processor');
+        my ($used, $free) = $mem_raw =~ /Processor\s+\S+\s+(\d+)\s+(\d+)/;
+        die "Could not parse memory output\n" unless defined $used;
+
+        my $total    = $used + $free;
+        my $mem_pct  = int($used / $total * 100);
+        my $mem_flag = ($mem_pct >= $mem_thresh) ? '!! ALERT' : 'OK';
+        out(sprintf("  Mem  used:%-8s free:%-8s util:%d%%  [%s]\n",
+                    _fmt($used), _fmt($free), $mem_pct, $mem_flag));
+
+        if ($mem_pct >= $mem_thresh) {
+            out("  !! Memory ${mem_pct}% exceeds threshold ${mem_thresh}%\n");
+            my $top_mem = $ssh->exec('show processes memory sorted | head 8');
+            $top_mem =~ s/^/    /mg;
+            out($top_mem . "\n");
+        }
+
+        $ssh->close();
     };
-    if ($@) { tee("  ERROR: $@"); $fail_count++; eval { $ssh->close() }; return; }
-
-    my $acl_out = ssh_cmd($ssh, "show ip access-lists");
-    my $int_out = ssh_cmd($ssh, "show ip interface | include line protocol|Inbound|Outbound");
-    $ssh->send("exit"); eval { $ssh->close() };
-
-    # parse ACLs
-    my (%acls, $cur);
-    for (split /\n/, $acl_out) {
-        s/\r//g;
-        if (/^(Standard|Extended)\s+IP\s+access\s+list\s+(\S+)/i) {
-            $cur = $2;
-            $acls{$cur} = { type => lc($1), entries => [] };
-        } elsif ($cur && /^\s+\d+/) {
-            push @{$acls{$cur}{entries}}, $_;
-        }
+    if (my $err = $@) {
+        $err =~ s/\s+$//;
+        out("  ERROR: $err\n");
     }
-
-    # parse interface bindings
-    my (%bind, $cur_if);
-    for (split /\n/, $int_out) {
-        s/\r//g;
-        $cur_if = $1 if /^(\S+)\s+is\s+\w+,\s+line\s+protocol/;
-        push @{$bind{$1}{in}},  $cur_if if $cur_if && /Inbound access list is (?!not set)(\S+)/;
-        push @{$bind{$1}{out}}, $cur_if if $cur_if && /Outbound access list is (?!not set)(\S+)/;
-    }
-
-    if (!%acls) { tee("  No ACLs defined on this device.\n"); $ok_count++; return; }
-
-    my $dev_issues = 0;
-    for my $name (sort keys %acls) {
-        $total_acls++;
-        my ($type, $entries) = ($acls{$name}{type}, $acls{$name}{entries});
-        my @in  = @{$bind{$name}{in}  // []};
-        my @out = @{$bind{$name}{out} // []};
-
-        tee(sprintf "\n  ACL %-28s [%-8s %2d entries]\n", $name, $type, scalar @$entries);
-        tee("    Inbound:  " . (@in  ? join(', ', @in)  : '(none)') . "\n");
-        tee("    Outbound: " . (@out ? join(', ', @out) : '(none)') . "\n");
-
-        my @issues;
-        push @issues, "UNBOUND — not applied to any interface"
-            unless @in || @out;
-        push @issues, "EMPTY — no ACL entries defined"
-            unless @$entries;
-        push @issues, "BROAD PERMIT — 'permit any any' found"
-            if grep { /permit\s+any\s+any/i } @$entries;
-
-        if (@issues) {
-            tee("    [!] $_\n") for @issues;
-            $dev_issues += @issues;
-            $total_issues += @issues;
-        } else {
-            tee("    [ok]\n");
-        }
-    }
-    tee("\n  Device summary: " . scalar(keys %acls) . " ACL(s), $dev_issues issue(s)\n");
-    $ok_count++;
 }
 
-# ── main ─────────────────────────────────────────────────────────────────────
-tee("ACL Audit Report — $ts\n");
-tee("Devices targeted: " . scalar(@devices) . "\n");
+out("\n=== Done ===\n");
+close $log_fh if $log_fh;
 
-audit_device($_) for @devices;
-
-tee("\n" . ('=' x 62) . "\n");
-tee("SUMMARY\n");
-tee("  Devices audited : $ok_count\n");
-tee("  Devices failed  : $fail_count\n");
-tee("  Total ACLs found: $total_acls\n");
-tee("  Total issues    : $total_issues\n");
-tee("  Log written to  : $opt_log\n");
-close $log;
+sub _fmt {
+    my ($bytes) = @_;
+    return sprintf('%dM', $bytes / 1_048_576) if $bytes >= 1_048_576;
+    return sprintf('%dK', $bytes / 1_024)     if $bytes >= 1_024;
+    return "${bytes}B";
+}
