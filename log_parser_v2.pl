@@ -1,163 +1,145 @@
-```perl
 #!/usr/bin/perl
+# Device Health Monitor - SSH Expect script for network device health monitoring
 #
-# security_log_analyzer.pl - Cisco IOS Security Event Log Analyzer
+# Purpose: Monitor and report device health metrics (CPU, memory, system processes)
+#          from network devices via SSH. Detects performance degradation before issues
+#          escalate. Useful for proactive NOC monitoring.
 #
-# Purpose:
-#   SSHes into one or more Cisco IOS devices, retrieves the buffered syslog
-#   via 'show logging', and categorizes security-relevant events: ACL deny
-#   hits, authentication failures, port-security violations, err-disabled
-#   ports, and STP topology changes. Produces a prioritized report suitable
-#   for daily NOC triage or incident response.
-#
-# Usage:
-#   ./security_log_analyzer.pl <device_ip> [username] [password]
-#   ./security_log_analyzer.pl --file devices.txt [--user admin] [--pass s3cr3t]
-#   ./security_log_analyzer.pl --file devices.txt --logdir /var/log/netaudit
+# Usage:   perl 041_device_health_monitor.pl <device_ip> [username] [password] [logfile]
+#          perl 041_device_health_monitor.pl devices.txt admin MyPass health.log
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
-#   IOS 'logging buffered' must be configured on target devices
-#   NET_USER / NET_PASS env vars can substitute for --user / --pass
+#  - Perl modules: Expect, strict, warnings
+#  - SSH access to devices (keys or password authentication)
+#  - Devices support 'show processes cpu' and 'show memory' commands
+#  - Can read device list from file (one IP/hostname per line)
 #
 # Output:
-#   STDOUT: categorized event summary per device
-#   File:   security_events_<device>_<timestamp>.log  (in --logdir, default '.')
-#
+#  - STDOUT: Formatted health status with threshold indicators (OK/WARNING/CRITICAL)
+#  - Log file: Timestamped results appended to file if specified
+#  - Exit code: 0 on success, non-zero on errors
 
 use strict;
 use warnings;
-use Net::SSH::Expect;
-use POSIX        qw(strftime);
-use Getopt::Long qw(GetOptions);
+use Expect;
+use Time::Localtime;
+use Fcntl;
 
-my $timeout  = 15;
-my $log_dir  = '.';
-my $username = $ENV{NET_USER} // 'admin';
-my $password = $ENV{NET_PASS} // '';
-my $file;
+my ($device, $user, $pass, $logfile) = @ARGV;
+die "Usage: $0 <device_ip|file> [username] [password] [logfile]\n" unless $device;
 
-GetOptions(
-    'file=s'    => \$file,
-    'user=s'    => \$username,
-    'pass=s'    => \$password,
-    'logdir=s'  => \$log_dir,
-    'timeout=i' => \$timeout,
-) or die "Invalid options. See header for usage.\n";
+$user ||= $ENV{NET_USER} || 'admin';
+$pass ||= $ENV{NET_PASS} || 'admin';
 
-my @devices;
-if ($file) {
-    open my $fh, '<', $file or die "Cannot open device file '$file': $!\n";
-    while (<$fh>) {
-        chomp;
-        s/#.*//; s/^\s+|\s+$//g;
-        push @devices, $_ if $_;
+sub log_msg {
+    my ($msg) = @_;
+    print $msg;
+    return unless $logfile && open(my $fh, '>>', $logfile);
+    print $fh scalar(localtime()) . " - $msg";
+    close($fh);
+}
+
+sub get_devices {
+    my ($input) = @_;
+    return (-f $input) ? do {
+        open(my $fh, '<', $input) or die "Cannot read $input: $!\n";
+        my @list = grep { chomp; $_ } <$fh>;
+        close($fh);
+        @list;
+    } : ($input);
+}
+
+sub check_device_health {
+    my ($dev_ip) = @_;
+    log_msg("\n" . "=" x 55 . "\n");
+    log_msg("Device: $dev_ip at " . scalar(localtime()) . "\n");
+    log_msg("=" x 55 . "\n");
+
+    my $exp = Expect->new();
+    $exp->log_stdout(0);
+    $exp->timeout(12);
+
+    unless ($exp->spawn("ssh", "-o", "StrictHostKeyChecking=no", "$user\@$dev_ip")) {
+        log_msg("ERROR: Cannot spawn SSH to $dev_ip: $!\n");
+        return 0;
     }
-    close $fh;
-} elsif (@ARGV) {
-    push @devices, shift @ARGV;
-    $username = shift @ARGV if @ARGV;
-    $password = shift @ARGV if @ARGV;
-} else {
-    die "Usage: $0 <device_ip> [user] [pass]\n       $0 --file devices.txt\n";
-}
 
-die "No devices specified.\n" unless @devices;
-
-my %patterns = (
-    auth_fail   => qr/\%(?:SEC|AAA|LOGIN)-\d+-(?:AUTHFAIL|BADAUTH|LOGIN_FAILED|IPACCESSLOGP?):/i,
-    port_sec    => qr/\%PORT_SECURITY-\d+-PSECURE_VIOLATION:/i,
-    err_disable => qr/\%PM-\d+-ERR_DISABLE:/i,
-    acl_deny    => qr/\%SEC-\d+-IPACCESSLOG(?:P|DP|SP)?:.*denied/i,
-    stp_change  => qr/\%SPANTREE-\d+-(?:TOPOLOGY_CHANGE|BLOCK_BPDUGUARD|ROOTGUARD_CONFIG_CHANGE):/i,
-);
-
-my %labels = (
-    auth_fail   => 'Authentication Failures',
-    port_sec    => 'Port Security Violations',
-    err_disable => 'Err-Disabled Ports',
-    acl_deny    => 'ACL Deny Hits',
-    stp_change  => 'STP Events',
-);
-
-my $stamp = strftime('%Y%m%d_%H%M%S', localtime);
-
-for my $device (@devices) {
-    print "\n" . ('=' x 70) . "\n";
-    print "Device: $device\n";
-    print ('=' x 70) . "\n";
-    analyze_device($device);
-}
-
-sub analyze_device {
-    my ($host) = @_;
-
-    my $ssh = Net::SSH::Expect->new(
-        host       => $host,
-        user       => $username,
-        password   => $password,
-        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
-        timeout    => $timeout,
-        raw_pty    => 1,
+    my $authenticated = 0;
+    $exp->expect(
+        12,
+        ['password:', sub { $exp->send("$pass\n"); exp_continue; }],
+        ['yes/no', sub { $exp->send("yes\n"); exp_continue; }],
+        [qr/[#>]\s*$/, sub { $authenticated = 1; }],
     );
 
-    unless (eval { $ssh->login() }) {
-        warn "  [CONNECT ERROR] $host: " . ($@ || 'login failed') . "\n";
-        return;
+    unless ($authenticated) {
+        log_msg("ERROR: Authentication failed\n");
+        $exp->hard_close();
+        return 0;
     }
 
-    $ssh->exec("terminal length 0");
-    my $output = $ssh->exec("show logging");
-    $ssh->close();
+    $exp->send("terminal length 0\n");
+    $exp->expect(2, qr/[#>]\s*$/);
 
-    unless (defined $output && $output =~ /\S/) {
-        warn "  [ERROR] Empty response from 'show logging' on $host\n";
-        return;
-    }
+    my %metrics = ();
 
-    my %events;
-    $events{$_} = [] for keys %patterns;
-
-    for my $line (split /\n/, $output) {
-        $line =~ s/\r//g;
-        next unless $line =~ /^\S/;
-        for my $cat (keys %patterns) {
-            push @{ $events{$cat} }, $line if $line =~ $patterns{$cat};
-        }
-    }
-
-    my $total = 0;
-    $total += @{ $events{$_} } for keys %events;
-
-    my $log_path = "$log_dir/security_events_${host}_${stamp}.log";
-    open my $log, '>', $log_path or do {
-        warn "  [WARN] Cannot write log file '$log_path': $!\n";
-        undef $log;
+    # Get CPU utilization
+    $exp->send("show processes cpu\n");
+    my $cpu_output = '';
+    eval {
+        $exp->expect(6, sub { $cpu_output = $exp->before(); });
     };
+    $exp->expect(1, qr/[#>]\s*$/);
 
-    my $report_time = strftime('%Y-%m-%d %H:%M:%S', localtime);
-    _out($log, "Report Time : $report_time\n");
-    _out($log, "Total Events: $total\n");
-    _out($log, ('-' x 70) . "\n");
-
-    if ($total == 0) {
-        _out($log, "No security events found in logging buffer.\n");
-    } else {
-        for my $cat (qw(auth_fail port_sec err_disable acl_deny stp_change)) {
-            my @hits = @{ $events{$cat} };
-            next unless @hits;
-            _out($log, sprintf("\n[%s] — %d event%s\n", $labels{$cat}, scalar @hits, @hits == 1 ? '' : 's'));
-            _out($log, "  $_\n") for @hits;
-        }
+    if ($cpu_output =~ /CPU\s+utilization.*?(\d+)%/i) {
+        $metrics{cpu} = $1;
+    } elsif ($cpu_output =~ /(\d+)%\s+Busy/i) {
+        $metrics{cpu} = $1;
     }
 
-    close $log if $log;
-    print "  Log: $log_path\n" if $log && -f $log_path;
+    # Get memory status
+    $exp->send("show memory\n");
+    my $mem_output = '';
+    eval {
+        $exp->expect(6, sub { $mem_output = $exp->before(); });
+    };
+    $exp->expect(1, qr/[#>]\s*$/);
+
+    if ($mem_output =~ /Processor.*?(\d+)\s+free/i) {
+        $metrics{mem_free} = int($1 / 1024);
+    }
+
+    $exp->send("exit\n");
+    $exp->expect(2);
+    $exp->hard_close();
+
+    # Report results with thresholds
+    log_msg("\nHealth Metrics:\n");
+
+    if (defined $metrics{cpu}) {
+        my $status = $metrics{cpu} > 85 ? "CRITICAL" : 
+                     $metrics{cpu} > 70 ? "WARNING" : "OK";
+        log_msg(sprintf("  CPU Utilization: %d%% [%s]\n", $metrics{cpu}, $status));
+    } else {
+        log_msg("  CPU Utilization: Unable to retrieve\n");
+    }
+
+    if (defined $metrics{mem_free}) {
+        log_msg(sprintf("  Memory Available: %d MB\n", $metrics{mem_free}));
+    }
+
+    log_msg("\nStatus: Health check completed successfully\n");
+    return 1;
 }
 
-sub _out {
-    my ($fh, $msg) = @_;
-    print $msg;
-    print $fh $msg if $fh;
+my @devices = get_devices($device);
+my $success_count = 0;
+
+foreach my $dev (grep { $_ } @devices) {
+    $success_count++ if check_device_health($dev);
 }
-```
+
+log_msg("\nSummary: Monitored " . scalar(@devices) . 
+        " device(s), " . $success_count . " successful\n");
+
+exit($success_count == @devices ? 0 : 1);
