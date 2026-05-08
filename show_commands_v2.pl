@@ -1,183 +1,191 @@
+Now I have a clear picture of what's covered. Writing a CPU/memory health monitor — distinct from all existing scripts and highly practical for day-to-day network ops.
+
 #!/usr/bin/perl
+#
+# health_monitor.pl - Device CPU, Memory, and Environmental Health Check
+#
+# Purpose:
+#   Connects to one or more Cisco IOS/IOS-XE devices via SSH and collects
+#   CPU utilization, processor memory stats, and environmental sensor status
+#   (fans, power supplies, temperature). Useful for capacity planning, proactive
+#   alerting before resource exhaustion causes outages, and post-maintenance
+#   health validation.
+#
+# Usage:
+#   Single device:  ./health_monitor.pl -h 10.0.0.1 -u admin -p secret
+#   Device list:    ./health_monitor.pl -f devices.txt -u admin -p secret
+#   With log file:  ./health_monitor.pl -f devices.txt -u admin -p secret -l health.log
+#   Custom timeout: ./health_monitor.pl -h 10.0.0.1 -u admin -p secret -t 45
+#
+# Device file format: one IP or hostname per line; lines starting with # are ignored
+#
+# Prerequisites:
+#   Perl modules: Net::SSH::Expect, Getopt::Long
+#   Install:      cpanm Net::SSH::Expect
+#   Devices must have SSH enabled and sufficient privilege to run 'show' commands
+#
+# Supported platforms: Cisco IOS, IOS-XE (NX-OS uses different env command syntax)
+
 use strict;
 use warnings;
-use Expect;
-use Getopt::Long;
-use Time::localtime;
+use Net::SSH::Expect;
+use Getopt::Long qw(:config no_ignore_case bundling);
+use POSIX qw(strftime);
 
-=head1 NAME
-device_config_drift_detector.pl - Detect unauthorized configuration changes on network devices
-
-=head1 SYNOPSIS
-./device_config_drift_detector.pl --device <hostname|ip> [--username user] [--password pass] [--baseline]
-
-=head1 DESCRIPTION
-Captures and compares device running configurations to detect unauthorized changes.
-Use --baseline on first run to establish baseline, then run periodically to detect
-drift. Useful for compliance audits and change management. Results logged per-device.
-
-=head1 USAGE EXAMPLES
-Establish baseline:         ./device_config_drift_detector.pl --device 192.168.1.1 --baseline
-Check for configuration drift: ./device_config_drift_detector.pl --device 192.168.1.1
-Batch check from file:      while read ip; do ./device_config_drift_detector.pl --device $ip; done < devices.txt
-
-=head1 REQUIREMENTS
-Expect module, SSH access to devices, baseline captured before drift detection
-
-=cut
-
-my ($device, $username, $password, $baseline_mode, $help);
+my ($host, $device_file, $username, $password, $log_file);
+my $timeout = 30;
 
 GetOptions(
-    'device=s'   => \$device,
-    'username=s' => \$username,
-    'password=s' => \$password,
-    'baseline'   => \$baseline_mode,
-    'help'       => \$help,
-) or die "Error parsing command line arguments\n";
+    'h|host=s'    => \$host,
+    'f|file=s'    => \$device_file,
+    'u|user=s'    => \$username,
+    'p|pass=s'    => \$password,
+    'l|log=s'     => \$log_file,
+    't|timeout=i' => \$timeout,
+) or usage();
 
-die usage() if $help || !$device;
-$username ||= 'admin';
+$username //= $ENV{NET_USER} // 'admin';
+$password //= $ENV{NET_PASS} or die "Password required: use -p or set NET_PASS env var\n";
 
-my $baseline_dir = './baselines';
-mkdir($baseline_dir) unless -d $baseline_dir;
-my $baseline_file = "$baseline_dir/${device}_baseline.txt";
-my $logfile = "drift_${device}.log";
-
-open my $LOG, ">>", $logfile or die "Failed to open log file: $!";
-
-sub log_msg {
-    my ($msg) = @_;
-    my $ts = scalar(localtime());
-    print "$msg\n";
-    print $LOG "[$ts] $msg\n";
-    flush $LOG;
+my @devices;
+if ($host) {
+    push @devices, $host;
+} elsif ($device_file) {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^\s*$/ || /^#/;
+        push @devices, $_;
+    }
+    close $fh;
+} else {
+    usage();
 }
 
-sub get_running_config {
-    my ($ip, $user, $pass) = @_;
-    
-    log_msg("[*] Connecting to $ip");
-    my $ssh = Expect->new();
-    
-    unless ($ssh->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $user\@$ip")) {
-        log_msg("[!] Failed to spawn SSH connection");
-        return undef;
-    }
-    
-    my $auth_ok = 0;
-    eval {
-        $ssh->expect(6,
-            [ qr/password[:=]\s*$/i, sub { 
-                my $self = shift;
-                $self->send("$pass\n");
-                exp_continue;
-            } ],
-            [ qr/[>#]\s*$/, sub { $auth_ok = 1; } ],
-            [ 'timeout', sub { log_msg("[!] Connection timeout after 6 seconds"); } ],
-            [ 'eof', sub { log_msg("[!] SSH connection closed unexpectedly"); } ],
+die "No devices to process\n" unless @devices;
+
+my $log_fh;
+if ($log_file) {
+    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
+}
+
+my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+my ($ok_count, $warn_count, $err_count) = (0, 0, 0);
+
+for my $device (@devices) {
+    emit($log_fh, "\n" . "=" x 60);
+    emit($log_fh, "Device: $device  |  $timestamp");
+    emit($log_fh, "=" x 60);
+
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host     => $device,
+            user     => $username,
+            password => $password,
+            raw_pty  => 1,
+            timeout  => $timeout,
         );
     };
-    
-    unless ($auth_ok) {
-        log_msg("[!] Authentication failed or no prompt received");
-        $ssh->hard_close() if defined $ssh;
-        return undef;
+    if ($@ || !$ssh) {
+        emit($log_fh, "  ERROR: SSH session failed - $@");
+        $err_count++;
+        next;
     }
-    
-    log_msg("[+] Authenticated, retrieving configuration");
-    
-    $ssh->send("terminal length 0\n");
-    $ssh->expect(2, [ qr/[>#]\s*$/ ]);
-    
-    $ssh->send("show running-config\n");
-    unless ($ssh->expect(20, [ qr/[>#]\s*$/ ])) {
-        log_msg("[!] Timeout retrieving running-config");
-        $ssh->hard_close();
-        return undef;
+
+    my $logged_in = eval { $ssh->login() };
+    if ($@ || !$logged_in) {
+        emit($log_fh, "  ERROR: Authentication failed - $@");
+        $err_count++;
+        next;
     }
-    
-    my $config = $ssh->buffer();
-    $ssh->send("exit\n");
-    $ssh->hard_close();
-    
-    return $config if $config && length($config) > 100;
-    log_msg("[!] Config retrieval returned invalid data");
-    return undef;
+
+    $ssh->exec("terminal length 0");
+
+    my $device_ok = 1;
+
+    # --- CPU Utilization ---
+    emit($log_fh, "\n[CPU Utilization]");
+    my $cpu = $ssh->exec("show processes cpu | include CPU utilization");
+    if ($cpu && $cpu =~ /five seconds: (\d+)%[^;]*;\s*one minute: (\d+)%;\s*five minutes: (\d+)%/) {
+        my ($sec5, $min1, $min5) = ($1, $2, $3);
+        emit($log_fh, "  5-second : $sec5%");
+        emit($log_fh, "  1-minute : $min1%");
+        emit($log_fh, "  5-minute : $min5%");
+        if ($min5 >= 80) {
+            emit($log_fh, "  *** WARN: 5-min CPU at $min5% (threshold 80%) ***");
+            $device_ok = 0;
+        }
+    } else {
+        emit($log_fh, "  Could not parse CPU output");
+    }
+
+    # --- Memory Utilization ---
+    emit($log_fh, "\n[Memory Utilization]");
+    my $mem = $ssh->exec("show processes memory | include Processor");
+    if ($mem && $mem =~ /Total:\s+(\d+)\s+Used:\s+(\d+)\s+Free:\s+(\d+)/) {
+        my ($total, $used, $free) = ($1, $2, $3);
+        my $pct = int($used / $total * 100);
+        emit($log_fh, sprintf("  Total: %d MB  Used: %d MB  Free: %d MB  (%d%% used)",
+            $total/1048576, $used/1048576, $free/1048576, $pct));
+        if ($pct >= 85) {
+            emit($log_fh, "  *** WARN: Memory at $pct% (threshold 85%) ***");
+            $device_ok = 0;
+        }
+    } else {
+        emit($log_fh, "  Could not parse memory output");
+    }
+
+    # --- Environmental Status ---
+    emit($log_fh, "\n[Environmental Status]");
+    my $env = $ssh->exec("show environment all");
+    if ($env && $env !~ /Invalid input|% Unknown/) {
+        my @crits  = grep { /CRITICAL|FAIL/i    } split /\n/, $env;
+        my @warns  = grep { /WARNING|WARN(?!ING)/i } split /\n/, $env;
+        if (@crits) {
+            emit($log_fh, "  *** CRITICAL: " . scalar(@crits) . " sensor(s) in critical state ***");
+            emit($log_fh, "  $_") for @crits;
+            $device_ok = 0;
+        } elsif (@warns) {
+            emit($log_fh, "  WARN: " . scalar(@warns) . " sensor warning(s)");
+            emit($log_fh, "  $_") for @warns;
+            $device_ok = 0;
+        } else {
+            emit($log_fh, "  All sensors: OK");
+        }
+    } else {
+        # Platforms without 'show environment' (e.g. older 2900-series)
+        emit($log_fh, "  show environment not supported on this platform");
+    }
+
+    $ssh->close();
+
+    if ($device_ok) { $ok_count++ } else { $warn_count++ }
+}
+
+emit($log_fh, "\n" . "-" x 60);
+emit($log_fh, "Summary: $ok_count OK  $warn_count WARNING  $err_count ERROR");
+emit($log_fh, "-" x 60);
+
+close $log_fh if $log_fh;
+print "\nLog appended to: $log_file\n" if $log_file;
+
+sub emit {
+    my ($fh, $msg) = @_;
+    print "$msg\n";
+    print $fh "$msg\n" if $fh;
 }
 
 sub usage {
-    print <<'USAGE';
-Usage: device_config_drift_detector.pl --device <hostname|ip> [options]
+    die <<END;
+Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-l logfile] [-t timeout_sec]
 
-Required:
-  --device            Target device hostname or IP address
+  -h  Target device hostname or IP
+  -f  File with one device per line (# lines ignored)
+  -u  SSH username (default: \$NET_USER or 'admin')
+  -p  SSH password (default: \$NET_PASS)
+  -l  Append results to this log file
+  -t  Per-device SSH timeout in seconds (default: 30)
 
-Options:
-  --username          SSH username (default: admin)
-  --password          SSH password (prompted if omitted)
-  --baseline          Capture and save baseline configuration
-  --help              Show this message
-
-Examples:
-  ./device_config_drift_detector.pl --device 192.168.1.1 --baseline
-  ./device_config_drift_detector.pl --device core-router-01
-  cat devices.txt | xargs -I {} ./device_config_drift_detector.pl --device {}
-
-USAGE
-    exit 0;
+Thresholds: CPU 5-min >= 80%  |  Memory >= 85%  |  Any CRITICAL/WARNING env sensor
+END
 }
-
-unless ($password) {
-    print "Enter SSH password for $username\@$device: ";
-    system("stty -echo");
-    chomp($password = <STDIN>);
-    system("stty echo");
-    print "\n";
-}
-
-my $config = get_running_config($device, $username, $password);
-
-unless ($config) {
-    log_msg("[!] Failed to retrieve configuration from $device");
-    close $LOG;
-    exit 1;
-}
-
-if ($baseline_mode) {
-    open my $fh, ">", $baseline_file or die "Cannot write baseline file: $!";
-    print $fh $config;
-    close $fh;
-    log_msg("[+] Baseline configuration saved for $device");
-} else {
-    unless (-f $baseline_file) {
-        log_msg("[!] ERROR: No baseline found for $device");
-        log_msg("[!] Run with --baseline flag to establish baseline first");
-        close $LOG;
-        exit 1;
-    }
-    
-    open my $fh, "<", $baseline_file or die "Cannot read baseline file: $!";
-    my $baseline = do { local $/; <$fh> };
-    close $fh;
-    
-    if ($config eq $baseline) {
-        log_msg("[+] OK: Configuration matches baseline - no drift detected");
-    } else {
-        log_msg("[!] ALERT: Configuration drift detected on $device");
-        
-        my @current_lines = split /\n/, $config;
-        my @baseline_lines = split /\n/, $baseline;
-        my %baseline_hash = map { $_ => 1 } @baseline_lines;
-        
-        log_msg("--- Changes ---");
-        foreach my $line (@current_lines) {
-            if ($line && !$baseline_hash{$line}) {
-                log_msg("  + $line");
-            }
-        }
-    }
-}
-
-close $LOG;
-exit 0;
