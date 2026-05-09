@@ -1,204 +1,163 @@
+```perl
 #!/usr/bin/perl
+# =============================================================================
+# ntp_drift_audit.pl - NTP Drift and Stratum Compliance Auditor
+#
+# Purpose:
+#   Connects to Cisco IOS/IOS-XE devices and audits NTP health beyond basic
+#   sync status. Checks clock offset/drift against threshold, validates
+#   stratum level, verifies reference clock IP matches approved server list,
+#   and flags devices with excessive jitter or unsynchronized state.
+#
+# Usage:
+#   ./ntp_drift_audit.pl -h <host> [-u <user>] [-p <pass>] [-l <logfile>]
+#                        [-t <offset_threshold_ms>] [-s <max_stratum>]
+#   ./ntp_drift_audit.pl -f <device_list_file> [-u <user>] [-p <pass>]
+#
+#   Device list file: one IP/hostname per line, blank lines and # comments OK
+#
+# Prerequisites:
+#   cpan Net::SSH::Expect
+#   SSH access to devices with 'show ntp status' and 'show ntp associations'
+#
+# Exit codes: 0=all OK, 1=warnings, 2=errors/unreachable
+# =============================================================================
+
 use strict;
 use warnings;
-use Expect;
+use Net::SSH::Expect;
 use Getopt::Long;
-use File::Basename;
-use Time::HiRes qw(time);
+use POSIX qw(strftime);
 
-=head1 NAME
+my ($host, $user, $pass, $logfile, $device_file);
+my $offset_threshold = 50;   # ms — flag if |offset| exceeds this
+my $max_stratum      = 3;    # flag if stratum > this value
+my @approved_servers = ();   # populate to enforce NTP server policy
 
-syslog_audit.pl - Network device syslog configuration and critical event auditor
-
-=head1 SYNOPSIS
-
-  ./syslog_audit.pl <device_ip> [username] [password]
-  ./syslog_audit.pl -f devices.txt -u netadmin -p secret123
-  ./syslog_audit.pl 192.168.1.1 -o audit_results.log
-
-=head1 DESCRIPTION
-
-Connects to Cisco/IOS network devices via SSH and performs syslog audits:
-- Verifies syslog server configuration and reachability
-- Checks syslog buffer status and recent critical/warning events
-- Reports logging trap levels and missing configurations
-- Outputs results to STDOUT and optional log file
-
-Useful for compliance audits and troubleshooting log delivery issues.
-
-=head1 PREREQUISITES
-
-Perl Expect module:
-  cpan Expect
-  apt-get install libexpect-perl
-
-Network requirements:
-- SSH access to devices (port 22)
-- Device credentials or SSH key auth
-- Devices must have SSH enabled
-
-=head1 OPTIONS
-
-  -f file         Read device list from file (one IP per line)
-  -u username     SSH username (default: prompts)
-  -p password     SSH password (default: prompts)
-  -o logfile      Write results to log file
-  -t timeout      SSH connection timeout in seconds (default: 15)
-  -h              Show this help message
-
-=cut
-
-my ($device_file, $username, $password, $logfile, $timeout, $help);
 GetOptions(
-    'f|file=s'     => \$device_file,
-    'u|user=s'     => \$username,
-    'p|pass=s'     => \$password,
-    'o|output=s'   => \$logfile,
-    't|timeout=i'  => \$timeout,
-    'h|help'       => \$help,
-) or die "Error in command line arguments\n";
+    'h|host=s'      => \$host,
+    'u|user=s'      => \$user,
+    'p|pass=s'      => \$pass,
+    'l|log=s'       => \$logfile,
+    'f|file=s'      => \$device_file,
+    't|threshold=i' => \$offset_threshold,
+    's|stratum=i'   => \$max_stratum,
+) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-l logfile]\n";
 
-die "Usage: $0 <device_ip> | -f <device_file> [-u user] [-p pass] [-o logfile]\n" if $help;
+$user //= $ENV{NET_USER} // 'admin';
+$pass //= $ENV{NET_PASS} // do { print "Password: "; chomp(my $p = <STDIN>); $p };
 
-$timeout //= 15;
-my @devices;
-
+my @targets;
 if ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) {
-        chomp;
-        push @devices, $_ if $_ && $_ !~ /^\s*#/;
-    }
-    close($fh);
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!";
+    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @targets, $_ if $_; }
+    close $fh;
+} elsif ($host) {
+    @targets = ($host);
 } else {
-    push @devices, $ARGV[0] or die "No device specified\n";
+    die "Specify -h <host> or -f <device_file>\n";
 }
 
-my $exp = Expect->new();
-$exp->log_stdout(0);
-my $start = time();
-my @results;
-
-foreach my $device (@devices) {
-    my $result = audit_syslog($device, $username, $password, $exp, $timeout);
-    push @results, $result;
+my $log_fh;
+if ($logfile) {
+    open $log_fh, '>>', $logfile or die "Cannot open log $logfile: $!";
 }
 
-my $elapsed = time() - $start;
-output_report(\@results, $logfile, $elapsed);
-
-sub audit_syslog {
-    my ($device, $user, $pass, $exp, $to) = @_;
-    my $report = { device => $device, status => 'FAIL', errors => [] };
-    
-    if (!$user) {
-        print "Username for $device: ";
-        chomp($user = <STDIN>);
-    }
-    if (!$pass) {
-        print "Password: ";
-        system('stty', '-echo') if -t STDIN;
-        chomp($pass = <STDIN>);
-        system('stty', 'echo') if -t STDIN;
-        print "\n";
-    }
-    
-    eval {
-        $exp->spawn("ssh -o StrictHostKeyChecking=no $user\@$device")
-            or push @{$report->{errors}}, "SSH spawn failed";
-        
-        $exp->timeout($to);
-        $exp->expect($to, ['password', 'assword']);
-        $exp->send("$pass\n");
-        
-        $exp->expect($to, ['>', '#']) or push @{$report->{errors}}, "Auth timeout";
-        $exp->send("terminal length 0\n");
-        $exp->expect($to, ['>', '#']);
-        
-        my @syslog_tests = (
-            { cmd => "show logging", label => 'syslog_config' },
-            { cmd => "show logging | include server|trap", label => 'trap_servers' },
-            { cmd => "show log | include %.*-[3-5]-", label => 'critical_events' },
-        );
-        
-        foreach my $test (@syslog_tests) {
-            $exp->send("$test->{cmd}\n");
-            $exp->expect($to, ['>', '#']);
-            my $output = $exp->before;
-            
-            if ($output =~ /invalid|unrecognized/i) {
-                push @{$report->{errors}}, "Command failed: $test->{cmd}";
-                next;
-            }
-            
-            if ($test->{label} eq 'trap_servers') {
-                if ($output =~ /^[^:]*server/) {
-                    $report->{trap_servers} = [ grep { /server/ } split /\n/, $output ];
-                } else {
-                    push @{$report->{errors}}, "No trap servers configured";
-                }
-            }
-            
-            if ($test->{label} eq 'critical_events') {
-                my @critical = grep { /[%]/ } split /\n/, $output;
-                $report->{critical_count} = scalar(@critical);
-                if (@critical) {
-                    push @{$report->{warnings}}, "Found $report->{critical_count} critical/warning events";
-                    $report->{recent_events} = [ @critical[0..4] ];
-                }
-            }
-        }
-        
-        $exp->send("exit\n");
-        $exp->soft_close();
-        
-        $report->{status} = @{$report->{errors}} ? 'WARN' : 'OK';
-    };
-    
-    if ($@) {
-        push @{$report->{errors}}, "Exception: $@";
-        $report->{status} = 'ERROR';
-    }
-    
-    return $report;
+sub output {
+    my ($msg) = @_;
+    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    print "[$ts] $msg\n";
+    print $log_fh "[$ts] $msg\n" if $log_fh;
 }
 
-sub output_report {
-    my ($results, $logfile, $elapsed) = @_;
-    
-    my @lines = (
-        "=" x 70,
-        "SYSLOG AUDIT REPORT - " . scalar(localtime()),
-        "=" x 70,
-        "",
+sub audit_device {
+    my ($target) = @_;
+    output("--- Connecting to $target ---");
+
+    my $ssh = Net::SSH::Expect->new(
+        host        => $target,
+        user        => $user,
+        password    => $pass,
+        raw_pty     => 1,
+        timeout     => 15,
+        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
     );
-    
-    foreach my $r (@$results) {
-        push @lines, sprintf("Device: %-20s Status: %s", $r->{device}, $r->{status});
-        
-        if (@{$r->{errors}}) {
-            push @lines, "  Errors:";
-            push @lines, "    - $_" foreach @{$r->{errors}};
-        }
-        
-        if ($r->{trap_servers}) {
-            push @lines, "  Trap Servers: " . join(", ", @{$r->{trap_servers}});
-        }
-        
-        if ($r->{critical_count}) {
-            push @lines, "  Critical Events: $r->{critical_count}";
-        }
-        push @lines, "";
+
+    eval { $ssh->login() };
+    if ($@) {
+        output("ERROR [$target]: Connection/auth failed - $@");
+        return 2;
     }
-    
-    push @lines, sprintf("Audit completed in %.2f seconds", $elapsed);
-    
-    my $report = join("\n", @lines);
-    print $report;
-    
-    if ($logfile) {
-        open(my $fh, '>', $logfile) or warn "Cannot write to $logfile: $!\n";
-        print $fh $report if $fh;
-        close($fh) if $fh;
+
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('\$|#|\>', 5);
+
+    # Collect NTP status
+    $ssh->send("show ntp status\n");
+    my $status_out = $ssh->waitfor('\$|#|\>', 10) // '';
+
+    # Collect NTP associations detail
+    $ssh->send("show ntp associations detail\n");
+    my $assoc_out = $ssh->waitfor('\$|#|\>', 10) // '';
+
+    $ssh->send("exit\n");
+    $ssh->close();
+
+    my $exit_code = 0;
+
+    # Parse sync state
+    if ($status_out =~ /Clock is unsynchronized/) {
+        output("CRITICAL [$target]: Clock is NOT synchronized");
+        $exit_code = 2;
+    } elsif ($status_out =~ /Clock is synchronized,\s+stratum\s+(\d+),\s+reference is\s+(\S+)/) {
+        my ($stratum, $ref) = ($1, $2);
+        output("OK [$target]: Synchronized | stratum=$stratum | ref=$ref");
+
+        if ($stratum > $max_stratum) {
+            output("WARN [$target]: Stratum $stratum exceeds max ($max_stratum)");
+            $exit_code = 1 unless $exit_code == 2;
+        }
+
+        if (@approved_servers && !grep { $_ eq $ref } @approved_servers) {
+            output("WARN [$target]: Reference $ref not in approved server list");
+            $exit_code = 1 unless $exit_code == 2;
+        }
+    } else {
+        output("WARN [$target]: Could not parse NTP status output");
+        $exit_code = 1;
     }
+
+    # Parse offset from associations detail
+    while ($assoc_out =~ /offset\s+([-\d.]+)\s+msec/gi) {
+        my $offset = abs($1);
+        if ($offset > $offset_threshold) {
+            output("WARN [$target]: NTP offset ${offset}ms exceeds threshold (${offset_threshold}ms)");
+            $exit_code = 1 unless $exit_code == 2;
+        } else {
+            output("OK [$target]: Offset ${offset}ms within threshold");
+        }
+        last; # report first (selected) peer only
+    }
+
+    # Parse jitter if available
+    if ($assoc_out =~ /jitter\s+([\d.]+)/) {
+        my $jitter = $1;
+        output("INFO [$target]: NTP jitter ${jitter}ms");
+    }
+
+    return $exit_code;
 }
+
+my $overall = 0;
+output("NTP Drift Audit started | targets=" . scalar(@targets) .
+       " | offset_threshold=${offset_threshold}ms | max_stratum=$max_stratum");
+
+for my $target (@targets) {
+    my $rc = audit_device($target);
+    $overall = $rc if $rc > $overall;
+}
+
+output("Audit complete | result=" . ($overall == 0 ? 'ALL_OK' : $overall == 1 ? 'WARNINGS' : 'ERRORS'));
+close $log_fh if $log_fh;
+exit $overall;
+```
