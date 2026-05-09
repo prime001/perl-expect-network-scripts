@@ -1,154 +1,163 @@
-The perl-expect-network-scripts repo isn't local — this is a content generation request. Writing the script now.
-
-```perl
 #!/usr/bin/perl
-#
-# bgp_advertised_routes.pl - BGP Advertised Route Verification
+# =============================================================================
+# bgp_prefix_limit_monitor.pl — BGP Prefix-Limit Health Check
 #
 # Purpose:
-#   Connects to a Cisco IOS/IOS-XE router and audits routes being advertised
-#   to BGP peers. Detects prefix count anomalies and flags potential route leaks
-#   by comparing advertised prefixes against an optional expected-prefixes file.
+#   Connects to one or more Cisco IOS/IOS-XE routers and compares each BGP
+#   neighbor's current received-prefix count against its configured maximum-
+#   prefix limit.  Peers at or above a warning threshold (default 80%) are
+#   flagged so the operator can act before the session gets torn down.
 #
 # Usage:
-#   bgp_advertised_routes.pl -h <device> -u <user> -p <pass> [-P <peer_ip>]
-#                            [-e <expected_prefixes_file>] [-l <logfile>]
-#                            [-t <threshold_pct>]
+#   Single device:   perl bgp_prefix_limit_monitor.pl -h 10.0.0.1
+#   Device file:     perl bgp_prefix_limit_monitor.pl -f devices.txt
+#   Custom threshold: add -t 75   (warn at 75 %)
+#   Log to file:     add -l /var/log/bgp_prefix_check.log
 #
 # Prerequisites:
-#   cpanm Net::SSH::Expect Getopt::Long
+#   cpan Net::SSH::Expect
+#   SSH key-based auth recommended; password auth supported via -p flag.
 #
-# Examples:
-#   bgp_advertised_routes.pl -h 10.0.0.1 -u admin -p secret
-#   bgp_advertised_routes.pl -h 10.0.0.1 -u admin -p secret -P 192.168.1.2
-#   bgp_advertised_routes.pl -h 10.0.0.1 -u admin -p secret -e expected.txt -t 20
+# Output:
+#   OK / WARN / CRIT per neighbor, plus a summary line per device.
+#   Exit code 0 = all OK, 1 = at least one WARN, 2 = at least one CRIT.
+# =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
+use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $user, $pass, $peer_filter, $expected_file, $logfile);
-my $threshold_pct = 25;
-my $timeout       = 30;
+# ---------------------------------------------------------------------------
+# CLI options
+# ---------------------------------------------------------------------------
+my ($host, $device_file, $username, $password, $log_file);
+my $warn_pct = 80;
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'u|user=s'     => \$user,
-    'p|pass=s'     => \$pass,
-    'P|peer=s'     => \$peer_filter,
-    'e|expected=s' => \$expected_file,
-    'l|log=s'      => \$logfile,
-    't|threshold=i' => \$threshold_pct,
-) or die "Usage: $0 -h host -u user -p pass [-P peer] [-e file] [-l log] [-t pct]\n";
+    'h=s' => \$host,
+    'f=s' => \$device_file,
+    'u=s' => \$username,
+    'p=s' => \$password,
+    't=i' => \$warn_pct,
+    'l=s' => \$log_file,
+) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-t warn%] [-l logfile]\n";
 
-die "ERROR: -h, -u, and -p are required\n"
-    unless $host && $user && $pass;
+$username //= $ENV{NET_USER} // 'admin';
+die "No device specified. Use -h or -f.\n" unless $host || $device_file;
 
-my $LOG;
-if ($logfile) {
-    open($LOG, '>>', $logfile) or die "Cannot open log $logfile: $!\n";
+my @devices = $host ? ($host) : do {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
+};
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+my $log_fh;
+if ($log_file) {
+    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
 }
 
-sub out {
-    my ($line) = @_;
-    print $line, "\n";
-    print $LOG strftime("[%Y-%m-%d %H:%M:%S] ", localtime), $line, "\n" if $LOG;
+sub logprint {
+    my $msg = strftime("[%Y-%m-%d %H:%M:%S] ", localtime) . $_[0] . "\n";
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
 
-sub load_expected {
-    my ($file) = @_;
-    open(my $fh, '<', $file) or die "Cannot read expected prefixes file $file: $!\n";
-    my %expected;
-    while (<$fh>) {
-        chomp;
-        s/\s*#.*//;
-        next unless /\S/;
-        $expected{$_} = 1;
-    }
-    close $fh;
-    return %expected;
-}
+# ---------------------------------------------------------------------------
+# Per-device check
+# ---------------------------------------------------------------------------
+my $global_exit = 0;
 
-my %expected_prefixes = $expected_file ? load_expected($expected_file) : ();
+for my $device (@devices) {
+    logprint("=== $device ===");
 
-out("=== BGP Advertised Route Audit: $host ===");
-out("Timestamp: " . strftime("%Y-%m-%d %H:%M:%S", localtime));
-
-my $ssh = Net::SSH::Expect->new(
-    host        => $host,
-    user        => $user,
-    password    => $pass,
-    raw_pty     => 1,
-    timeout     => $timeout,
-    ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
-);
-
-eval { $ssh->login() };
-if ($@) {
-    out("ERROR: SSH connection failed to $host: $@");
-    exit 1;
-}
-
-$ssh->send("terminal length 0");
-$ssh->waitfor('\$|#', 5);
-
-# Collect peer list from BGP summary unless a specific peer was given
-my @peers;
-if ($peer_filter) {
-    @peers = ($peer_filter);
-} else {
-    $ssh->send("show ip bgp summary");
-    my $summary = $ssh->waitfor('\$|#', $timeout);
-    @peers = ($summary =~ /^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+/mg);
-    unless (@peers) {
-        out("ERROR: No BGP peers found in 'show ip bgp summary' output.");
-        $ssh->close();
-        exit 1;
-    }
-}
-
-my $issues = 0;
-
-for my $peer (@peers) {
-    out("\n--- Peer: $peer ---");
-    $ssh->send("show ip bgp neighbors $peer advertised-routes");
-    my $output = $ssh->waitfor('\$|#', $timeout);
-
-    my @prefixes = ($output =~ /^\s*\*?[>i ]\s*(\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2})/mg);
-    my $count    = scalar @prefixes;
-    out("  Advertised prefixes: $count");
-
-    if ($count == 0) {
-        out("  WARNING: No routes advertised to $peer — check route-map or peer policy.");
-        $issues++;
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host        => $device,
+            user        => $username,
+            ($password ? (password => $password) : ()),
+            raw_pty     => 1,
+            timeout     => 15,
+        );
+    };
+    if ($@ || !$ssh) {
+        logprint("ERROR $device: connection failed — $@");
+        $global_exit = 2 if $global_exit < 2;
         next;
     }
 
-    if (%expected_prefixes) {
-        my @unexpected = grep { !$expected_prefixes{$_} } @prefixes;
-        my @missing    = grep { my $e = $_; !grep { $_ eq $e } @prefixes } keys %expected_prefixes;
+    my $login = eval { $ssh->login() };
+    if ($@ || !defined $login) {
+        logprint("ERROR $device: authentication failed");
+        $global_exit = 2 if $global_exit < 2;
+        next;
+    }
 
-        if (@unexpected) {
-            out("  LEAK ALERT: " . scalar(@unexpected) . " unexpected prefix(es):");
-            out("    $_") for @unexpected;
-            $issues++;
+    # Disable paging so we get full output in one shot
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('\#', 5);
+
+    $ssh->send("show bgp neighbors | include BGP neighbor|Prefixes Current|Maximum prefix\n");
+    my $raw = $ssh->waitfor('\#', 30) // '';
+
+    $ssh->send("exit\n");
+
+    # -------------------------------------------------------------------
+    # Parse output — pull neighbor IP, current prefix count, max-prefix
+    # -------------------------------------------------------------------
+    my ($current_neighbor, %data);
+    for my $line (split /\r?\n/, $raw) {
+        if ($line =~ /BGP neighbor is (\S+)/) {
+            $current_neighbor = $1;
+            $current_neighbor =~ s/,$//;
         }
-        if (@missing) {
-            out("  MISSING: " . scalar(@missing) . " expected prefix(es) not advertised:");
-            out("    $_") for @missing;
-            $issues++;
+        # "  Prefixes Current:          45"  (IOS-XE style)
+        if ($current_neighbor && $line =~ /Prefixes Current:\s+(\d+)/) {
+            $data{$current_neighbor}{current} = $1;
         }
-        unless (@unexpected || @missing) {
-            out("  OK: Advertised prefixes match expected set.");
+        # "  Maximum prefix limit:    100"  or  "maximum 100 ..."
+        if ($current_neighbor && $line =~ /[Mm]aximum.*?(\d+)/) {
+            $data{$current_neighbor}{max} //= $1;
         }
     }
+
+    if (!%data) {
+        logprint("INFO $device: no BGP neighbors found or no prefix-limit configured");
+        next;
+    }
+
+    my ($ok, $warn, $crit) = (0, 0, 0);
+    for my $nbr (sort keys %data) {
+        my $cur = $data{$nbr}{current} // 0;
+        my $max = $data{$nbr}{max};
+
+        unless (defined $max && $max > 0) {
+            logprint("INFO $device neighbor $nbr: current=$cur  max=unlimited");
+            next;
+        }
+
+        my $pct = int($cur / $max * 100);
+        my $status;
+        if ($pct >= 100) {
+            $status = 'CRIT';
+            $crit++;
+            $global_exit = 2 if $global_exit < 2;
+        } elsif ($pct >= $warn_pct) {
+            $status = 'WARN';
+            $warn++;
+            $global_exit = 1 if $global_exit < 1;
+        } else {
+            $status = 'OK  ';
+            $ok++;
+        }
+        logprint("$status $device neighbor $nbr: $cur/$max prefixes ($pct%)");
+    }
+
+    logprint("SUMMARY $device: OK=$ok WARN=$warn CRIT=$crit");
 }
 
-$ssh->close();
-
-out("\n=== Audit Complete: $issues issue(s) found ===");
-close $LOG if $LOG;
-exit($issues ? 1 : 0);
-```
+close $log_fh if $log_fh;
+exit $global_exit;
