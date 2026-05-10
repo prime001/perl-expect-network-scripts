@@ -1,193 +1,165 @@
+The repo context in the prompt is a GitHub portfolio repo, not this local project. I'll generate the script content directly.
+
+```perl
 #!/usr/bin/perl
-# =============================================================================
-# ospf_lsdb_check.pl - OSPF Link-State Database Analyzer
+# ospf_lsdb_summary.pl - OSPF Link State Database Summarizer
 #
 # Purpose:
-#   Connects to Cisco IOS/IOS-XE devices via SSH and analyzes the OSPF
-#   link-state database (LSDB). Counts LSAs by type per area, flags databases
-#   with excessive external LSA counts (potential redistribution leak), and
-#   reports area type anomalies. Complements ospf_neighbors.pl (neighbor state)
-#   by validating the database content itself.
+#   Audits the OSPF LSDB on Cisco IOS/IOS-XE routers. Reports LSA counts
+#   by type per area, flags excessive external LSAs (possible redistribution
+#   leak), NSSA areas, and ASBRs with no matching external LSAs. Complements
+#   ospf_neighbors.pl (neighbor state) with database-level visibility.
 #
 # Usage:
-#   Single device:  ./ospf_lsdb_check.pl -h 10.0.0.1
-#   Fleet sweep:    ./ospf_lsdb_check.pl -f routers.txt -l lsdb_audit.log
-#   Custom process: ./ospf_lsdb_check.pl -h 10.0.0.1 -P 100
-#   Custom creds:   ./ospf_lsdb_check.pl -h 10.0.0.1 -u netops -p secretpass
-#   Set ext limit:  ./ospf_lsdb_check.pl -f routers.txt --max-ext 500
+#   Single device:  ./ospf_lsdb_summary.pl <host> <user> <password>
+#   Device file:    ./ospf_lsdb_summary.pl -f devices.txt
 #
-# Device file format: one IP/hostname per line, # for comments
+#   Device file format (one per line, whitespace-delimited):
+#     <host> <user> <password>
 #
 # Prerequisites:
 #   cpan Net::SSH::Expect
-#   SSH read-only access to Cisco IOS/IOS-XE (privilege 1+)
-#   OSPF must be running on the device
 #
-# Exit codes:
-#   0 - All databases healthy
-#   1 - Anomaly detected (LSA threshold exceeded or area mismatch)
-#   2 - All connection attempts failed
-# =============================================================================
+# Output:
+#   STDOUT + ospf_lsdb_YYYYMMDD_HHMMSS.log
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
 use POSIX qw(strftime);
+use Getopt::Long;
 
-my ($host, $device_file, $log_file, $username, $password);
-my ($timeout, $process_id, $max_ext, $help);
-$username   = $ENV{NET_USER} // 'admin';
-$password   = $ENV{NET_PASS} // '';
-$timeout    = 20;
-$process_id = 1;
-$max_ext    = 1000;
+my $TIMEOUT      = 20;
+my $EXT_LSA_WARN = 500;
 
-GetOptions(
-    'h|host=s'    => \$host,
-    'f|file=s'    => \$device_file,
-    'l|log=s'     => \$log_file,
-    'u|user=s'    => \$username,
-    'p|pass=s'    => \$password,
-    't|timeout=i' => \$timeout,
-    'P|process=i' => \$process_id,
-    'max-ext=i'   => \$max_ext,
-    'help'        => \$help,
-) or die "Error parsing options. Use --help for usage.\n";
+my $device_file;
+GetOptions('f=s' => \$device_file)
+    or die "Usage: $0 [-f devices.txt] [host user password]\n";
 
-if ($help) {
-    system("grep '^#' $0 | sed 's/^# \\?//'");
-    exit 0;
-}
-die "Specify -h <host> or -f <file>\n" unless $host || $device_file;
-
-unless ($password) {
-    print "Password for $username: ";
-    system('stty -echo');
-    chomp($password = <STDIN>);
-    system('stty echo');
-    print "\n";
-}
-
-my @devices;
-push @devices, $host if $host;
-if ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; next if /^\s*[#\s]/; push @devices, $_; }
-    close $fh;
-}
-
-my $log_fh;
-if ($log_file) {
-    open($log_fh, '>>', $log_file) or die "Cannot open $log_file: $!\n";
-}
+my $log_file = "ospf_lsdb_" . strftime("%Y%m%d_%H%M%S", localtime) . ".log";
+open(my $LOG, '>', $log_file) or die "Cannot open log $log_file: $!\n";
 
 sub out {
-    my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
+    print @_;
+    print $LOG @_;
 }
 
-my $ts      = strftime('%Y-%m-%d %H:%M:%S', localtime);
-my $anomaly = 0;
-my $failed  = 0;
-
-out("=" x 70 . "\n");
-out("OSPF LSDB Audit  |  $ts  |  Ext-LSA limit: $max_ext\n");
-out("=" x 70 . "\n");
-
-for my $device (@devices) {
-    out("\n[ $device ]\n");
-
-    my $ssh = Net::SSH::Expect->new(
-        host     => $device,
-        user     => $username,
-        password => $password,
-        raw_pty  => 1,
-        timeout  => $timeout,
-    );
-
-    my $login;
-    eval { $login = $ssh->login() };
-    if ($@ || !defined $login) {
-        out("  ERROR: Login failed - " . ($@ // 'unknown') . "\n");
-        $failed++;
-        next;
+sub collect {
+    my ($ssh, $cmd) = @_;
+    $ssh->send($cmd);
+    my $buf = "";
+    while (defined(my $line = $ssh->read_line())) {
+        last if $line =~ /^\S+[#>]\s*$/;
+        $buf .= "$line\n";
     }
-
-    $ssh->send('terminal length 0');
-    $ssh->waitfor('\$|#|>', 5);
-
-    $ssh->send("show ip ospf $process_id");
-    my $proc = $ssh->waitfor('\$|#|>', $timeout) // '';
-
-    my $router_id = ($proc =~ /Router ID (\d+\.\d+\.\d+\.\d+)/) ? $1 : 'unknown';
-    my %area_types;
-    while ($proc =~ /Area\s+(\S+).*?(?:\((\w[\w\s]+?)\))?(?:\s*$)/mg) {
-        $area_types{$1} = lc($2 // 'normal');
-    }
-    out("  Router ID: $router_id\n");
-
-    $ssh->send("show ip ospf $process_id database summary");
-    my $db_sum = $ssh->waitfor('\$|#|>', $timeout) // '';
-
-    my %lsa_counts;
-    my $cur_area = '0.0.0.0';
-
-    for my $line (split /\n/, $db_sum) {
-        $cur_area = $1 if $line =~ /Area\s+(\S+)\s+database/i;
-        if ($line =~ /Number of (\w[\w\s]+?)\s+LSA[s]?\s+(\d+)/i) {
-            $lsa_counts{$cur_area}{lc($1)} += $2;
-        }
-    }
-
-    if (!%lsa_counts) {
-        $ssh->send("show ip ospf $process_id database");
-        my $db = $ssh->waitfor('\$|#|>', $timeout) // '';
-        $cur_area = '0.0.0.0';
-        for my $line (split /\n/, $db) {
-            $cur_area = $1 if $line =~ /OSPF Router with ID.*?Area\s+\((\S+)\)/i;
-            if ($line =~ /^\s+(Router|Network|Summary Net|Summary ASB|Type-5 AS External|NSSA External)\s+Link/i) {
-                $lsa_counts{$cur_area}{lc($1)}++;
-            }
-        }
-    }
-
-    if (!%lsa_counts) {
-        out("  WARN: No LSDB data retrieved (OSPF down or process ID mismatch?)\n");
-        $anomaly++;
-        $ssh->close();
-        next;
-    }
-
-    for my $area (sort keys %lsa_counts) {
-        my $atype = $area_types{$area} // 'normal';
-        out(sprintf("  Area %-18s [%s]\n", $area, $atype));
-        for my $type (sort keys %{ $lsa_counts{$area} }) {
-            my $count = $lsa_counts{$area}{$type};
-            my $flag  = '';
-            if ($type =~ /external|type.5/i) {
-                if ($count > $max_ext) {
-                    $flag = " !! EXCEEDS LIMIT ($max_ext)";
-                    $anomaly++;
-                }
-                if ($atype =~ /stub/) {
-                    $flag .= " !! EXT LSAS IN STUB AREA";
-                    $anomaly++;
-                }
-            }
-            out(sprintf("    %-30s %5d%s\n", $type, $count, $flag));
-        }
-    }
-
-    $ssh->close();
+    return $buf;
 }
 
-out("\n" . "=" x 70 . "\n");
-out(sprintf("Devices: %d  |  Failed: %d  |  Anomalies flagged: %d\n",
-    scalar(@devices), $failed, $anomaly));
-out("=" x 70 . "\n");
+sub audit_device {
+    my ($host, $user, $pass) = @_;
+    out("\n" . "=" x 62 . "\n");
+    out("Host: $host  [" . strftime("%Y-%m-%d %H:%M:%S", localtime) . "]\n");
+    out("=" x 62 . "\n");
 
-close $log_fh if $log_fh;
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host     => $host,
+            user     => $user,
+            password => $pass,
+            raw_pty  => 1,
+            timeout  => $TIMEOUT,
+        );
+    };
+    if ($@ || !$ssh) { out("CONNECT ERROR: $@\n"); return; }
 
-exit(($failed == scalar(@devices)) ? 2 : ($anomaly ? 1 : 0));
+    eval { $ssh->login() };
+    if ($@) { out("AUTH ERROR: $@\n"); return; }
+
+    collect($ssh, "terminal length 0");
+
+    my $proc_out = collect($ssh, "show ip ospf");
+    my $db_out   = collect($ssh, "show ip ospf database database-summary");
+
+    $ssh->send("exit");
+    eval { $ssh->close() };
+
+    # Parse process header
+    my ($pid, $rid)  = ("?", "?");
+    $pid = $1 if $proc_out =~ /Routing Process "ospf (\d+)"/;
+    $rid = $1 if $proc_out =~ /Router ID(?:\s+is)?\s+([\d.]+)/;
+
+    my $spf_total = 0;
+    $spf_total += $1 while $proc_out =~ /SPF algorithm executed (\d+) times/g;
+
+    my $area_count = () = $proc_out =~ /^\s+Area\s+[\d.]+/mg;
+
+    out(sprintf("PID: %-5s  Router-ID: %-16s  Areas: %d  Total SPF runs: %d\n",
+        $pid, $rid, $area_count, $spf_total));
+
+    # Parse database-summary LSA counts per area
+    my (%lsa, $cur_area);
+    for my $line (split /\n/, $db_out) {
+        $cur_area = $1 if $line =~ /^\s*Area\s+([\d.]+)/;
+        next unless defined $cur_area;
+        for my $t (qw(Router Network Summary ASBR External NSSA Opaque)) {
+            $lsa{$cur_area}{$t} += $1 if $line =~ /^\s+$t\s+(\d+)/i;
+        }
+    }
+
+    if (!%lsa) {
+        out("No OSPF database-summary data — OSPF may not be running.\n");
+        return;
+    }
+
+    out(sprintf("\n  %-14s %6s %6s %6s %6s %6s %6s\n",
+        "Area", "Router", "Net", "Sum", "ASBR", "Ext", "NSSA"));
+    out("  " . "-" x 54 . "\n");
+
+    my @warnings;
+    for my $area (sort keys %lsa) {
+        my %c = map { $_ => ($lsa{$area}{$_} // 0) }
+                qw(Router Network Summary ASBR External NSSA);
+        out(sprintf("  %-14s %6d %6d %6d %6d %6d %6d\n",
+            $area, @c{qw(Router Network Summary ASBR External NSSA)}));
+
+        push @warnings, "Area $area: $c{External} external LSAs (threshold: $EXT_LSA_WARN)"
+            if $c{External} > $EXT_LSA_WARN;
+        push @warnings, "Area $area: ASBR LSA present but no external LSAs — check redistribution"
+            if $c{ASBR} > 0 && $c{External} == 0;
+        push @warnings, "Area $area: NSSA in use — verify stub config is consistent across all ABRs"
+            if $c{NSSA} > 0;
+    }
+
+    if (@warnings) {
+        out("\n  Warnings:\n");
+        out("    [!] $_\n") for @warnings;
+    } else {
+        out("\n  LSDB looks clean — no anomalies detected.\n");
+    }
+}
+
+# Load device list
+my @devices;
+if ($device_file) {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+    while (<$fh>) {
+        chomp; next if /^\s*[#;]/ || /^\s*$/;
+        my @f = split /\s+/, $_, 3;
+        push @devices, \@f if @f == 3;
+    }
+    close $fh;
+} elsif (@ARGV == 3) {
+    push @devices, [@ARGV[0..2]];
+} else {
+    die "Usage: $0 <host> <user> <password>\n       $0 -f devices.txt\n";
+}
+
+die "No valid device entries found.\n" unless @devices;
+
+audit_device(@$_) for @devices;
+
+out("\nLog written to: $log_file\n");
+close $LOG;
+```
+
+This script focuses on the OSPF LSDB (`show ip ospf database database-summary`) rather than neighbor state, which is what the existing `ospf_neighbors.pl`/`v2` scripts cover. It catches redistribution leaks (external LSA floods), NSSA/stub misconfigurations, and orphaned ASBR records — practical things a network engineer would actually alert on.
