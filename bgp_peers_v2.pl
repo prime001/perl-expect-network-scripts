@@ -1,26 +1,24 @@
+```perl
 #!/usr/bin/perl
 # =============================================================================
-# bgp_prefix_limit_monitor.pl — BGP Prefix-Limit Health Check
+# bgp_peer_health.pl - BGP Peer Health Monitor
 #
 # Purpose:
-#   Connects to one or more Cisco IOS/IOS-XE routers and compares each BGP
-#   neighbor's current received-prefix count against its configured maximum-
-#   prefix limit.  Peers at or above a warning threshold (default 80%) are
-#   flagged so the operator can act before the session gets torn down.
+#   Connects to one or more Cisco IOS/IOS-XE routers via SSH and checks
+#   BGP peer state. Flags any peer not in Established state, reports
+#   prefix counts, and shows session uptime. Useful for post-change
+#   verification and routine BGP health audits.
 #
 # Usage:
-#   Single device:   perl bgp_prefix_limit_monitor.pl -h 10.0.0.1
-#   Device file:     perl bgp_prefix_limit_monitor.pl -f devices.txt
-#   Custom threshold: add -t 75   (warn at 75 %)
-#   Log to file:     add -l /var/log/bgp_prefix_check.log
+#   ./bgp_peer_health.pl -h <host> [-u <user>] [-p <pass>] [-l <logfile>]
+#   ./bgp_peer_health.pl -f <hosts.txt> [-u <user>] [-p <pass>] [-l <logfile>]
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH key-based auth recommended; password auth supported via -p flag.
+#   cpan Net::SSH::Expect Getopt::Long
 #
-# Output:
-#   OK / WARN / CRIT per neighbor, plus a summary line per device.
-#   Exit code 0 = all OK, 1 = at least one WARN, 2 = at least one CRIT.
+# Hosts file format (one per line):
+#   192.168.1.1
+#   router2.example.com
 # =============================================================================
 
 use strict;
@@ -29,135 +27,118 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-# ---------------------------------------------------------------------------
-# CLI options
-# ---------------------------------------------------------------------------
-my ($host, $device_file, $username, $password, $log_file);
-my $warn_pct = 80;
+my ($host, $hosts_file, $logfile);
+my $user     = $ENV{NET_USER} || 'admin';
+my $password = $ENV{NET_PASS} || '';
+my $timeout  = 30;
 
 GetOptions(
-    'h=s' => \$host,
-    'f=s' => \$device_file,
-    'u=s' => \$username,
-    'p=s' => \$password,
-    't=i' => \$warn_pct,
-    'l=s' => \$log_file,
-) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-t warn%] [-l logfile]\n";
+    'h|host=s'     => \$host,
+    'f|file=s'     => \$hosts_file,
+    'u|user=s'     => \$user,
+    'p|pass=s'     => \$password,
+    'l|log=s'      => \$logfile,
+    't|timeout=i'  => \$timeout,
+) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-l logfile]\n";
 
-$username //= $ENV{NET_USER} // 'admin';
-die "No device specified. Use -h or -f.\n" unless $host || $device_file;
+die "Specify -h <host> or -f <hosts_file>\n" unless $host || $hosts_file;
 
-my @devices = $host ? ($host) : do {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
-};
+my @devices;
+if ($hosts_file) {
+    open(my $fh, '<', $hosts_file) or die "Cannot open $hosts_file: $!\n";
+    @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
+    close $fh;
+} else {
+    @devices = ($host);
+}
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 my $log_fh;
-if ($log_file) {
-    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
+if ($logfile) {
+    open($log_fh, '>>', $logfile) or die "Cannot open log $logfile: $!\n";
 }
 
-sub logprint {
-    my $msg = strftime("[%Y-%m-%d %H:%M:%S] ", localtime) . $_[0] . "\n";
-    print $msg;
-    print $log_fh $msg if $log_fh;
-}
+my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+output("=" x 60);
+output("BGP Peer Health Check  $timestamp");
+output("=" x 60);
 
-# ---------------------------------------------------------------------------
-# Per-device check
-# ---------------------------------------------------------------------------
-my $global_exit = 0;
+my $total_devices  = 0;
+my $total_problems = 0;
 
 for my $device (@devices) {
-    logprint("=== $device ===");
+    $total_devices++;
+    output("\n--- Device: $device ---");
 
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host        => $device,
-            user        => $username,
-            ($password ? (password => $password) : ()),
-            raw_pty     => 1,
-            timeout     => 15,
-        );
-    };
-    if ($@ || !$ssh) {
-        logprint("ERROR $device: connection failed — $@");
-        $global_exit = 2 if $global_exit < 2;
+    my $ssh = Net::SSH::Expect->new(
+        host        => $device,
+        user        => $user,
+        password    => $password,
+        raw_pty     => 1,
+        timeout     => $timeout,
+        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+    );
+
+    my $login_output;
+    eval { $login_output = $ssh->login() };
+    if ($@ || !defined $login_output) {
+        output("  ERROR: SSH connection failed to $device: $@");
+        $total_problems++;
         next;
     }
 
-    my $login = eval { $ssh->login() };
-    if ($@ || !defined $login) {
-        logprint("ERROR $device: authentication failed");
-        $global_exit = 2 if $global_exit < 2;
+    # Disable paging
+    $ssh->send('terminal length 0');
+    $ssh->waitfor('\$\s*#', $timeout);
+
+    $ssh->send('show ip bgp summary');
+    my $output = $ssh->waitfor('\$\s*#', $timeout);
+
+    unless (defined $output && length $output) {
+        output("  ERROR: No output from 'show ip bgp summary' on $device");
+        $total_problems++;
+        $ssh->close();
         next;
     }
 
-    # Disable paging so we get full output in one shot
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('\#', 5);
+    my $found_peers = 0;
+    my $problem_peers = 0;
 
-    $ssh->send("show bgp neighbors | include BGP neighbor|Prefixes Current|Maximum prefix\n");
-    my $raw = $ssh->waitfor('\#', 30) // '';
+    for my $line (split /\n/, $output) {
+        # BGP summary peer lines: IP  V  AS  MsgRcvd MsgSent TblVer InQ OutQ Up/Down  State/PfxRcd
+        next unless $line =~ /^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+(\d)\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\S+)\s+(\S+)/;
 
-    $ssh->send("exit\n");
+        my ($peer, $ver, $asn, $updown, $state) = ($1, $2, $3, $4, $5);
+        $found_peers++;
 
-    # -------------------------------------------------------------------
-    # Parse output — pull neighbor IP, current prefix count, max-prefix
-    # -------------------------------------------------------------------
-    my ($current_neighbor, %data);
-    for my $line (split /\r?\n/, $raw) {
-        if ($line =~ /BGP neighbor is (\S+)/) {
-            $current_neighbor = $1;
-            $current_neighbor =~ s/,$//;
-        }
-        # "  Prefixes Current:          45"  (IOS-XE style)
-        if ($current_neighbor && $line =~ /Prefixes Current:\s+(\d+)/) {
-            $data{$current_neighbor}{current} = $1;
-        }
-        # "  Maximum prefix limit:    100"  or  "maximum 100 ..."
-        if ($current_neighbor && $line =~ /[Mm]aximum.*?(\d+)/) {
-            $data{$current_neighbor}{max} //= $1;
-        }
-    }
-
-    if (!%data) {
-        logprint("INFO $device: no BGP neighbors found or no prefix-limit configured");
-        next;
-    }
-
-    my ($ok, $warn, $crit) = (0, 0, 0);
-    for my $nbr (sort keys %data) {
-        my $cur = $data{$nbr}{current} // 0;
-        my $max = $data{$nbr}{max};
-
-        unless (defined $max && $max > 0) {
-            logprint("INFO $device neighbor $nbr: current=$cur  max=unlimited");
-            next;
-        }
-
-        my $pct = int($cur / $max * 100);
-        my $status;
-        if ($pct >= 100) {
-            $status = 'CRIT';
-            $crit++;
-            $global_exit = 2 if $global_exit < 2;
-        } elsif ($pct >= $warn_pct) {
-            $status = 'WARN';
-            $warn++;
-            $global_exit = 1 if $global_exit < 1;
+        if ($state =~ /^\d+$/) {
+            output(sprintf("  %-18s AS%-8s  Established  uptime=%-12s prefixes=%s", $peer, $asn, $updown, $state));
         } else {
-            $status = 'OK  ';
-            $ok++;
+            output(sprintf("  %-18s AS%-8s  *** %-12s uptime=%-12s ***", $peer, $asn, $state, $updown));
+            $problem_peers++;
+            $total_problems++;
         }
-        logprint("$status $device neighbor $nbr: $cur/$max prefixes ($pct%)");
     }
 
-    logprint("SUMMARY $device: OK=$ok WARN=$warn CRIT=$crit");
+    if ($found_peers == 0) {
+        output("  No BGP peers found (BGP may not be configured)");
+    } else {
+        output("  Summary: $found_peers peer(s), $problem_peers not Established");
+    }
+
+    $ssh->send('exit');
+    $ssh->close();
 }
 
+output("\n" . "=" x 60);
+output("Checked $total_devices device(s)  |  Problems found: $total_problems");
+output("=" x 60);
+
 close $log_fh if $log_fh;
-exit $global_exit;
+exit($total_problems ? 1 : 0);
+
+sub output {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $log_fh "$msg\n" if $log_fh;
+}
+```
