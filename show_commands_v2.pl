@@ -1,167 +1,161 @@
+```perl
 #!/usr/bin/perl
-#
-# cpu_mem_health.pl - Cisco IOS CPU and Memory Health Check
-#
-# Purpose:
-#   Connects to one or more Cisco IOS devices via SSH and collects CPU
-#   utilization (5-second, 1-minute, 5-minute averages) and processor memory
-#   statistics (used/free). Flags any device exceeding configurable thresholds
-#   and exits non-zero if warnings exist, making it suitable for cron/monitoring.
-#
-# Usage:
-#   Single device:  ./cpu_mem_health.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:    ./cpu_mem_health.pl -f devices.txt -u admin -p secret
-#   With log:       ./cpu_mem_health.pl -h 192.168.1.1 -u admin -p secret -l health.log
-#   Thresholds:     ./cpu_mem_health.pl -h 192.168.1.1 -u admin -p secret --cpu-warn 70 --mem-warn 80
-#
-# Device file format: one IP or hostname per line; lines starting with # are skipped.
-#
-# Prerequisites:
-#   cpan install Net::SSH::Expect
-#   Target devices: SSH enabled, user needs at minimum privilege level 1.
-#   For enable mode (show processes memory requires priv 15 on some platforms),
-#   supply -e with the enable password.
+=head1
+SPANNING TREE PROTOCOL (STP) AUDIT SCRIPT
+Audits STP topology, bridge priorities, port roles, and topology change counts
+PURPOSE: Collect and analyze Spanning Tree configuration and operational status
+USAGE: ./stp_audit.pl --device 192.168.1.1 [--user admin] [--pass secret] [--log stp_audit.log]
+       ./stp_audit.pl --file devices.txt [--user admin] [--pass secret]
+PREREQUISITES: Perl Expect module (cpan Expect), SSH access with privileged exec
+OUTPUT: Console summary + detailed log file showing bridge priority, port roles, and topology health
+=cut
 
 use strict;
 use warnings;
-use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
+use Expect;
+use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $device_file, $username, $password, $enable_pw, $log_file);
-my $cpu_warn = 80;
-my $mem_warn = 85;
-my $timeout  = 30;
-
+my ($device, $device_file, $user, $pass, $logfile, $timeout);
 GetOptions(
-    'h|host=s'    => \$host,
-    'f|file=s'    => \$device_file,
-    'u|user=s'    => \$username,
-    'p|pass=s'    => \$password,
-    'e|enable=s'  => \$enable_pw,
-    'l|log=s'     => \$log_file,
-    'cpu-warn=i'  => \$cpu_warn,
-    'mem-warn=i'  => \$mem_warn,
-    't|timeout=i' => \$timeout,
-) or usage();
+    'device=s'  => \$device,
+    'file=s'    => \$device_file,
+    'user=s'    => \$user,
+    'pass=s'    => \$pass,
+    'log=s'     => \$logfile,
+    'timeout=i' => \$timeout,
+    'help'      => sub { print_usage(); exit 0; }
+) or die "Error in command line arguments\n";
 
-usage() unless ($host || $device_file) && $username && $password;
+$user    //= 'admin';
+$timeout //= 10;
 
-my @devices;
-if ($host) {
-    push @devices, $host;
-} else {
+die "Usage: stp_audit.pl --device <IP> | --file <list>\n" unless $device || $device_file;
+
+my @devices = $device ? ($device) : do {
     open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; push @devices, $_ unless /^\s*#/ || /^\s*$/ }
+    my @list = grep { !/^#/ && !/^\s*$/ } <$fh>;
+    chomp @list;
     close $fh;
-}
-die "No devices to check\n" unless @devices;
+    @list;
+};
 
 my $log_fh;
-if ($log_file) {
-    open $log_fh, '>>', $log_file or die "Cannot open $log_file: $!\n";
+if ($logfile) {
+    open $log_fh, '>>', $logfile or die "Cannot open $logfile: $!\n";
+    print $log_fh "\n" . "="x70 . "\n";
+    print $log_fh "STP AUDIT - " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n";
+    print $log_fh "="x70 . "\n";
 }
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-out("=" x 70);
-out("CPU/Memory Health Check  $ts");
-out("Thresholds: CPU >= ${cpu_warn}%   Memory used >= ${mem_warn}%");
-out("=" x 70);
-out(sprintf("%-22s  %-28s  %s", "Device", "CPU (5s/1m/5m)", "Memory Used%"));
-out("-" x 70);
-
-my ($n_ok, $n_warn, $n_err) = (0, 0, 0);
-
-for my $dev (@devices) {
-    my $r = poll_device($dev);
-    if ($r->{error}) {
-        out(sprintf("%-22s  ERROR: %s", $dev, $r->{error}));
-        $n_err++;
-        next;
-    }
-    my $cpu_tag = $r->{cpu_5min} >= $cpu_warn ? ' [WARN]' : '';
-    my $mem_tag = $r->{mem_pct}  >= $mem_warn ? ' [WARN]' : '';
-    out(sprintf("%-22s  %3d%% / %3d%% / %3d%%%-8s  %3d%%%s",
-        $dev,
-        $r->{cpu_5sec}, $r->{cpu_1min}, $r->{cpu_5min}, $cpu_tag,
-        $r->{mem_pct}, $mem_tag,
-    ));
-    ($cpu_tag || $mem_tag) ? $n_warn++ : $n_ok++;
+foreach my $host (@devices) {
+    audit_stp_device($host, $user, $pass, $timeout, $log_fh);
 }
 
-out("=" x 70);
-out(sprintf("Summary: %d OK  %d WARNING  %d ERROR  (%d total)",
-    $n_ok, $n_warn, $n_err, scalar @devices));
 close $log_fh if $log_fh;
-exit(($n_warn + $n_err) ? 1 : 0);
+print "\n[*] Audit complete.\n";
 
-# -----------------------------------------------------------------------
-
-sub poll_device {
-    my ($dev) = @_;
-    my %r = (cpu_5sec => 0, cpu_1min => 0, cpu_5min => 0, mem_pct => 0);
-
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host     => $dev,
-            user     => $username,
-            password => $password,
-            raw_pty  => 1,
-            timeout  => $timeout,
+sub audit_stp_device {
+    my ($host, $user, $pass, $timeout, $log) = @_;
+    
+    print "\n[*] Connecting to $host...\n";
+    log_output($log, "[*] Connecting to $host");
+    
+    my $exp = Expect->new();
+    $exp->log_stdout(0);
+    $exp->set_timeout($timeout);
+    
+    eval {
+        $exp->spawn("ssh -o ConnectTimeout=$timeout -o StrictHostKeyChecking=no $user\@$host")
+            or die "Cannot spawn SSH: $!\n";
+        
+        $exp->expect($timeout, ['password:', 'Password:'])
+            or die "No password prompt\n";
+        
+        $exp->send("$pass\n");
+        $exp->expect($timeout, ['#', '>', '\$'])
+            or die "No command prompt after authentication\n";
+        
+        $exp->send("terminal length 0\n");
+        $exp->expect($timeout, ['#', '>', '\$']);
+        
+        my @commands = (
+            'show spanning-tree summary',
+            'show spanning-tree bridge',
+            'show spanning-tree interface status'
         );
+        
+        print "\n[+] STP Audit Results: $host\n";
+        log_output($log, "\n[+] STP Audit Results: $host");
+        
+        foreach my $cmd (@commands) {
+            $exp->clear_accumulators();
+            $exp->send("$cmd\n");
+            $exp->expect($timeout, ['#', '>', '\$']);
+            my $output = $exp->before();
+            
+            print "\n[$cmd]\n";
+            log_output($log, "\n[$cmd]");
+            
+            my @lines = split /\n/, $output;
+            foreach my $line (@lines) {
+                next if $line =~ /^\s*$/ || $line =~ /^$cmd$/ || $line =~ /^$host/;
+                
+                if ($line =~ /Bridge|Priority|Port|Role|State|Cost|VLAN|Topology|Changes/) {
+                    my $display = "  $line";
+                    print "$display\n";
+                    log_output($log, $display);
+                }
+            }
+        }
+        
+        $exp->send("exit\n");
+        $exp->soft_close();
+        print "[+] Completed $host\n";
+        log_output($log, "[+] Completed $host");
+        
+    } or do {
+        my $error = $@;
+        print "[-] Error connecting to $host: $error\n";
+        log_output($log, "[-] Error connecting to $host: $error");
     };
-    return { error => "SSH init: $@" } if $@;
-
-    my $banner = eval { $ssh->login() };
-    return { error => 'Login failed (bad credentials or unreachable)' }
-        unless defined $banner && $banner !~ /[Pp]assword:\s*$/;
-
-    if ($enable_pw) {
-        $ssh->send('enable');
-        $ssh->waitfor('[Pp]assword', 5);
-        $ssh->send($enable_pw);
-        $ssh->waitfor('#', 10) or return { error => 'Enable mode failed' };
-    }
-
-    $ssh->exec('terminal length 0');
-
-    my $cpu = $ssh->exec('show processes cpu | include CPU utilization');
-    # IOS: "CPU utilization for five seconds: 4%/0%; one minute: 6%; five minutes: 5%"
-    if ($cpu && $cpu =~ /five seconds:\s*(\d+)%.*?one minute:\s*(\d+)%.*?five minutes:\s*(\d+)%/i) {
-        @r{qw(cpu_5sec cpu_1min cpu_5min)} = ($1, $2, $3);
-    }
-
-    my $mem = $ssh->exec('show processes memory | include ^Processor');
-    # IOS: "Processor  <total>  <used>  <free>  <largest>  <available>"
-    if ($mem && $mem =~ /Processor\s+(\d+)\s+(\d+)\s+(\d+)/i) {
-        my ($total, $used) = ($1, $2);
-        $r{mem_pct} = $total > 0 ? int($used / $total * 100 + 0.5) : 0;
-    }
-
-    eval { $ssh->close() };
-    return \%r;
 }
 
-sub out {
-    my ($line) = @_;
-    print "$line\n";
-    print $log_fh "$line\n" if $log_fh;
+sub log_output {
+    my ($fh, $msg) = @_;
+    return unless $fh;
+    print $fh "$msg\n";
 }
 
-sub usage {
-    die <<'END';
-Usage: cpu_mem_health.pl -h <host> | -f <file> -u <user> -p <pass> [options]
+sub print_usage {
+    print <<'EOF';
+STP AUDIT - Spanning Tree Protocol Configuration and Status Audit
 
-  -h, --host       Single device IP or hostname
-  -f, --file       File listing devices (one per line, # for comments)
-  -u, --user       SSH username
-  -p, --pass       SSH password
-  -e, --enable     Enable password (required for full memory stats on some IOS)
-  -l, --log        Append results to log file
-  --cpu-warn <n>   CPU 5-minute % threshold for warning (default: 80)
-  --mem-warn <n>   Memory used % threshold for warning (default: 85)
-  -t, --timeout    SSH timeout seconds (default: 30)
+USAGE:
+  stp_audit.pl --device <IP|hostname> [--user admin] [--pass secret] [--log stp.log]
+  stp_audit.pl --file devices.txt [--user admin] [--pass secret] [--log stp.log]
 
-Exit codes: 0 = all OK,  1 = one or more warnings or errors
-END
+OPTIONS:
+  --device    Target device IP or hostname
+  --file      File containing device list (one per line, # for comments)
+  --user      SSH username (default: admin)
+  --pass      SSH password
+  --log       Optional output log file (appends results)
+  --timeout   SSH timeout in seconds (default: 10)
+  --help      Show this help message
+
+EXAMPLES:
+  stp_audit.pl --device 10.1.1.1 --user admin --pass MyPass123 --log results.log
+  stp_audit.pl --file switches.txt --user netadmin --log stp_audit.log
+
+PREREQUISITES:
+  - Perl Expect module: cpan Expect
+  - SSH access to Cisco/vendor network devices
+  - User account with exec/privileged access
+  - Device running Spanning Tree (PVST+, RSTP, MST)
+
+OUTPUT:
+  Displays and logs: Bridge priority, STP mode, port roles/states, topology changes
+EOF
 }
+```
