@@ -1,165 +1,161 @@
-The repo context in the prompt is a GitHub portfolio repo, not this local project. I'll generate the script content directly.
+Since I can't write to that path, here is the script content as requested:
 
-```perl
 #!/usr/bin/perl
-# ospf_lsdb_summary.pl - OSPF Link State Database Summarizer
+# cdp_neighbors.pl - CDP/LLDP Neighbor Discovery and Topology Mapper
 #
-# Purpose:
-#   Audits the OSPF LSDB on Cisco IOS/IOS-XE routers. Reports LSA counts
-#   by type per area, flags excessive external LSAs (possible redistribution
-#   leak), NSSA areas, and ASBRs with no matching external LSAs. Complements
-#   ospf_neighbors.pl (neighbor state) with database-level visibility.
+# PURPOSE:
+#   Collects CDP and LLDP neighbor information from Cisco IOS/NX-OS devices
+#   to build a layer-2 adjacency map. Useful for topology validation,
+#   change-impact analysis, and discovering undocumented links.
 #
-# Usage:
-#   Single device:  ./ospf_lsdb_summary.pl <host> <user> <password>
-#   Device file:    ./ospf_lsdb_summary.pl -f devices.txt
+# USAGE:
+#   Single device:   ./cdp_neighbors.pl -h 192.168.1.1 -u admin -p secret
+#   Device list:     ./cdp_neighbors.pl -f devices.txt -u admin -p secret
+#   With log file:   ./cdp_neighbors.pl -h 10.0.0.1 -u admin -p secret -l neighbors.log
+#   LLDP mode:       ./cdp_neighbors.pl -h 10.0.0.1 -u admin -p secret --lldp
 #
-#   Device file format (one per line, whitespace-delimited):
-#     <host> <user> <password>
+# PREREQUISITES:
+#   cpanm Net::SSH::Expect
+#   SSH access to target devices (port 22)
+#   Account with at minimum 'show' privilege level
 #
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#
-# Output:
-#   STDOUT + ospf_lsdb_YYYYMMDD_HHMMSS.log
+# OUTPUT:
+#   Tabular neighbor summary with local port, remote device, remote port,
+#   platform, and management IP.
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use POSIX qw(strftime);
 use Getopt::Long;
+use POSIX qw(strftime);
 
-my $TIMEOUT      = 20;
-my $EXT_LSA_WARN = 500;
+my ($host, $user, $pass, $device_file, $log_file, $use_lldp, $timeout);
+$timeout = 30;
 
-my $device_file;
-GetOptions('f=s' => \$device_file)
-    or die "Usage: $0 [-f devices.txt] [host user password]\n";
+GetOptions(
+    'h|host=s'     => \$host,
+    'u|user=s'     => \$user,
+    'p|pass=s'     => \$pass,
+    'f|file=s'     => \$device_file,
+    'l|log=s'      => \$log_file,
+    'lldp'         => \$use_lldp,
+    't|timeout=i'  => \$timeout,
+) or die "Usage: $0 -h HOST -u USER -p PASS [-f FILE] [-l LOGFILE] [--lldp]\n";
 
-my $log_file = "ospf_lsdb_" . strftime("%Y%m%d_%H%M%S", localtime) . ".log";
-open(my $LOG, '>', $log_file) or die "Cannot open log $log_file: $!\n";
+die "Provide -h HOST or -f FILE\n" unless $host || $device_file;
+die "Username required (-u)\n"     unless $user;
+die "Password required (-p)\n"     unless $pass;
 
-sub out {
-    print @_;
-    print $LOG @_;
+my @devices = $host ? ($host) : do {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
+};
+
+my $log_fh;
+if ($log_file) {
+    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
 }
 
-sub collect {
-    my ($ssh, $cmd) = @_;
-    $ssh->send($cmd);
-    my $buf = "";
-    while (defined(my $line = $ssh->read_line())) {
-        last if $line =~ /^\S+[#>]\s*$/;
-        $buf .= "$line\n";
-    }
-    return $buf;
+sub output {
+    my $msg = shift;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
 
-sub audit_device {
-    my ($host, $user, $pass) = @_;
-    out("\n" . "=" x 62 . "\n");
-    out("Host: $host  [" . strftime("%Y-%m-%d %H:%M:%S", localtime) . "]\n");
-    out("=" x 62 . "\n");
+sub collect_neighbors {
+    my ($device) = @_;
+    my $cmd      = $use_lldp ? 'show lldp neighbors detail' : 'show cdp neighbors detail';
+    my $protocol = $use_lldp ? 'LLDP' : 'CDP';
 
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host     => $host,
-            user     => $user,
-            password => $pass,
-            raw_pty  => 1,
-            timeout  => $TIMEOUT,
-        );
+    my $ssh = Net::SSH::Expect->new(
+        host        => $device,
+        user        => $user,
+        password    => $pass,
+        raw_pty     => 1,
+        timeout     => $timeout,
+        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+    );
+
+    eval {
+        my $login = $ssh->login();
+        die "Auth failed" unless $login =~ /[>#]/;
     };
-    if ($@ || !$ssh) { out("CONNECT ERROR: $@\n"); return; }
-
-    eval { $ssh->login() };
-    if ($@) { out("AUTH ERROR: $@\n"); return; }
-
-    collect($ssh, "terminal length 0");
-
-    my $proc_out = collect($ssh, "show ip ospf");
-    my $db_out   = collect($ssh, "show ip ospf database database-summary");
-
-    $ssh->send("exit");
-    eval { $ssh->close() };
-
-    # Parse process header
-    my ($pid, $rid)  = ("?", "?");
-    $pid = $1 if $proc_out =~ /Routing Process "ospf (\d+)"/;
-    $rid = $1 if $proc_out =~ /Router ID(?:\s+is)?\s+([\d.]+)/;
-
-    my $spf_total = 0;
-    $spf_total += $1 while $proc_out =~ /SPF algorithm executed (\d+) times/g;
-
-    my $area_count = () = $proc_out =~ /^\s+Area\s+[\d.]+/mg;
-
-    out(sprintf("PID: %-5s  Router-ID: %-16s  Areas: %d  Total SPF runs: %d\n",
-        $pid, $rid, $area_count, $spf_total));
-
-    # Parse database-summary LSA counts per area
-    my (%lsa, $cur_area);
-    for my $line (split /\n/, $db_out) {
-        $cur_area = $1 if $line =~ /^\s*Area\s+([\d.]+)/;
-        next unless defined $cur_area;
-        for my $t (qw(Router Network Summary ASBR External NSSA Opaque)) {
-            $lsa{$cur_area}{$t} += $1 if $line =~ /^\s+$t\s+(\d+)/i;
-        }
-    }
-
-    if (!%lsa) {
-        out("No OSPF database-summary data — OSPF may not be running.\n");
+    if ($@) {
+        output(sprintf "[%-20s] ERROR: Cannot connect - %s\n", $device, $@);
         return;
     }
 
-    out(sprintf("\n  %-14s %6s %6s %6s %6s %6s %6s\n",
-        "Area", "Router", "Net", "Sum", "ASBR", "Ext", "NSSA"));
-    out("  " . "-" x 54 . "\n");
+    $ssh->send('terminal length 0');
+    $ssh->waitfor('\s*[>#]', 5);
+    $ssh->send($cmd);
+    my $output = $ssh->waitfor('\s*[>#]', $timeout);
+    $ssh->send('exit');
+    $ssh->close();
 
-    my @warnings;
-    for my $area (sort keys %lsa) {
-        my %c = map { $_ => ($lsa{$area}{$_} // 0) }
-                qw(Router Network Summary ASBR External NSSA);
-        out(sprintf("  %-14s %6d %6d %6d %6d %6d %6d\n",
-            $area, @c{qw(Router Network Summary ASBR External NSSA)}));
+    return parse_neighbors($device, $output, $protocol);
+}
 
-        push @warnings, "Area $area: $c{External} external LSAs (threshold: $EXT_LSA_WARN)"
-            if $c{External} > $EXT_LSA_WARN;
-        push @warnings, "Area $area: ASBR LSA present but no external LSAs — check redistribution"
-            if $c{ASBR} > 0 && $c{External} == 0;
-        push @warnings, "Area $area: NSSA in use — verify stub config is consistent across all ABRs"
-            if $c{NSSA} > 0;
+sub parse_neighbors {
+    my ($device, $raw, $protocol) = @_;
+    my @neighbors;
+    my %current;
+
+    for my $line (split /\n/, $raw) {
+        $line =~ s/\r//g;
+
+        if ($protocol eq 'CDP') {
+            $current{device_id} = $1 if $line =~ /^Device ID:\s*(\S+)/;
+            $current{mgmt_ip}   = $1 if $line =~ /IP(?:v4)? [Aa]ddress:\s*(\d+\.\d+\.\d+\.\d+)/;
+            $current{platform}  = $1 if $line =~ /Platform:\s*([^,]+)/;
+            $current{local_if}  = $1 if $line =~ /Interface:\s*(\S+),/;
+            $current{remote_if} = $1 if $line =~ /Port ID \(outgoing port\):\s*(\S+)/;
+        } else {
+            $current{device_id} = $1 if $line =~ /System Name:\s*(\S+)/;
+            $current{mgmt_ip}   = $1 if $line =~ /Management Addresses.*?(\d+\.\d+\.\d+\.\d+)/s;
+            $current{platform}  = $1 if $line =~ /System Description:\s*(.+)/;
+            $current{local_if}  = $1 if $line =~ /Local Intf:\s*(\S+)/;
+            $current{remote_if} = $1 if $line =~ /Port id:\s*(\S+)/;
+        }
+
+        if ($line =~ /^-{3,}/ && %current && $current{device_id}) {
+            push @neighbors, {%current};
+            %current = ();
+        }
+    }
+    push @neighbors, {%current} if %current && $current{device_id};
+
+    return ($device, \@neighbors);
+}
+
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+output("\n=== CDP/LLDP Neighbor Discovery  [$ts] ===\n");
+output(sprintf "%-20s %-22s %-20s %-22s %-16s\n",
+    'Source Device', 'Local Interface', 'Neighbor', 'Remote Interface', 'Mgmt IP');
+output('-' x 102 . "\n");
+
+my $total_neighbors = 0;
+for my $device (@devices) {
+    my ($src, $neighbors) = collect_neighbors($device);
+    next unless defined $neighbors;
+
+    if (!@$neighbors) {
+        output(sprintf "%-20s  No %s neighbors found\n", $device, $use_lldp ? 'LLDP' : 'CDP');
+        next;
     }
 
-    if (@warnings) {
-        out("\n  Warnings:\n");
-        out("    [!] $_\n") for @warnings;
-    } else {
-        out("\n  LSDB looks clean — no anomalies detected.\n");
+    for my $n (@$neighbors) {
+        output(sprintf "%-20s %-22s %-20s %-22s %-16s\n",
+            $device,
+            $n->{local_if}  // 'unknown',
+            $n->{device_id} // 'unknown',
+            $n->{remote_if} // 'unknown',
+            $n->{mgmt_ip}   // 'N/A',
+        );
+        $total_neighbors++;
     }
 }
 
-# Load device list
-my @devices;
-if ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) {
-        chomp; next if /^\s*[#;]/ || /^\s*$/;
-        my @f = split /\s+/, $_, 3;
-        push @devices, \@f if @f == 3;
-    }
-    close $fh;
-} elsif (@ARGV == 3) {
-    push @devices, [@ARGV[0..2]];
-} else {
-    die "Usage: $0 <host> <user> <password>\n       $0 -f devices.txt\n";
-}
-
-die "No valid device entries found.\n" unless @devices;
-
-audit_device(@$_) for @devices;
-
-out("\nLog written to: $log_file\n");
-close $LOG;
-```
-
-This script focuses on the OSPF LSDB (`show ip ospf database database-summary`) rather than neighbor state, which is what the existing `ospf_neighbors.pl`/`v2` scripts cover. It catches redistribution leaks (external LSA floods), NSSA/stub misconfigurations, and orphaned ASBR records — practical things a network engineer would actually alert on.
+output('-' x 102 . "\n");
+output(sprintf "Total neighbors discovered: %d across %d device(s)\n", $total_neighbors, scalar @devices);
+output("Log written to: $log_file\n") if $log_file;
+close $log_fh if $log_fh;
