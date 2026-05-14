@@ -1,30 +1,32 @@
+Here's the complete script content for `stp_health_check.pl`:
+
+```perl
 #!/usr/bin/perl
 #
-# cpu_mem_check.pl - Cisco IOS CPU and Memory Utilization Health Check
+# stp_health_check.pl - Spanning Tree Protocol Health Audit
 #
-# PURPOSE:
-#   Connects to one or more Cisco IOS/IOS-XE devices and collects CPU load
-#   (5-sec, 1-min, 5-min) plus processor memory utilization. Flags devices
-#   that exceed configurable thresholds so operators can act before outages.
+# Purpose:
+#   Connects to one or more Cisco IOS/IOS-XE switches via SSH and audits the
+#   Spanning Tree topology for common issues: unexpected root bridges, ports
+#   stuck in non-forwarding states, high topology change counts, and
+#   mismatched STP mode (PVST vs RSTP vs MST).
 #
-# USAGE:
-#   Single device:    ./cpu_mem_check.pl -h 192.168.1.1 -u admin -p secret
-#   Device list file: ./cpu_mem_check.pl -f devices.txt -u admin -p secret
-#   With log output:  ./cpu_mem_check.pl -f devices.txt -u admin -p secret -l health.log
-#   Custom threshold: ./cpu_mem_check.pl -f devices.txt -u admin -p secret --cpu-warn 70 --mem-warn 85
+# Usage:
+#   Single device:   ./stp_health_check.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:     ./stp_health_check.pl -f devices.txt -u admin -p secret
+#   With log:        ./stp_health_check.pl -f devices.txt -u admin -p secret -l stp_audit.log
+#   Expected root:   ./stp_health_check.pl -h 10.0.0.1 -u admin -p secret -r 10.0.0.254
 #
-# DEVICE FILE FORMAT (one IP or hostname per line, blank lines and # ignored):
+# Device file format (one IP/hostname per line, blank lines and # comments ignored):
 #   192.168.1.1
 #   192.168.1.2
-#   core-router-01
 #
-# PREREQUISITES:
-#   cpan Net::SSH::Expect Getopt::Long
-#   SSH key auth or password auth must work for the target user account.
+# Prerequisites:
+#   cpan Net::SSH::Expect
+#   SSH access to target devices with privilege-exec enabled
+#   Devices must support: show spanning-tree summary, show spanning-tree detail
 #
-# EXIT CODES:
-#   0 - All devices within thresholds
-#   1 - One or more devices exceeded threshold or had connection errors
+# Exit codes: 0=clean, 1=issues found, 2=fatal error
 
 use strict;
 use warnings;
@@ -32,110 +34,139 @@ use Net::SSH::Expect;
 use Getopt::Long qw(:config no_ignore_case);
 use POSIX qw(strftime);
 
-my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_log);
-my $cpu_warn = 80;
-my $mem_warn = 90;
-my $timeout  = 20;
+my ($host, $device_file, $username, $password, $logfile, $expected_root);
+my $timeout = 15;
 
 GetOptions(
-    'h|host=s'     => \$opt_host,
-    'f|file=s'     => \$opt_file,
-    'u|user=s'     => \$opt_user,
-    'p|pass=s'     => \$opt_pass,
-    'l|log=s'      => \$opt_log,
-    'cpu-warn=i'   => \$cpu_warn,
-    'mem-warn=i'   => \$mem_warn,
+    'h|host=s'     => \$host,
+    'f|file=s'     => \$device_file,
+    'u|user=s'     => \$username,
+    'p|pass=s'     => \$password,
+    'l|log=s'      => \$logfile,
+    'r|root=s'     => \$expected_root,
     't|timeout=i'  => \$timeout,
-) or die "Usage: $0 [-h host|-f file] -u user -p pass [-l logfile] [--cpu-warn N] [--mem-warn N]\n";
+) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOGFILE] [-r EXPECTED_ROOT]\n";
 
-die "ERROR: Provide -h HOST or -f FILE\n"  unless $opt_host || $opt_file;
-die "ERROR: -u USER is required\n"         unless $opt_user;
-die "ERROR: -p PASS is required\n"         unless $opt_pass;
+die "Specify -h HOST or -f FILE\n"    unless $host || $device_file;
+die "Username required (-u)\n"        unless $username;
+die "Password required (-p)\n"        unless $password;
 
 my @devices;
-if ($opt_host) {
-    push @devices, $opt_host;
-} else {
-    open my $fh, '<', $opt_file or die "Cannot open $opt_file: $!\n";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if length }
+if ($device_file) {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_; }
     close $fh;
+} else {
+    @devices = ($host);
 }
 
 my $log_fh;
-if ($opt_log) {
-    open $log_fh, '>', $opt_log or die "Cannot open log $opt_log: $!\n";
+if ($logfile) {
+    open $log_fh, '>', $logfile or die "Cannot open log $logfile: $!\n";
 }
+
+my $ts      = strftime("%Y-%m-%d %H:%M:%S", localtime);
+my $issues  = 0;
 
 sub out {
-    print @_;
-    print $log_fh @_ if $log_fh;
+    my $msg = shift;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-out("=" x 72 . "\n");
-out("CPU/Memory Health Check  |  $ts\n");
-out(sprintf("Thresholds: CPU >= %d%%  |  Memory >= %d%%\n", $cpu_warn, $mem_warn));
-out("=" x 72 . "\n");
-out(sprintf("%-20s  %6s %6s %6s  %7s  %s\n", 'Device', '5sec%', '1min%', '5min%', 'Mem%', 'Status'));
-out("-" x 72 . "\n");
+out("=" x 65 . "\n");
+out("STP Health Audit  $ts\n");
+out("Devices: " . scalar(@devices) . "  Expected root: " . ($expected_root // "any") . "\n");
+out("=" x 65 . "\n\n");
 
-my $exit_code = 0;
-
-for my $host (@devices) {
-    my ($cpu5s, $cpu1m, $cpu5m, $mem_pct) = (undef, undef, undef, undef);
-    my $status = 'OK';
-
+for my $dev (@devices) {
+    out("--- $dev ---\n");
     my $ssh = eval {
         Net::SSH::Expect->new(
-            host        => $host,
-            user        => $opt_user,
-            password    => $opt_pass,
+            host        => $dev,
+            user        => $username,
+            password     => $password,
             raw_pty     => 1,
             timeout     => $timeout,
-            ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
         );
     };
-    if ($@ || !$ssh) { out(sprintf("%-20s  %s\n", $host, "CONNECT ERROR: $@")); $exit_code = 1; next }
-
-    my $login_ok = eval { $ssh->login() };
-    if ($@ || !$login_ok) { out(sprintf("%-20s  %s\n", $host, "AUTH ERROR")); $exit_code = 1; next }
-
-    $ssh->exec('terminal length 0');
-
-    my $cpu_out = $ssh->exec('show processes cpu sorted | head lines 5');
-    if ($cpu_out =~ /CPU utilization for five seconds:\s*(\d+)%.*?one minute:\s*(\d+)%.*?five minutes:\s*(\d+)%/s) {
-        ($cpu5s, $cpu1m, $cpu5m) = ($1, $2, $3);
+    if ($@ || !$ssh) {
+        out("  [ERROR] SSH init failed: $@\n\n");
+        $issues++;
+        next;
     }
 
-    my $ver_out = $ssh->exec('show version | include bytes of memory');
-    if ($ver_out =~ /(\d+)K\/(\d+)K bytes of memory/) {
-        my $total = $1 + $2;
-        $mem_pct = int($1 / $total * 100) if $total > 0;
-    } elsif ($ver_out =~ /(\d+) bytes of physical memory/) {
-        my $mem2 = $ssh->exec('show processes memory sorted | head lines 3');
-        if ($mem2 =~ /Processor\s+\d+\s+(\d+)\s+(\d+)/) {
-            my $used = $1; my $free = $2;
-            my $total = $used + $free;
-            $mem_pct = int($used / $total * 100) if $total > 0;
+    my $login = eval { $ssh->login() };
+    if ($@ || !$login) {
+        out("  [ERROR] Auth failed or timed out\n\n");
+        $issues++;
+        next;
+    }
+
+    $ssh->exec("terminal length 0");
+
+    my $summary = $ssh->exec("show spanning-tree summary") // "";
+    my $detail  = $ssh->exec("show spanning-tree detail")  // "";
+    $ssh->close();
+
+    # Parse STP mode
+    my $mode = "unknown";
+    $mode = "PVST+"  if $summary =~ /Switch is in pvst mode/i;
+    $mode = "RPVST+" if $summary =~ /Switch is in rapid-pvst mode/i;
+    $mode = "MST"    if $summary =~ /Switch is in mst mode/i;
+    out("  Mode       : $mode\n");
+
+    # Count blocking/listening ports
+    my $blocking_count  = () = $summary =~ /\bBLK\b/g;
+    my $listening_count = () = $summary =~ /\bLIS\b/g;
+
+    # Extract root bridge addresses per VLAN
+    my %roots;
+    while ($summary =~ /^(?:VLAN\S+)\s+(\S+)\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)/mg) {
+        $roots{$2}++ if $1 eq 'root';
+    }
+
+    # Topology change counts from detail output
+    my $tc_total = 0;
+    $tc_total += $1 while $detail =~ /(\d+) topology changes/g;
+
+    # Root bridge check
+    my @root_list = keys %roots;
+    if ($expected_root && @root_list) {
+        my @wrong = grep { $_ ne $expected_root } @root_list;
+        if (@wrong) {
+            out("  [WARN]  Unexpected root(s): " . join(", ", @wrong) . "\n");
+            $issues++;
+        } else {
+            out("  Root(s)    : " . join(", ", @root_list) . " [OK]\n");
         }
+    } elsif (@root_list) {
+        out("  Root(s)    : " . join(", ", @root_list) . "\n");
     }
 
-    $ssh->exec('exit');
+    out("  Blocking   : $blocking_count port(s)" . ($blocking_count > 0 ? " [check if expected]\n" : "\n"));
+    if ($listening_count > 0) {
+        out("  [WARN]  $listening_count port(s) in LISTENING state (topology flux?)\n");
+        $issues++;
+    }
+    if ($tc_total > 100) {
+        out("  [WARN]  High topology change count: $tc_total (loop or flap suspected)\n");
+        $issues++;
+    } elsif ($tc_total > 0) {
+        out("  TC count   : $tc_total\n");
+    }
 
-    my $alert = '';
-    if (defined $cpu5m && $cpu5m >= $cpu_warn) { $status = 'WARN-CPU'; $alert .= " cpu5m=${cpu5m}%"; $exit_code = 1 }
-    if (defined $mem_pct && $mem_pct >= $mem_warn) { $status = 'WARN-MEM'; $alert .= " mem=${mem_pct}%"; $exit_code = 1 }
-
-    out(sprintf("%-20s  %6s %6s %6s  %7s  %s%s\n",
-        $host,
-        defined $cpu5s  ? "${cpu5s}%"  : 'N/A',
-        defined $cpu1m  ? "${cpu1m}%"  : 'N/A',
-        defined $cpu5m  ? "${cpu5m}%"  : 'N/A',
-        defined $mem_pct ? "${mem_pct}%" : 'N/A',
-        $status, $alert));
+    out("\n");
 }
 
-out("-" x 72 . "\n");
-out(sprintf("Checked %d device(s)  |  Exit: %s\n", scalar @devices, $exit_code ? 'WARN' : 'OK'));
+out("=" x 65 . "\n");
+out("Result: " . ($issues == 0 ? "CLEAN — no STP anomalies found" : "$issues issue(s) flagged") . "\n");
+out("=" x 65 . "\n");
+
 close $log_fh if $log_fh;
-exit $exit_code;
+exit($issues > 0 ? 1 : 0);
+```
+
+**What it does:** STP health audit — checks across multiple switches for unexpected root bridges (with optional `-r` flag to assert which root is correct), ports stuck in LISTENING state (indicates active topology flux), high topology change counts (loop/flap indicator), and STP mode (PVST+/RPVST+/MST). BLOCKING ports are noted but not flagged as errors since they're normal in PVST environments.
+
+**Why it's distinct from existing scripts:** `bulk_ops.pl` runs arbitrary config commands, `show_commands.pl` collects show output — this one specifically parses STP state and raises structured warnings, which is the auditing angle the repo doesn't currently cover.
