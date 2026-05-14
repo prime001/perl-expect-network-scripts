@@ -1,156 +1,176 @@
-```perl
 #!/usr/bin/perl
+# =============================================================================
+# stp_audit.pl - Spanning Tree Protocol health audit for Cisco IOS/IOS-XE
 #
-# Critical Routes and Prefix Validator
-# Purpose: Validate that critical/expected routes exist in device routing table
-# Usage: ./route_validator.pl <device_ip> <routes_file>
-#        ./route_validator.pl <device_ip> 10.0.0.0/8 10.1.0.0/16 192.168.0.0/16
+# PURPOSE:
+#   Audits STP health across one or more switches: identifies root bridge
+#   placement, counts topology changes, flags instability, and detects
+#   BPDU guard err-disabled ports. Essential for validating STP design
+#   and hunting the source of network flaps.
 #
-# Prerequisites:
-#   - Net::SSH::Expect module (cpan Net::SSH::Expect)
-#   - SSH connectivity to target devices
-#   - Network credentials in environment: DEVICE_USER, DEVICE_PASS
-#   - Route prefixes to validate in file or as command arguments
+# USAGE:
+#   Single device:  perl stp_audit.pl -h 192.168.1.1 -u admin -p secret
+#   From file:      perl stp_audit.pl -f switches.txt -u admin -p secret
+#   With log:       perl stp_audit.pl -h 10.0.0.1 -u admin -p secret -l stp.log
+#   Custom timeout: perl stp_audit.pl -h 10.0.0.1 -u admin -p secret -t 20
 #
-# Features:
-#   - Connects via SSH to network device
-#   - Retrieves routing table
-#   - Validates critical prefixes are present
-#   - Checks route protocol (static, BGP, OSPF, etc)
-#   - Reports missing or unexpected routes
-#   - Outputs results to STDOUT and log file with timestamps
+# PREREQUISITES:
+#   cpan install Net::SSH::Expect Getopt::Long
 #
-# Error Handling:
-#   - SSH connection failures with detailed messages
-#   - Authentication errors caught and logged
-#   - Command timeouts and device responsiveness checks
-#   - Graceful handling of device disconnection
-#   - Input validation for IP prefixes
+# DEVICE FILE FORMAT (one IP or hostname per line, # for comments):
+#   10.0.0.1
+#   10.0.0.2
+#   # sw-distribution-01
+# =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Time::HiRes qw(gettimeofday tv_interval);
-use Getopt::Std;
-use IO::File;
+use Getopt::Long;
+use POSIX qw(strftime);
 
-my %opts;
-getopts('l:u:p:', \%opts);
+my ($host, $file, $user, $pass, $logfile, $timeout);
+$timeout = 15;
 
-my $device = shift @ARGV or die "Usage: $0 [-l logfile] [-u user] [-p pass] <device> [prefix1 prefix2 ...]\n";
+GetOptions(
+    'h|host=s'    => \$host,
+    'f|file=s'    => \$file,
+    'u|user=s'    => \$user,
+    'p|pass=s'    => \$pass,
+    'l|log=s'     => \$logfile,
+    't|timeout=i' => \$timeout,
+) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOGFILE] [-t TIMEOUT]\n";
 
-my @prefixes;
-if ($_[0] && $_[0] =~ m|/|) {
-    @prefixes = @ARGV;
+die "Provide -h HOST or -f FILE\n" unless $host || $file;
+die "Provide -u USER and -p PASS\n" unless $user && $pass;
+
+my @devices;
+if ($host) {
+    push @devices, $host;
 } else {
-    my $routes_file = shift @ARGV;
-    if ($routes_file && -f $routes_file) {
-        open my $fh, '<', $routes_file or die "Cannot open file $routes_file: $!\n";
-        while (<$fh>) {
-            chomp;
-            next if /^#/ or /^\s*$/;
-            push @prefixes, $_;
-        }
-        close $fh;
+    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
+    while (<$fh>) {
+        chomp; s/#.*//; s/^\s+|\s+$//g;
+        push @devices, $_ if length $_;
+    }
+    close $fh;
+}
+
+my $LOG;
+if ($logfile) {
+    open($LOG, '>>', $logfile) or die "Cannot open log '$logfile': $!\n";
+}
+
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+output("=" x 68);
+output("STP Audit Report - $ts");
+output("=" x 68);
+
+for my $dev (@devices) {
+    output("\n--- Device: $dev ---");
+    eval { audit_stp($dev) };
+    if ($@) {
+        (my $err = $@) =~ s/ at .+ line \d+.*//s;
+        output("  ERROR: $err");
     }
 }
 
-die "No prefixes specified or found\n" unless @prefixes;
+close $LOG if $LOG;
 
-my $logfile = $opts{l} || "route_validation_${device}.log";
-my $user = $opts{u} || $ENV{DEVICE_USER} || 'admin';
-my $pass = $opts{p} || $ENV{DEVICE_PASS} || 'password';
+sub audit_stp {
+    my ($device) = @_;
 
-open my $log_fh, '>>', $logfile or die "Cannot open log: $!\n";
-$log_fh->autoflush(1);
-
-sub log_output {
-    my ($msg) = @_;
-    my $timestamp = scalar localtime;
-    print "[$$] $timestamp - $msg\n";
-    print $log_fh "[$$] $timestamp - $msg\n";
-}
-
-log_output("=== Route Validation Start: $device ===");
-
-my $start = [gettimeofday];
-my $ssh;
-
-eval {
-    $ssh = Net::SSH::Expect->new(
-        host => $device,
-        user => $user,
-        password => $pass,
-        timeout => 20,
-        raw_pty => 1,
+    my $ssh = Net::SSH::Expect->new(
+        host        => $device,
+        user        => $user,
+        password    => $pass,
+        raw_pty     => 1,
+        timeout     => $timeout,
+        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
     );
-    
-    unless ($ssh->login()) {
-        die "SSH login failed: " . $ssh->error();
-    }
-};
 
-if ($@) {
-    log_output("[ERROR] Failed to connect to $device: $@");
-    close $log_fh;
-    exit 1;
+    my $login = eval { $ssh->login() };
+    die "SSH connection failed: " . ($@ || 'timeout') if $@ || !defined $login;
+    die "Authentication failed (bad credentials)" if $login =~ /denied|invalid|fail/i;
+
+    $ssh->exec('terminal length 0');
+
+    my $summary = $ssh->exec('show spanning-tree summary');
+    my $detail  = $ssh->exec('show spanning-tree detail');
+
+    $ssh->exec('exit');
+
+    parse_and_report($device, $summary, $detail);
 }
 
-my $conn_time = tv_interval($start);
-log_output("[OK] SSH connected to $device (${conn_time}s)");
+sub parse_and_report {
+    my ($device, $summary, $detail) = @_;
+    my $issues = 0;
 
-my @found_routes;
-my @missing_routes;
-
-eval {
-    my $start_cmd = [gettimeofday];
-    my $routing_table = $ssh->exec('show ip route | include ');
-    my $cmd_time = tv_interval($start_cmd);
-    
-    unless ($routing_table) {
-        die "Failed to retrieve routing table";
+    # Root bridge status
+    if ($summary =~ /Root bridge for:\s*(.+)/i) {
+        (my $vlans = $1) =~ s/\s+$//;
+        output("  Root bridge for: $vlans");
+    } else {
+        output("  Root bridge: not root for any VLAN on this switch");
     }
-    
-    log_output("[OK] Retrieved routing table (${cmd_time}s) - scanning prefixes");
-    
-    foreach my $prefix (@prefixes) {
-        my $found = 0;
-        foreach my $line (split /\n/, $routing_table) {
-            if ($line =~ /\Q$prefix\E/) {
-                push @found_routes, $prefix;
-                log_output("[FOUND] $prefix - $line");
-                $found = 1;
-                last;
-            }
-        }
-        
-        unless ($found) {
-            push @missing_routes, $prefix;
-            log_output("[MISSING] $prefix - NOT FOUND in routing table");
-        }
-    }
-};
 
-if ($@) {
-    log_output("[ERROR] Route validation failed: $@");
+    # Mode (PVST, Rapid-PVST, MST)
+    if ($summary =~ /Switch is in (\S+) mode/i) {
+        output("  STP mode: $1");
+    }
+
+    # Port state counts from summary
+    my %states;
+    while ($summary =~ /(\d+)\s+(Blocking|Listening|Learning|Forwarding|Loopback)/gi) {
+        $states{ucfirst(lc($2))} += $1;
+    }
+    for my $state (qw(Forwarding Learning Listening Blocking Loopback)) {
+        next unless exists $states{$state};
+        output(sprintf("  %-14s %d port(s)", "$state:", $states{$state}));
+    }
+    if (($states{Blocking} || 0) > 25) {
+        output("  WARN: Unusually high blocking port count -- verify topology design");
+        $issues++;
+    }
+
+    # Topology change totals from detail output
+    my $tc_total = 0;
+    $tc_total += $1 while $detail =~ /Number of topology changes (\d+)/gi;
+    output("  Topology changes (cumulative): $tc_total");
+    if ($tc_total > 150) {
+        output("  WARN: High TC count ($tc_total) indicates ongoing or recent instability");
+        $issues++;
+    }
+
+    # Last topology change timestamp
+    if ($detail =~ /last change occurred\s+([\d:]+\s+(?:ago)?)/i) {
+        output("  Last topology change: $1");
+    }
+
+    # Detect BPDU guard err-disabled ports
+    my @errdis;
+    push @errdis, $1 while $detail =~ /^(\S+(?:\/\d+)+)\s+.*\berr.disabled\b/gim;
+    if (@errdis) {
+        output("  WARN: BPDU guard err-disabled ports (" . scalar(@errdis) . "): " . join(', ', @errdis));
+        $issues++;
+    }
+
+    # Ports stuck in Listening/Learning longer than expected
+    my @stuck;
+    while ($detail =~ /(\S+(?:\/\d+)+).*?has been (?:listening|learning) for (\d+) second/gis) {
+        push @stuck, "$1 ($2s)" if $2 > 60;
+    }
+    if (@stuck) {
+        output("  WARN: Ports stuck in transient STP state: " . join(', ', @stuck));
+        $issues++;
+    }
+
+    output($issues == 0 ? "  STATUS: OK" : "  STATUS: $issues issue(s) found -- review above warnings");
 }
 
-eval { $ssh->close(); };
-
-log_output("=== Summary ===");
-log_output("Total prefixes checked: " . scalar(@prefixes));
-log_output("Found: " . scalar(@found_routes));
-log_output("Missing: " . scalar(@missing_routes));
-
-if (@missing_routes) {
-    log_output("[ALERT] Missing routes detected:");
-    foreach (@missing_routes) {
-        log_output("  - $_");
-    }
+sub output {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $LOG "$msg\n" if $LOG;
 }
-
-log_output("=== Route Validation Complete ===\n");
-close $log_fh;
-
-exit(scalar(@missing_routes) > 0 ? 1 : 0);
-```
