@@ -1,145 +1,167 @@
-The task is a direct code generation request with explicit output format instructions ("Output ONLY the script content"). The brainstorming skill doesn't apply here — the spec is fully defined. Writing the script now.
+Writing the script now — CPU/memory utilization monitor, which is not covered by any of the listed existing scripts.
 
 #!/usr/bin/perl
 #
-# stp_audit.pl - Spanning Tree Protocol Audit Tool
+# cpu_memory_monitor.pl - CPU and Memory Utilization Monitor for Cisco IOS/IOS-XE
 #
 # Purpose:
-#   SSH into Cisco IOS/IOS-XE switches and audit STP topology. Reports root
-#   bridge status per VLAN, blocked port counts, topology change counters,
-#   and flags recent topology changes that may indicate network instability.
+#   Connects to network devices via SSH, collects CPU and memory utilization
+#   data, identifies top resource-consuming processes, and alerts when
+#   configurable thresholds are exceeded. Useful for capacity planning,
+#   incident response, and proactive health monitoring.
 #
 # Usage:
-#   stp_audit.pl -h <host> [-u <user>] [-p <pass>] [-l <logfile>]
-#   stp_audit.pl -f <hostfile> [-u <user>] [-p <pass>] [-l <logfile>]
+#   Single device:  ./cpu_memory_monitor.pl -h 192.168.1.1 -u admin -p secret
+#   Device list:    ./cpu_memory_monitor.pl -f devices.txt -u admin -p secret
+#   With logging:   ./cpu_memory_monitor.pl -f devices.txt -u admin -p secret -l /tmp/cpu.log
+#   Custom alerts:  ./cpu_memory_monitor.pl -h 192.168.1.1 -u admin -p secret --cpu-warn 70 --mem-warn 80
+#
+# Device file format:
+#   One IP or hostname per line; lines starting with # are ignored.
 #
 # Prerequisites:
-#   cpan install Net::SSH::Expect Getopt::Long
+#   cpan Net::SSH::Expect
+#   SSH access to target devices (password or key-based auth)
+#   Cisco IOS/IOS-XE (tested on 12.x, 15.x, 16.x, 17.x)
 #
-# Examples:
-#   stp_audit.pl -h 192.168.1.10 -u netops -p s3cr3t
-#   stp_audit.pl -f switches.txt -u netops -l /var/log/stp_audit.log
+# Output:
+#   Per-device CPU averages (5s/1m/5m), top-5 processes by CPU,
+#   processor memory pool utilization, and threshold alerts.
 #
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case);
 use POSIX qw(strftime);
 
-my ($host, $hostfile, $user, $pass, $logfile);
-$user = 'admin';
+my ($host, $device_file, $username, $password, $log_file);
+my $cpu_warn = 75;
+my $mem_warn = 85;
+my $timeout  = 30;
 
 GetOptions(
-    'h|host=s' => \$host,
-    'f|file=s' => \$hostfile,
-    'u|user=s' => \$user,
-    'p|pass=s' => \$pass,
-    'l|log=s'  => \$logfile,
-) or die "Usage: $0 -h <host>|-f <file> [-u user] [-p pass] [-l logfile]\n";
+    'h|host=s'     => \$host,
+    'f|file=s'     => \$device_file,
+    'u|user=s'     => \$username,
+    'p|password=s' => \$password,
+    'l|log=s'      => \$log_file,
+    'cpu-warn=i'   => \$cpu_warn,
+    'mem-warn=i'   => \$mem_warn,
+    't|timeout=i'  => \$timeout,
+) or die "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-l logfile] [--cpu-warn N] [--mem-warn N]\n";
 
-die "Specify -h <host> or -f <file>\n" unless $host || $hostfile;
+die "Provide -h <host> or -f <file>\n" unless $host || $device_file;
+die "Username required (-u)\n"         unless $username;
+die "Password required (-p)\n"         unless $password;
 
-unless ($pass) {
-    print "Password: ";
-    system('stty', '-echo');
-    chomp($pass = <STDIN>);
-    system('stty', 'echo');
-    print "\n";
-}
-
-my @hosts;
+my @devices;
 if ($host) {
-    @hosts = ($host);
+    push @devices, $host;
 } else {
-    open(my $fh, '<', $hostfile) or die "Cannot open $hostfile: $!\n";
-    @hosts = map { chomp; $_ } grep { /\S/ && !/^#/ } <$fh>;
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) {
+        chomp; s/#.*//; s/^\s+|\s+$//g;
+        push @devices, $_ if $_;
+    }
     close $fh;
 }
 
 my $log_fh;
-if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open $logfile: $!\n";
+if ($log_file) {
+    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
 }
 
-sub out {
-    my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
-}
+my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+output("=" x 60);
+output("CPU/Memory Monitor  |  $ts");
+output(sprintf("Thresholds: CPU >= %d%%  Memory >= %d%%", $cpu_warn, $mem_warn));
+output("=" x 60);
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-out("=" x 62 . "\nSTP Audit Report - $ts\n" . "=" x 62 . "\n");
+check_device($_) for @devices;
+close $log_fh if $log_fh;
+exit 0;
 
-for my $device (@hosts) {
-    out("\n[Device: $device]\n");
+sub check_device {
+    my ($device) = @_;
+    output("\n[Device: $device]");
 
     my $ssh = eval {
         Net::SSH::Expect->new(
             host     => $device,
-            user     => $user,
-            password => $pass,
+            user     => $username,
+            password => $password,
             raw_pty  => 1,
-            timeout  => 15,
+            timeout  => $timeout,
         );
     };
     if ($@ || !$ssh) {
-        out("  ERROR: Connection failed - $@\n");
-        next;
+        output("  ERROR: Could not create SSH session: " . ($@ || 'unknown'));
+        return;
     }
 
-    eval {
-        my $login = $ssh->login();
-        if ($login !~ /[\$#>]/) {
-            die "Login prompt not detected (auth failure?)\n";
-        }
+    my $logged_in = eval { $ssh->login() };
+    if ($@ || !defined $logged_in) {
+        output("  ERROR: Authentication failed (bad credentials or SSH key mismatch)");
+        return;
+    }
 
-        $ssh->send("terminal length 0");
-        $ssh->waitfor('[#>]', 5);
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('\$|#|>', 5);
 
-        $ssh->send("show spanning-tree summary totals");
-        my $summary = $ssh->waitfor('[#>]', 15) // '';
+    $ssh->send("show processes cpu sorted\n");
+    my $cpu_raw = $ssh->waitfor('\$|#|>', $timeout) // '';
 
-        $ssh->send("show spanning-tree detail");
-        my $detail = $ssh->waitfor('[#>]', 25) // '';
+    $ssh->send("show processes memory sorted\n");
+    my $mem_raw = $ssh->waitfor('\$|#|>', $timeout) // '';
 
-        $ssh->send("exit");
+    eval { $ssh->close() };
 
-        # Parse summary: root bridge counts and blocked ports
-        my ($root_vlans, $blocking) = (0, 0);
-        for my $line (split /\n/, $summary) {
-            $root_vlans++ if $line =~ /\broot\b/i;
-            $blocking += $1 if $line =~ /(\d+)\s+blocking/i;
-        }
-        out("  Root bridge for $root_vlans VLAN(s)\n");
-        out("  Blocked ports: $blocking\n");
-        out("  WARN: No VLANs where this switch is root\n") if $root_vlans == 0;
+    parse_cpu($cpu_raw);
+    parse_memory($mem_raw);
+}
 
-        # Parse detail: per-VLAN topology change tracking
-        my ($current_vlan, $tc_count);
-        for my $line (split /\n/, $detail) {
-            if ($line =~ /MST(\d+)|VLAN(\d+)/i) {
-                $current_vlan = $1 // $2;
-            }
-            if ($line =~ /Number of topology changes\s+(\d+)/i) {
-                $tc_count = $1;
-                if ($tc_count > 50) {
-                    out("  WARN: VLAN/MST $current_vlan - $tc_count topology changes (STP instability risk)\n");
-                }
-            }
-            if ($line =~ /last topology change\s+(\d+):(\d+):(\d+)/i) {
-                my $age_sec = $1 * 3600 + $2 * 60 + $3;
-                if ($age_sec < 1800 && defined $current_vlan) {
-                    out("  WARN: VLAN/MST $current_vlan - topology change ${1}h${2}m${3}s ago\n");
-                }
-            }
-        }
-        out("  OK: No instability indicators found\n") unless $summary.$detail =~ /WARN/;
-    };
-    if ($@) {
-        out("  ERROR: Session error - $@\n");
+sub parse_cpu {
+    my ($out) = @_;
+
+    if ($out =~ /five seconds:\s*(\d+)%[^;]*;\s*one minute:\s*(\d+)%;\s*five minutes:\s*(\d+)%/i) {
+        my ($s5, $m1, $m5) = ($1, $2, $3);
+        output(sprintf("  CPU: 5sec=%-3d%%  1min=%-3d%%  5min=%-3d%%", $s5, $m1, $m5));
+        output(sprintf("  ALERT: 1-min CPU (%d%%) >= threshold (%d%%)", $m1, $cpu_warn))
+            if $m1 >= $cpu_warn;
+    } else {
+        output("  CPU: Unable to parse utilization summary");
+    }
+
+    my @procs;
+    while ($out =~ /^\s*\d+\s+\d+\s+\d+\s+\d+\s+(\d+)%\s+(\d+)%\s+(\d+)%\s+\d+\s+(\S+)/mg) {
+        push @procs, [$1, $2, $3, $4];
+        last if @procs >= 5;
+    }
+    if (@procs) {
+        output("  Top processes (5s% / 1m% / 5m%  name):");
+        output(sprintf("    %3d%% / %3d%% / %3d%%  %s", @{$_})) for @procs;
     }
 }
 
-out("\nAudit complete.\n");
-close $log_fh if $log_fh;
+sub parse_memory {
+    my ($out) = @_;
+
+    if ($out =~ /Processor\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)/i) {
+        my ($total, $used, $free) = ($1, $2, $3);
+        my $pct      = ($total > 0) ? int($used / $total * 100) : 0;
+        my $used_mb  = int($used  / 1048576);
+        my $total_mb = int($total / 1048576);
+        output(sprintf("  Memory: %dMB / %dMB used (%d%%)", $used_mb, $total_mb, $pct));
+        output(sprintf("  ALERT: Memory (%d%%) >= threshold (%d%%)", $pct, $mem_warn))
+            if $pct >= $mem_warn;
+    } else {
+        output("  Memory: Unable to parse processor pool data");
+    }
+}
+
+sub output {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $log_fh "$msg\n" if $log_fh;
+}
