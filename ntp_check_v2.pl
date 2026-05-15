@@ -1,163 +1,193 @@
 #!/usr/bin/perl
 use strict;
 use warnings;
-use Net::SSH::Expect;
+use Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-# ntp_compliance_audit.pl
+# =============================================================================
+# ntp_compliance_audit.pl - NTP Configuration Compliance Auditor
 #
 # Purpose:
-#   Audits NTP security and policy compliance on Cisco IOS/IOS-XE devices.
-#   Checks authentication keys, ACL enforcement, approved server list adherence,
-#   and stratum policy -- NOT just sync status. Use ntp_check.pl for basic
-#   operational status; use this when you need to verify NTP config meets policy.
+#   Audits NTP configuration compliance across Cisco IOS/IOS-XE devices.
+#   Validates NTP server configuration against a required server list,
+#   checks authentication state, and flags stratum policy violations.
+#   Distinct from ntp_check.pl (sync status) -- this focuses on CONFIGURATION
+#   correctness: are the right servers configured, is auth enabled, is the
+#   stratum within policy limits?
 #
 # Usage:
-#   ntp_compliance_audit.pl -h 192.168.1.1 -u admin -p secret [options]
-#   ntp_compliance_audit.pl -f devices.txt -u admin -p secret [options]
+#   ./ntp_compliance_audit.pl -u admin -p secret -s 10.0.0.1,10.0.0.2
+#   ./ntp_compliance_audit.pl -u admin -p secret -f devices.txt
+#   ./ntp_compliance_audit.pl -u admin -p secret -f devices.txt -l audit.log
+#                             --required-servers 10.1.1.1,10.1.1.2
+#                             --max-stratum 4
 #
 # Options:
-#   -h, --host      Single device IP or hostname
-#   -f, --file      File with one device per line
-#   -u, --user      SSH username
-#   -p, --pass      SSH password
-#   -s, --servers   Comma-separated approved NTP server IPs
-#   -m, --maxstrat  Maximum allowed stratum (default: 4)
-#   -l, --log       Log file path (optional)
-#   -t, --timeout   SSH timeout in seconds (default: 15)
+#   -u, --user            SSH username (required)
+#   -p, --password        SSH password (required)
+#   -s, --servers         Comma-separated device list
+#   -f, --file            File with one device per line
+#   -l, --log             Output log file path
+#       --required-servers  Comma-separated list of NTP servers devices must use
+#       --max-stratum       Maximum acceptable stratum (default: 5)
+#   -t, --timeout         SSH timeout in seconds (default: 15)
 #
 # Prerequisites:
-#   Net::SSH::Expect (cpan install Net::SSH::Expect)
-#   SSH enabled on target devices, valid credentials
+#   cpan install Expect Getopt::Long
+#   SSH access to devices; enable password optional (script handles enable prompt)
+#
+# Output:
+#   PASS/FAIL/WARN per device with specific compliance findings
+# =============================================================================
 
-my ($host, $file, $user, $pass, $servers_arg, $log_file);
-my $max_stratum = 4;
-my $timeout     = 15;
+my ($user, $pass, $server_arg, $device_file, $log_file);
+my ($required_servers_arg, $max_stratum, $timeout) = ('', 5, 15);
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'f|file=s'     => \$file,
-    'u|user=s'     => \$user,
-    'p|pass=s'     => \$pass,
-    's|servers=s'  => \$servers_arg,
-    'm|maxstrat=i' => \$max_stratum,
-    'l|log=s'      => \$log_file,
-    't|timeout=i'  => \$timeout,
-) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [options]\n";
+    'u|user=s'             => \$user,
+    'p|password=s'         => \$pass,
+    's|servers=s'          => \$server_arg,
+    'f|file=s'             => \$device_file,
+    'l|log=s'              => \$log_file,
+    'required-servers=s'   => \$required_servers_arg,
+    'max-stratum=i'        => \$max_stratum,
+    't|timeout=i'          => \$timeout,
+) or die "Usage: $0 -u USER -p PASS [-s DEVICE[,..] | -f FILE] [options]\n";
 
-die "Must specify -h or -f\n"    unless $host || $file;
-die "Must specify -u username\n" unless $user;
-die "Must specify -p password\n" unless $pass;
+die "Error: --user and --password are required\n" unless $user && $pass;
 
-my @approved_servers = $servers_arg ? split(/,/, $servers_arg) : ();
-my @devices = $host ? ($host) : do {
-    open my $fh, '<', $file or die "Cannot open $file: $!\n";
-    map { chomp; $_ } grep { /\S/ && !/^#/ } <$fh>;
-};
+my @devices;
+push @devices, split(/,/, $server_arg) if $server_arg;
+if ($device_file) {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+    while (<$fh>) { chomp; push @devices, $_ if /\S/ && !/^#/ }
+    close $fh;
+}
+die "Error: no devices specified (-s or -f required)\n" unless @devices;
+
+my %required = map { $_ => 1 } split(/,/, $required_servers_arg);
 
 my $log_fh;
 if ($log_file) {
-    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
+    open($log_fh, '>', $log_file) or warn "Cannot open log $log_file: $!\n";
 }
 
-sub log_out {
+sub emit {
     my ($msg) = @_;
     print $msg;
     print $log_fh $msg if $log_fh;
 }
 
-sub audit_device {
-    my ($dev) = @_;
-    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-    log_out("\n[$ts] Auditing $dev\n" . "-" x 60 . "\n");
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+emit("NTP Compliance Audit  $ts\n" . "=" x 60 . "\n");
+emit(sprintf("Policy: max_stratum=%d  required_servers=%s\n\n",
+    $max_stratum, $required_servers_arg || '(any)'));
 
-    my $ssh = Net::SSH::Expect->new(
-        host        => $dev,
-        user        => $user,
-        password     => $pass,
-        raw_pty      => 1,
-        timeout      => $timeout,
+my ($pass_count, $fail_count, $warn_count) = (0, 0, 0);
+
+for my $device (@devices) {
+    $device =~ s/\s+//g;
+    emit("Device: $device\n");
+
+    my $exp = Expect->new;
+    $exp->raw_pty(1);
+    $exp->log_stdout(0);
+
+    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=$timeout $user\@$device")) {
+        emit("  [FAIL] Connection failed: $!\n\n");
+        $fail_count++;
+        next;
+    }
+
+    my $result = $exp->expect($timeout,
+        [ qr/[Pp]assword:/            => sub { $exp->send("$pass\n"); exp_continue } ],
+        [ qr/yes\/no/                 => sub { $exp->send("yes\n");   exp_continue } ],
+        [ qr/[>#]/                    => sub { 1 } ],
+        [ timeout                     => sub { 0 } ],
     );
 
-    eval { $ssh->login() };
-    if ($@) {
-        log_out("  FAIL: Cannot connect to $dev: $@\n");
-        return;
+    unless ($result) {
+        emit("  [FAIL] Auth timeout or connection refused\n\n");
+        $fail_count++;
+        $exp->soft_close;
+        next;
     }
 
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('>#', 3);
+    $exp->send("terminal length 0\n");
+    $exp->expect($timeout, qr/[>#]/);
 
-    my %findings;
+    # Collect NTP associations
+    $exp->send("show ntp associations\n");
+    my $assoc_output = '';
+    $exp->expect($timeout,
+        [ qr/[>#]/ => sub { $assoc_output = $exp->before; } ]
+    );
 
-    # Check NTP authentication
-    $ssh->send("show run | section ntp");
-    my $ntp_config = $ssh->waitfor('>#', 10) // '';
+    # Collect running NTP config
+    $exp->send("show running-config | include ntp\n");
+    my $cfg_output = '';
+    $exp->expect($timeout,
+        [ qr/[>#]/ => sub { $cfg_output = $exp->before; } ]
+    );
 
-    $findings{auth_enabled}  = $ntp_config =~ /ntp authenticate\b/ ? 1 : 0;
-    $findings{auth_keys}     = () = $ntp_config =~ /ntp authentication-key/g;
-    $findings{trusted_keys}  = () = $ntp_config =~ /ntp trusted-key/g;
-    $findings{acl_applied}   = $ntp_config =~ /ntp access-group/ ? 1 : 0;
-    $findings{source_iface}  = $ntp_config =~ /ntp source\s+(\S+)/ ? $1 : 'none';
+    $exp->send("exit\n");
+    $exp->soft_close;
 
-    my @configured_servers = ($ntp_config =~ /ntp server\s+([\d\.]+)/g);
-    $findings{server_count}  = scalar @configured_servers;
+    # Parse configured NTP servers from running config
+    my @configured_servers = ($cfg_output =~ /ntp server\s+(\S+)/gi);
+    my $auth_enabled = ($cfg_output =~ /ntp authenticate/i) ? 1 : 0;
+    my $auth_keys    = ($cfg_output =~ /ntp authentication-key/i) ? 1 : 0;
+    my $trusted_keys = ($cfg_output =~ /ntp trusted-key/i) ? 1 : 0;
 
-    # Check for rogue servers if approved list provided
-    my @rogue;
-    if (@approved_servers) {
-        my %approved = map { $_ => 1 } @approved_servers;
-        @rogue = grep { !$approved{$_} } @configured_servers;
-    }
-    $findings{rogue_servers} = \@rogue;
-
-    # Check stratum from operational state
-    $ssh->send("show ntp status");
-    my $ntp_status = $ssh->waitfor('>#', 10) // '';
-    my ($stratum) = $ntp_status =~ /stratum\s+(\d+)/i;
-    $findings{stratum}      = $stratum // 'unknown';
-    $findings{synchronized} = $ntp_status =~ /Clock is synchronized/i ? 1 : 0;
-
-    $ssh->send("exit");
-    $ssh->close();
-
-    # Report
-    my $pass_fail = sub { $_[0] ? "PASS" : "FAIL" };
-
-    log_out(sprintf("  NTP Synchronized  : %s\n", $findings{synchronized} ? "YES" : "NO"));
-    log_out(sprintf("  Stratum           : %s  [%s]\n",
-        $findings{stratum},
-        ($findings{stratum} eq 'unknown' || $findings{stratum} > $max_stratum) ? "FAIL" : "PASS"));
-    log_out(sprintf("  Authentication    : %s\n", &$pass_fail($findings{auth_enabled})));
-    log_out(sprintf("  Auth Keys         : %d configured, %d trusted\n",
-        $findings{auth_keys}, $findings{trusted_keys}));
-    log_out(sprintf("  ACL Enforced      : %s\n", &$pass_fail($findings{acl_applied})));
-    log_out(sprintf("  Source Interface  : %s\n", $findings{source_iface}));
-    log_out(sprintf("  NTP Servers       : %s\n", join(', ', @configured_servers) || 'none'));
-
-    if (@approved_servers && @{$findings{rogue_servers}}) {
-        log_out(sprintf("  ROGUE SERVERS     : FAIL -- %s\n",
-            join(', ', @{$findings{rogue_servers}})));
-    } elsif (@approved_servers) {
-        log_out("  Approved Servers  : PASS\n");
+    # Parse stratum from associations output (synced peer marked with *)
+    my ($synced_ip, $synced_stratum) = ('none', 'N/A');
+    if ($assoc_output =~ /^\*(\d+\.\d+\.\d+\.\d+)\s+\S+\s+(\d+)/m) {
+        ($synced_ip, $synced_stratum) = ($1, $2);
     }
 
-    my $compliant = $findings{auth_enabled}
-        && $findings{trusted_keys}
-        && $findings{acl_applied}
-        && $findings{synchronized}
-        && ($findings{stratum} ne 'unknown' && $findings{stratum} <= $max_stratum)
-        && !@{$findings{rogue_servers}};
+    # Evaluate compliance
+    my @issues;
+    my @warnings;
 
-    log_out(sprintf("\n  COMPLIANCE STATUS : %s\n", $compliant ? "COMPLIANT" : "NON-COMPLIANT"));
+    if (!@configured_servers) {
+        push @issues, "No NTP servers configured";
+    } else {
+        if (%required) {
+            for my $req (keys %required) {
+                unless (grep { $_ eq $req } @configured_servers) {
+                    push @issues, "Required NTP server $req not configured";
+                }
+            }
+        }
+    }
+
+    if ($synced_stratum ne 'N/A' && $synced_stratum > $max_stratum) {
+        push @issues, "Stratum $synced_stratum exceeds policy max ($max_stratum)";
+    }
+    if ($synced_ip eq 'none') {
+        push @warnings, "Not synchronized to any NTP server";
+    }
+    if (!$auth_enabled || !$auth_keys || !$trusted_keys) {
+        push @warnings, "NTP authentication not fully configured";
+    }
+
+    my $status = @issues ? 'FAIL' : (@warnings ? 'WARN' : 'PASS');
+    @issues  ? $fail_count++ : (@warnings ? $warn_count++ : $pass_count++);
+
+    emit("  Status   : [$status]\n");
+    emit("  Synced to: $synced_ip  (stratum $synced_stratum)\n");
+    emit("  Servers  : " . (@configured_servers ? join(', ', @configured_servers) : 'none') . "\n");
+    emit("  Auth     : " . ($auth_enabled && $auth_keys && $trusted_keys ? 'configured' : 'INCOMPLETE') . "\n");
+
+    for my $issue (@issues)   { emit("  [!] $issue\n") }
+    for my $warn  (@warnings) { emit("  [W] $warn\n")  }
+    emit("\n");
 }
 
-log_out("NTP Compliance Audit -- " . strftime('%Y-%m-%d %H:%M:%S', localtime) . "\n");
-log_out("Approved servers: " . (@approved_servers ? join(', ', @approved_servers) : 'not enforced') . "\n");
-log_out("Max stratum: $max_stratum\n");
+emit("=" x 60 . "\n");
+emit(sprintf("Summary: %d PASS  %d WARN  %d FAIL  (%d total)\n",
+    $pass_count, $warn_count, $fail_count, scalar @devices));
 
-audit_device($_) for @devices;
-
-log_out("\nAudit complete. " . scalar(@devices) . " device(s) checked.\n");
 close $log_fh if $log_fh;
+exit ($fail_count > 0 ? 1 : 0);
