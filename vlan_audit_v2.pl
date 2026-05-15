@@ -1,222 +1,171 @@
-This is a standalone script generation request — writing directly to STDOUT as instructed.
-
+```perl
 #!/usr/bin/perl
-#
-# vlan_trunk_audit.pl - VLAN Trunk Pruning and Consistency Auditor
-#
-# Purpose:
-#   Audits trunk port configurations against the local VLAN database on
-#   Cisco IOS/IOS-XE switches. Identifies orphaned VLANs (allowed on
-#   trunks but absent from the VLAN DB), flags misconfigured native VLANs,
-#   and reports VLANs defined locally but not propagated on any trunk.
-#   Useful for catching stale trunk configs after VLAN cleanup or merges.
-#
-# Usage:
-#   ./vlan_trunk_audit.pl -h <host> -u <user> -p <pass> [-l <logfile>]
-#   ./vlan_trunk_audit.pl -f <device_file> -u <user> -p <pass> [-l <logfile>]
-#
-# Device file: one IP or hostname per line; lines starting with # are ignored.
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect Getopt::Long
-#   SSH must be enabled on target devices with password authentication.
-#   Tested on Cisco IOS 15.x and IOS-XE 16.x/17.x.
-#
-# Exit codes: 0 = clean, 1 = issues found, 2 = all connections failed
-#
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use POSIX qw(strftime);
+use Time::localtime;
 
-my ($host, $user, $pass, $device_file, $logfile);
-my $timeout = 15;
+# ==============================================================================
+# route_audit.pl - Network Device Routing Table Audit
+# ==============================================================================
+# PURPOSE:
+#   Validates critical routes exist in device routing tables. Useful for
+#   post-deployment verification and monitoring route convergence.
+#
+# USAGE:
+#   ./route_audit.pl --host 192.168.1.1 --user admin [--pass PASSWORD]
+#   ./route_audit.pl --file devices.txt --user admin --log results.log
+#
+# PREREQUISITES:
+#   - Net::SSH::Expect Perl module installed
+#   - SSH access to network devices (Cisco IOS/XE compatible)
+#   - Valid device credentials
+#   - Critical routes defined in %CRITICAL_ROUTES hash
+#
+# OUTPUT:
+#   - Console: real-time audit status
+#   - Log file: detailed per-device results with timestamps
+#
+# ==============================================================================
+
+my ($host, $file, $user, $pass, $logfile, $timeout, $help);
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'u|user=s'     => \$user,
-    'p|password=s' => \$pass,
-    'f|file=s'     => \$device_file,
-    'l|log=s'      => \$logfile,
-    't|timeout=i'  => \$timeout,
-) or usage();
+    'host=s'     => \$host,
+    'file=s'     => \$file,
+    'user=s'     => \$user,
+    'pass=s'     => \$pass,
+    'log=s'      => \$logfile,
+    'timeout=i'  => \$timeout,
+    'help'       => \$help,
+) or die "Error in command line arguments\n";
 
-usage() unless ($host || $device_file) && $user && $pass;
+die usage() if $help || (!$host && !$file) || !$user;
 
-my @devices = $host ? ($host) : read_device_file($device_file);
-die "No devices to process\n" unless @devices;
+$timeout   ||= 30;
+$logfile   ||= 'route_audit.log';
 
-my $log_fh;
-if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log $logfile: $!\n";
+# Define critical routes to validate (CIDR notation)
+my %CRITICAL_ROUTES = (
+    '10.0.0.0/8'        => 'Corporate headquarters',
+    '172.16.0.0/12'     => 'Branch office networks',
+    '192.168.0.0/16'    => 'Management networks',
+);
+
+my @devices = $host ? ($host) : read_device_list($file);
+
+open my $logfh, '>>', $logfile or die "Cannot open $logfile: $!\n";
+
+foreach my $device (@devices) {
+    audit_device($device, $user, $pass, $logfh, $timeout);
 }
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-out("=" x 62, $log_fh);
-out("VLAN Trunk Consistency Audit  $ts", $log_fh);
-out("=" x 62, $log_fh);
+close $logfh;
+print "[✓] Audit complete. Results written to $logfile\n";
 
-my ($issues, $conn_errors) = (0, 0);
-for my $dev (@devices) {
-    my $rc = audit_device($dev, $user, $pass, $timeout, $log_fh);
-    $issues++      if $rc == 1;
-    $conn_errors++ if $rc == 2;
-}
-
-out("=" x 62, $log_fh);
-out(sprintf("Done. %d device(s) with issues, %d connection error(s).",
-    $issues, $conn_errors), $log_fh);
-
-close($log_fh) if $log_fh;
-exit($issues ? 1 : ($conn_errors == @devices ? 2 : 0));
-
-# ------------------------------------------------------------------
+#----------- SUBROUTINES -----------
 
 sub audit_device {
-    my ($device, $user, $pass, $timeout, $log_fh) = @_;
-
-    out("\n[*] $device", $log_fh);
-
-    my $ssh = Net::SSH::Expect->new(
-        host     => $device,
-        user     => $user,
-        password => $pass,
-        raw_pty  => 1,
-        timeout  => $timeout,
-    );
-
-    my $banner;
-    eval { $banner = $ssh->login() };
-    if ($@ || !defined $banner || $banner =~ /denied|fail|incorrect/i) {
-        out("    [ERROR] Connection or auth failed: " . ($@ // 'bad credentials'), $log_fh);
-        return 2;
-    }
-
-    $ssh->exec("terminal length 0");
-
-    my $ver = $ssh->exec("show version | include uptime");
-    my $hostname = ($ver =~ /^(\S+)\s+uptime/) ? $1 : $device;
-    out("    Host   : $hostname", $log_fh);
-
-    # Build VLAN database (skip extended range 1006-4094 unless present)
-    my %vlan_db;
-    for my $line (split /\n/, $ssh->exec("show vlan brief")) {
-        $vlan_db{$1} = $2 if $line =~ /^(\d+)\s+(\S+)\s+active/i;
-    }
-    out("    VLAN DB: " . scalar(keys %vlan_db) . " active VLANs", $log_fh);
-
-    # Parse trunk table in three passes (mode/native, allowed, active)
-    my (%native, %allowed, %active);
-    my ($section, $port) = ('', '');
-
-    for my $line (split /\n/, $ssh->exec("show interfaces trunk")) {
-        if    ($line =~ /^Port\s+Vlans allowed on trunk/i)     { $section = 'allowed' }
-        elsif ($line =~ /^Port\s+Vlans allowed and active/i)   { $section = 'active'  }
-        elsif ($line =~ /^Port\s+/i)                           { $section = 'mode'    }
-
-        if ($section eq 'mode' &&
-            $line =~ /^((?:Gi|Fa|Te|Hu|Po|Eth)\S+)\s+\S+\s+\S+\s+\S+\s+(\d+)/) {
-            ($port, $native{$1}) = ($1, $2);
-        }
-        elsif ($section eq 'allowed' &&
-               $line =~ /^((?:Gi|Fa|Te|Hu|Po|Eth)\S+)\s+([\d,\-]+)/) {
-            $allowed{$1} = expand_range($2);
-        }
-        elsif ($section eq 'active' &&
-               $line =~ /^((?:Gi|Fa|Te|Hu|Po|Eth)\S+)\s+([\d,\-]+)/) {
-            $active{$1} = expand_range($2);
-        }
-    }
-
-    unless (keys %allowed) {
-        out("    [INFO]  No trunk ports found", $log_fh);
+    my ($device, $user, $pass, $logfh, $timeout) = @_;
+    
+    print "[*] Auditing $device...\n";
+    log_msg($logfh, "\n" . "=" x 70);
+    log_msg($logfh, "Device: $device | Timestamp: " . scalar localtime);
+    log_msg($logfh, "=" x 70);
+    
+    my $ssh;
+    eval {
+        $ssh = Net::SSH::Expect->new(
+            host     => $device,
+            user     => $user,
+            password => $pass,
+            timeout  => $timeout,
+        );
+        $ssh->login() or die "Login failed\n";
+    } or do {
+        my $error = $@ || "Unknown error";
+        log_msg($logfh, "[ERROR] SSH connection failed: $error");
+        print "[✗] $device: Connection failed\n";
+        return;
+    };
+    
+    my $route_output = '';
+    eval {
+        $ssh->send('show ip route');
+        $route_output = $ssh->read_all();
         $ssh->close();
-        return 0;
-    }
-    out("    Trunks : " . scalar(keys %allowed) . " trunk port(s)", $log_fh);
-
-    my $dev_issues = 0;
-    my %all_trunked;
-
-    for my $iface (sort keys %allowed) {
-        my @iface_allowed = @{ $allowed{$iface} };
-        my %act_set       = map { $_ => 1 } @{ $active{$iface} // [] };
-        my $nat           = $native{$iface} // '?';
-
-        $all_trunked{$_}++ for @iface_allowed;
-
-        my @orphan  = grep { !exists $vlan_db{$_} && $_ != 1 } @iface_allowed;
-        my @pruned  = grep { !$act_set{$_} }                    @iface_allowed;
-        my $bad_nat = ($nat ne '1' && $nat ne '?' && !exists $vlan_db{$nat});
-
-        if (@orphan) {
-            my $show = join(',', @orphan[0 .. ($#orphan > 9 ? 9 : $#orphan)]);
-            $show .= '...' if @orphan > 10;
-            out("    [WARN]  $iface: " . scalar(@orphan) . " orphaned VLAN(s) (allowed, not in DB): $show", $log_fh);
-            $dev_issues++;
-        }
-        if ($bad_nat) {
-            out("    [WARN]  $iface: native VLAN $nat not in VLAN database", $log_fh);
-            $dev_issues++;
-        }
-        unless (@orphan || $bad_nat) {
-            my $pruned_str = @pruned ? ", " . scalar(@pruned) . " pruned" : "";
-            out(sprintf("    [OK]    %-22s native=%-4s allowed=%-4d active=%-4d%s",
-                $iface, $nat, scalar(@iface_allowed), scalar(keys %act_set), $pruned_str),
-                $log_fh);
+    } or do {
+        my $error = $@ || "Unknown error";
+        log_msg($logfh, "[ERROR] Route retrieval failed: $error");
+        print "[✗] $device: Command execution failed\n";
+        $ssh->close() if $ssh;
+        return;
+    };
+    
+    # Parse routing table for critical routes
+    my %route_found = ();
+    foreach my $line (split /\n/, $route_output) {
+        foreach my $route (keys %CRITICAL_ROUTES) {
+            if ($line =~ /\Q$route\E/) {
+                $route_found{$route} = 1;
+                log_msg($logfh, "[✓] Found: $route ($CRITICAL_ROUTES{$route})");
+            }
         }
     }
-
-    # VLANs in DB but not present on any trunk (access-only or unused)
-    my @local_only = grep { !$all_trunked{$_} && $_ ne '1' }
-                     sort { $a <=> $b } keys %vlan_db;
-    if (@local_only) {
-        my $show = join(',', @local_only[0 .. ($#local_only > 14 ? 14 : $#local_only)]);
-        $show .= '...' if @local_only > 15;
-        out("    [INFO]  " . scalar(@local_only) . " VLAN(s) in DB but not on any trunk: $show", $log_fh);
+    
+    # Report missing routes
+    my $missing_count = 0;
+    foreach my $route (keys %CRITICAL_ROUTES) {
+        unless ($route_found{$route}) {
+            log_msg($logfh, "[✗] MISSING: $route ($CRITICAL_ROUTES{$route})");
+            $missing_count++;
+        }
     }
-
-    $ssh->close();
-    return $dev_issues ? 1 : 0;
+    
+    # Summary
+    my $audit_result = $missing_count ? "FAILED" : "PASSED";
+    log_msg($logfh, "\nAudit Result: $audit_result");
+    if ($missing_count) {
+        log_msg($logfh, "Missing routes: $missing_count");
+        print "[✗] $device: FAILED ($missing_count missing)\n";
+    } else {
+        print "[✓] $device: PASSED\n";
+    }
 }
 
-sub expand_range {
-    my ($str) = @_;
-    my @out;
-    for my $tok (split /,/, $str) {
-        push @out, ($1 .. $2) if $tok =~ /^(\d+)-(\d+)$/;
-        push @out,  $1        if $tok =~ /^(\d+)$/;
-    }
-    return \@out;
-}
-
-sub read_device_file {
-    my ($file) = @_;
-    open(my $fh, '<', $file) or die "Cannot open $file: $!\n";
-    my @devs = grep { /\S/ && !/^\s*#/ } map { chomp; s/\s+//g; $_ } <$fh>;
+sub read_device_list {
+    my ($filename) = @_;
+    open my $fh, '<', $filename or die "Cannot open $filename: $!\n";
+    my @devices = grep { chomp; $_ } <$fh>;
     close $fh;
-    return @devs;
+    return @devices;
 }
 
-sub out {
-    my ($msg, $fh) = @_;
-    print "$msg\n";
-    print $fh "$msg\n" if $fh;
+sub log_msg {
+    my ($fh, $message) = @_;
+    print $fh "$message\n";
+    print "$message\n";
 }
 
 sub usage {
-    die <<'END';
-Usage:
-  vlan_trunk_audit.pl -h <host>        -u <user> -p <pass> [-l <log>] [-t <sec>]
-  vlan_trunk_audit.pl -f <device_file> -u <user> -p <pass> [-l <log>] [-t <sec>]
+    return <<'EOF';
+Usage: route_audit.pl [options]
 
-  -h  Single device IP or hostname
-  -f  File with one device per line (# = comment)
-  -u  SSH username
-  -p  SSH password
-  -l  Append results to log file
-  -t  SSH timeout seconds (default 15)
-END
+Options:
+  --host HOSTNAME     IP or hostname of single device to audit
+  --file FILENAME     File containing list of devices (one per line)
+  --user USERNAME     SSH username (required)
+  --pass PASSWORD     SSH password (if not provided, will be prompted)
+  --log LOGFILE       Output log file (default: route_audit.log)
+  --timeout SECONDS   SSH connection timeout (default: 30)
+  --help              Display this help message
+
+Examples:
+  ./route_audit.pl --host 10.1.1.1 --user admin --pass mypass123
+  ./route_audit.pl --file routers.txt --user admin --log audit_results.log
+
+Modify %CRITICAL_ROUTES hash in script to define routes to audit.
+EOF
 }
+```
