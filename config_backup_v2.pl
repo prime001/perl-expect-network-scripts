@@ -1,158 +1,171 @@
-Here is the script:
+The user wants only script content output with no explanation. The brainstorming skill would add overhead, but user instructions (output ONLY the script) take precedence. I'll write a startup-vs-running config diff script — distinct from the existing config_backup.pl scripts.
 
-```
 #!/usr/bin/perl
+#
 # startup_running_diff.pl - Detect unsaved configuration changes on Cisco IOS devices
 #
-# Purpose:
-#   Connects to one or more network devices and compares running-config to
-#   startup-config. Reports any device where changes exist but have not been
-#   written to NVRAM. Useful for change audits, pre-maintenance checks, and
-#   compliance enforcement ("no unsaved changes in prod").
+# PURPOSE:
+#   Connects to one or more network devices via SSH and compares the running
+#   configuration against the startup configuration. Flags devices where changes
+#   have been made but not written to NVRAM -- these devices would lose config
+#   on reboot. Critical for change management audits and post-maintenance checks.
 #
-# Usage:
-#   Single device:  perl startup_running_diff.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:    perl startup_running_diff.pl -f devices.txt -u admin -p secret
-#   With log:       perl startup_running_diff.pl -f devices.txt -u admin -p secret -l diff_audit.log
+# USAGE:
+#   perl startup_running_diff.pl -h <host> -u <user> -p <pass> [-o <logfile>]
+#   perl startup_running_diff.pl -f <hostfile> -u <user> -p <pass> [-o <logfile>]
 #
-# Device file format: one IP or hostname per line; lines starting with # are skipped.
+# PREREQUISITES:
+#   cpanm Expect Getopt::Long
 #
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH access enabled on target devices (ip ssh version 2)
-#   Credentials with at least privilege 1 ("show" access)
+# HOSTFILE FORMAT:
+#   One IP or hostname per line. Lines starting with # are ignored.
 #
-# Exit codes: 0 = all devices clean, 1 = unsaved changes detected, 2 = script error
+# ENVIRONMENT:
+#   NET_USER  - fallback username if -u not provided
+#   NET_PASS  - fallback password if -p not provided
+#
+# EXAMPLES:
+#   perl startup_running_diff.pl -h 10.0.0.1 -u admin -p s3cr3t
+#   perl startup_running_diff.pl -f core_switches.txt -u netops -o audit.log
 
 use strict;
 use warnings;
-use Net::SSH::Expect;
-use Getopt::Long;
-use POSIX qw(strftime);
+use Expect;
+use Getopt::Long qw(:config no_ignore_case);
 
-my ($host, $device_file, $username, $password, $log_file);
-my $timeout = 15;
+my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_log, $opt_timeout);
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'f|file=s'     => \$device_file,
-    'u|user=s'     => \$username,
-    'p|pass=s'     => \$password,
-    'l|log=s'      => \$log_file,
-    't|timeout=i'  => \$timeout,
-) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOGFILE] [-t TIMEOUT]\n";
+    'h|host=s'    => \$opt_host,
+    'f|file=s'    => \$opt_file,
+    'u|user=s'    => \$opt_user,
+    'p|pass=s'    => \$opt_pass,
+    'o|output=s'  => \$opt_log,
+    't|timeout=i' => \$opt_timeout,
+) or die "Usage: $0 -h <host>|-f <file> -u <user> -p <pass> [-o logfile] [-t timeout]\n";
 
-die "Specify -h HOST or -f FILE\n"  unless $host || $device_file;
-die "Username required (-u)\n"      unless $username;
-die "Password required (-p)\n"      unless $password;
+my $username = $opt_user // $ENV{NET_USER} // die "Username required: use -u or set NET_USER\n";
+my $password = $opt_pass // $ENV{NET_PASS} // die "Password required: use -p or set NET_PASS\n";
+my $timeout  = $opt_timeout // 45;
 
 my @devices;
-if ($host) {
-    push @devices, $host;
-} else {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    while (<$fh>) {
-        chomp;
-        s/^\s+|\s+$//g;
-        next if /^#/ || /^$/;
-        push @devices, $_;
-    }
+if ($opt_file) {
+    open my $fh, '<', $opt_file or die "Cannot open host file '$opt_file': $!\n";
+    @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
     close $fh;
+} elsif ($opt_host) {
+    @devices = ($opt_host);
+} else {
+    die "Specify -h <host> or -f <hostfile>\n";
 }
 
 my $log_fh;
-if ($log_file) {
-    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
+if ($opt_log) {
+    open $log_fh, '>', $opt_log or die "Cannot open log file '$opt_log': $!\n";
 }
 
-sub log_print {
+sub emit {
     my ($msg) = @_;
-    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-    my $line = "[$ts] $msg";
-    print "$line\n";
-    print $log_fh "$line\n" if $log_fh;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
 
-my $has_diff   = 0;
-my $error_count = 0;
+sub strip_noise {
+    my ($text) = @_;
+    return grep {
+        /\S/
+        && !/^Building configuration/
+        && !/^Current configuration/
+        && !/^NVRAM config last/
+        && !/^Load for/
+        && !/^Time source/
+        && !/^\s*!/
+    } split /\n/, $text;
+}
 
-log_print("Starting startup/running diff audit on " . scalar(@devices) . " device(s)");
+sub check_device {
+    my ($host) = @_;
 
-for my $device (@devices) {
-    my $ssh = Net::SSH::Expect->new(
-        host        => $device,
-        user        => $username,
-        password     => $password,
-        raw_pty     => 1,
-        timeout     => $timeout,
+    emit(sprintf("\n%-60s\n", "[ $host ]"));
+    emit("-" x 60 . "\n");
+
+    my $ssh_cmd = "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "
+                . "-o BatchMode=no ${username}\@${host}";
+
+    my $exp = Expect->new;
+    $exp->raw_pty(1);
+    $exp->log_stdout(0);
+
+    unless ($exp->spawn($ssh_cmd)) {
+        emit("ERROR: Failed to spawn SSH to $host\n");
+        return 'error';
+    }
+
+    my $authed = 0;
+    $exp->expect($timeout,
+        [ qr/[Pp]assword:/        => sub { $exp->send("$password\n"); exp_continue; } ],
+        [ qr/yes\/no\)\?/         => sub { $exp->send("yes\n");       exp_continue; } ],
+        [ qr/[>#]\s*$/            => sub { $authed = 1; } ],
+        [ 'timeout'               => sub { emit("ERROR: Timeout during auth to $host\n"); } ],
+        [ 'eof'                   => sub { emit("ERROR: Connection closed by $host\n"); } ],
     );
 
-    eval {
-        my $login_output = $ssh->login();
-        if ($login_output !~ /[>#]/) {
-            die "Authentication failed or unexpected prompt\n";
-        }
-
-        $ssh->send("terminal length 0");
-        $ssh->waitfor('[\$#>]', 5);
-
-        $ssh->send("show archive config differences nvram:startup-config system:running-config");
-        my $output = $ssh->waitfor('[\$#>]', $timeout);
-
-        $ssh->send("exit");
-
-        if (!defined $output || $output eq '') {
-            log_print("WARN  $device: No output received");
-            $error_count++;
-            return;
-        }
-
-        # IOS returns "!Archiving configurations from this system" or
-        # specific diff lines when changes exist; empty/no-diff returns
-        # just the prompt. A clean device returns nothing between the
-        # command and the next prompt.
-        my @diff_lines = grep {
-            /^[+\-!]/ && !/^---/ && !/^!!!/ && !/^!\s*$/ && !/Archiving/
-        } split(/\n/, $output);
-
-        if (@diff_lines) {
-            $has_diff = 1;
-            log_print("UNSAVED $device: " . scalar(@diff_lines) . " changed line(s) detected");
-            for my $line (@diff_lines) {
-                $line =~ s/^\s+|\s+$//g;
-                next unless length($line);
-                log_print("  $device >> $line");
-            }
-        } else {
-            log_print("CLEAN   $device: startup matches running");
-        }
-    };
-
-    if ($@) {
-        my $err = $@;
-        $err =~ s/\n/ /g;
-        if ($err =~ /timeout/i) {
-            log_print("ERROR  $device: Connection timed out");
-        } elsif ($err =~ /auth|password|denied/i) {
-            log_print("ERROR  $device: Authentication failed");
-        } elsif ($err =~ /refused|no route|network/i) {
-            log_print("ERROR  $device: Connection refused or unreachable");
-        } else {
-            log_print("ERROR  $device: $err");
-        }
-        $error_count++;
+    unless ($authed) {
+        $exp->soft_close;
+        return 'error';
     }
+
+    $exp->send("terminal length 0\n");
+    $exp->expect($timeout, qr/[>#]\s*$/);
+
+    $exp->send("show running-config\n");
+    $exp->expect($timeout, qr/[>#]\s*$/);
+    my @running = strip_noise($exp->before // '');
+
+    $exp->send("show startup-config\n");
+    $exp->expect($timeout, qr/[>#]\s*$/);
+    my @startup = strip_noise($exp->before // '');
+
+    $exp->send("exit\n");
+    $exp->soft_close;
+
+    my %run_set   = map { $_ => 1 } @running;
+    my %start_set = map { $_ => 1 } @startup;
+
+    my @unsaved  = grep { !$start_set{$_} } @running;
+    my @removed  = grep { !$run_set{$_}   } @startup;
+
+    if (!@unsaved && !@removed) {
+        emit("STATUS: IN SYNC - Running matches startup, safe to reboot\n");
+        return 'ok';
+    }
+
+    emit("STATUS: UNSAVED CHANGES DETECTED - write memory required before reboot\n");
+    if (@unsaved) {
+        emit("\n  In running, not in startup (changes pending write):\n");
+        emit("    $_\n") for @unsaved;
+    }
+    if (@removed) {
+        emit("\n  In startup, not in running (deletions pending write):\n");
+        emit("    $_\n") for @removed;
+    }
+    return 'drift';
 }
 
-log_print("Audit complete — devices checked: " . scalar(@devices) .
-          ", unsaved changes: " . ($has_diff ? "YES" : "none") .
-          ", errors: $error_count");
+my $ts = localtime;
+emit("Startup vs Running Config Audit\n");
+emit("Generated : $ts\n");
+emit("Devices   : " . scalar(@devices) . "\n");
+
+my %summary = (ok => 0, drift => 0, error => 0);
+for my $dev (@devices) {
+    my $result = check_device($dev);
+    $summary{$result}++;
+}
+
+emit("\n" . "=" x 60 . "\n");
+emit(sprintf("Summary: %d in-sync  |  %d with drift  |  %d errors\n",
+    $summary{ok}, $summary{drift}, $summary{error}));
 
 close $log_fh if $log_fh;
-
-exit 2 if $error_count && !$has_diff;
-exit 1 if $has_diff;
-exit 0;
-```
-
-This is `startup_running_diff.pl` — detects unsaved config changes by running `show archive config differences` between NVRAM startup and the live running config. It's distinct from the existing config_backup scripts (which save configs) — this one audits for drift. Exit codes make it CI/cron-friendly: 0 clean, 1 unsaved changes found, 2 errors.
+exit($summary{drift} > 0 ? 1 : ($summary{error} > 0 ? 2 : 0));
