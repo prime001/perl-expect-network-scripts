@@ -1,172 +1,164 @@
-Here's the complete script content for `stp_health_check.pl`:
+The user's explicit instruction — output only the script content — takes precedence over the brainstorming skill. Writing the spanning tree audit script now.
 
-```perl
 #!/usr/bin/perl
 #
-# stp_health_check.pl - Spanning Tree Protocol Health Audit
+# spanning_tree_audit.pl — Bulk Spanning Tree Protocol Audit Tool
 #
 # Purpose:
-#   Connects to one or more Cisco IOS/IOS-XE switches via SSH and audits the
-#   Spanning Tree topology for common issues: unexpected root bridges, ports
-#   stuck in non-forwarding states, high topology change counts, and
-#   mismatched STP mode (PVST vs RSTP vs MST).
+#   Connects to Cisco IOS/IOS-XE switches via SSH and audits spanning tree
+#   status: root bridge placement, blocking ports, topology change counters,
+#   and TCN storm indicators. Flags anything that warrants review.
 #
 # Usage:
-#   Single device:   ./stp_health_check.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:     ./stp_health_check.pl -f devices.txt -u admin -p secret
-#   With log:        ./stp_health_check.pl -f devices.txt -u admin -p secret -l stp_audit.log
-#   Expected root:   ./stp_health_check.pl -h 10.0.0.1 -u admin -p secret -r 10.0.0.254
-#
-# Device file format (one IP/hostname per line, blank lines and # comments ignored):
-#   192.168.1.1
-#   192.168.1.2
+#   ./spanning_tree_audit.pl -f devices.txt [-u user] [-p pass] [-l out.log]
+#   ./spanning_tree_audit.pl -d 192.168.1.1  [-u user] [-p pass]
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH access to target devices with privilege-exec enabled
-#   Devices must support: show spanning-tree summary, show spanning-tree detail
+#   cpan Net::SSH::Expect Getopt::Long
+#   SSH access with at least 'show' privilege on target devices.
 #
-# Exit codes: 0=clean, 1=issues found, 2=fatal error
+# Device file format (one entry per line, # for comments):
+#   192.168.1.1
+#   sw-core-02
+#
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
+use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $device_file, $username, $password, $logfile, $expected_root);
-my $timeout = 15;
+my ($device_file, $single_device, $username, $password, $log_file);
+my $timeout = 30;
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'f|file=s'     => \$device_file,
-    'u|user=s'     => \$username,
-    'p|pass=s'     => \$password,
-    'l|log=s'      => \$logfile,
-    'r|root=s'     => \$expected_root,
-    't|timeout=i'  => \$timeout,
-) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOGFILE] [-r EXPECTED_ROOT]\n";
+    'f=s' => \$device_file,
+    'd=s' => \$single_device,
+    'u=s' => \$username,
+    'p=s' => \$password,
+    'l=s' => \$log_file,
+    't=i' => \$timeout,
+) or die "Usage: $0 -f devices.txt | -d device [-u user] [-p pass] [-l logfile]\n";
 
-die "Specify -h HOST or -f FILE\n"    unless $host || $device_file;
-die "Username required (-u)\n"        unless $username;
-die "Password required (-p)\n"        unless $password;
+die "Specify -f devices.txt or -d device\n" unless $device_file || $single_device;
 
-my @devices;
-if ($device_file) {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_; }
-    close $fh;
-} else {
-    @devices = ($host);
-}
+$username ||= $ENV{NET_USER} || do { print "Username: "; chomp(my $u = <STDIN>); $u };
+$password ||= $ENV{NET_PASS} || do {
+    system('stty -echo');
+    print "Password: ";
+    chomp(my $p = <STDIN>);
+    system('stty echo');
+    print "\n";
+    $p;
+};
 
+my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
 my $log_fh;
-if ($logfile) {
-    open $log_fh, '>', $logfile or die "Cannot open log $logfile: $!\n";
+if ($log_file) {
+    open($log_fh, '>', $log_file) or die "Cannot open log '$log_file': $!\n";
 }
-
-my $ts      = strftime("%Y-%m-%d %H:%M:%S", localtime);
-my $issues  = 0;
 
 sub out {
-    my $msg = shift;
-    print $msg;
-    print $log_fh $msg if $log_fh;
+    print @_;
+    print $log_fh @_ if $log_fh;
 }
 
-out("=" x 65 . "\n");
-out("STP Health Audit  $ts\n");
-out("Devices: " . scalar(@devices) . "  Expected root: " . ($expected_root // "any") . "\n");
-out("=" x 65 . "\n\n");
+sub audit_device {
+    my ($host) = @_;
 
-for my $dev (@devices) {
-    out("--- $dev ---\n");
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host        => $dev,
-            user        => $username,
-            password     => $password,
-            raw_pty     => 1,
-            timeout     => $timeout,
-        );
-    };
-    if ($@ || !$ssh) {
-        out("  [ERROR] SSH init failed: $@\n\n");
-        $issues++;
-        next;
+    out("\n" . ('=' x 60) . "\n");
+    out("Host: $host\n");
+    out('=' x 60, "\n");
+
+    my $ssh = Net::SSH::Expect->new(
+        host     => $host,
+        user     => $username,
+        password => $password,
+        timeout  => $timeout,
+        raw_pty  => 1,
+    );
+
+    eval { $ssh->login() };
+    if ($@) {
+        out("  ERROR: Login failed — $@\n");
+        return;
     }
 
-    my $login = eval { $ssh->login() };
-    if ($@ || !$login) {
-        out("  [ERROR] Auth failed or timed out\n\n");
-        $issues++;
-        next;
-    }
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('[>#]\s*$', 5);
 
-    $ssh->exec("terminal length 0");
+    $ssh->send("show spanning-tree summary\n");
+    my $summary = $ssh->waitfor('[>#]\s*$', $timeout) // '';
 
-    my $summary = $ssh->exec("show spanning-tree summary") // "";
-    my $detail  = $ssh->exec("show spanning-tree detail")  // "";
-    $ssh->close();
+    $ssh->send("show spanning-tree detail\n");
+    my $detail = $ssh->waitfor('[>#]\s*$', $timeout) // '';
 
-    # Parse STP mode
-    my $mode = "unknown";
-    $mode = "PVST+"  if $summary =~ /Switch is in pvst mode/i;
-    $mode = "RPVST+" if $summary =~ /Switch is in rapid-pvst mode/i;
-    $mode = "MST"    if $summary =~ /Switch is in mst mode/i;
-    out("  Mode       : $mode\n");
+    $ssh->send("exit\n");
 
-    # Count blocking/listening ports
-    my $blocking_count  = () = $summary =~ /\bBLK\b/g;
-    my $listening_count = () = $summary =~ /\bLIS\b/g;
-
-    # Extract root bridge addresses per VLAN
-    my %roots;
-    while ($summary =~ /^(?:VLAN\S+)\s+(\S+)\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)/mg) {
-        $roots{$2}++ if $1 eq 'root';
-    }
-
-    # Topology change counts from detail output
-    my $tc_total = 0;
-    $tc_total += $1 while $detail =~ /(\d+) topology changes/g;
-
-    # Root bridge check
-    my @root_list = keys %roots;
-    if ($expected_root && @root_list) {
-        my @wrong = grep { $_ ne $expected_root } @root_list;
-        if (@wrong) {
-            out("  [WARN]  Unexpected root(s): " . join(", ", @wrong) . "\n");
-            $issues++;
-        } else {
-            out("  Root(s)    : " . join(", ", @root_list) . " [OK]\n");
-        }
-    } elsif (@root_list) {
-        out("  Root(s)    : " . join(", ", @root_list) . "\n");
-    }
-
-    out("  Blocking   : $blocking_count port(s)" . ($blocking_count > 0 ? " [check if expected]\n" : "\n"));
-    if ($listening_count > 0) {
-        out("  [WARN]  $listening_count port(s) in LISTENING state (topology flux?)\n");
-        $issues++;
-    }
-    if ($tc_total > 100) {
-        out("  [WARN]  High topology change count: $tc_total (loop or flap suspected)\n");
-        $issues++;
-    } elsif ($tc_total > 0) {
-        out("  TC count   : $tc_total\n");
-    }
-
-    out("\n");
+    analyze($host, $summary, $detail);
 }
 
-out("=" x 65 . "\n");
-out("Result: " . ($issues == 0 ? "CLEAN — no STP anomalies found" : "$issues issue(s) flagged") . "\n");
-out("=" x 65 . "\n");
+sub analyze {
+    my ($host, $summary, $detail) = @_;
 
+    my @warnings;
+
+    my @root_vlans;
+    push @root_vlans, $1 while $summary =~ /VLAN(\d+)/gi
+        && $summary =~ /root\s+bridge\s+for[^:]*VLAN(\d+)/gi;
+    @root_vlans = ($summary =~ /Root bridge for[^:]*:\s*([^\n]+)/i)
+        ? split(/,\s*/, $1) : ();
+
+    my @blocking;
+    push @blocking, $1 while $detail =~ /^\s*((?:Gi|Fa|Te|Hu|Et|Po)\S+)\s+\S+\s+BLK/mg;
+
+    my ($tc_total) = $detail =~ /Number of topology changes\s+(\d+)/i;
+    my ($tc_since) = $detail =~ /last change occurred\s+(\S+)\s+ago/i;
+
+    if (defined $tc_total && $tc_total > 100) {
+        push @warnings, sprintf("High topology change count: %d (last: %s ago)",
+            $tc_total, $tc_since // 'unknown');
+    }
+
+    if ($summary =~ /portfast\s+bpduguard\s+default/i) {
+        # good — BPDU guard globally enabled, no warning
+    } elsif ($summary !~ /bpduguard/i) {
+        push @warnings, "BPDU Guard not globally enabled";
+    }
+
+    out("  Root bridge for: " . (@root_vlans ? join(', ', @root_vlans) : 'none detected') . "\n");
+    out("  Blocking ports:  " . (@blocking   ? join(', ', @blocking)   : 'none') . "\n");
+    out("  TC count:        " . (defined $tc_total ? $tc_total : 'n/a') . "\n");
+    out("  Last TC:         " . ($tc_since // 'n/a') . " ago\n");
+
+    if (@warnings) {
+        out("  WARNINGS:\n");
+        out("    ! $_\n") for @warnings;
+        out("  Status: REVIEW\n");
+    } else {
+        out("  Status: OK\n");
+    }
+}
+
+my @devices;
+if ($single_device) {
+    push @devices, $single_device;
+} else {
+    open(my $fh, '<', $device_file) or die "Cannot open '$device_file': $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^\s*[#;]/ || /^\s*$/;
+        push @devices, (split)[0];
+    }
+    close $fh;
+}
+
+die "No devices to audit.\n" unless @devices;
+
+out("Spanning Tree Audit — $timestamp\n");
+out("Devices: " . scalar(@devices) . "\n");
+
+audit_device($_) for @devices;
+
+out("\nDone. " . scalar(@devices) . " device(s) audited.\n");
 close $log_fh if $log_fh;
-exit($issues > 0 ? 1 : 0);
-```
-
-**What it does:** STP health audit — checks across multiple switches for unexpected root bridges (with optional `-r` flag to assert which root is correct), ports stuck in LISTENING state (indicates active topology flux), high topology change counts (loop/flap indicator), and STP mode (PVST+/RPVST+/MST). BLOCKING ports are noted but not flagged as errors since they're normal in PVST environments.
-
-**Why it's distinct from existing scripts:** `bulk_ops.pl` runs arbitrary config commands, `show_commands.pl` collects show output — this one specifically parses STP state and raises structured warnings, which is the auditing angle the repo doesn't currently cover.
