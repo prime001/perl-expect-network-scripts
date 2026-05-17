@@ -1,148 +1,136 @@
-The Perl scripts aren't in this local repo — this is the NetAutoCommitter project. Writing the script content as requested.
-
+```perl
 #!/usr/bin/perl
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use POSIX qw(strftime);
+use Time::Localtime;
 
-# =============================================================================
-# bgp_route_analysis.pl - BGP Per-Peer Route & Prefix Analysis
-#
-# PURPOSE:
-#   Connects to one or more Cisco IOS/IOS-XE routers and analyzes BGP route
-#   tables on a per-peer basis. Reports received/advertised prefix counts,
-#   AS path length distribution, and flags peers with abnormal prefix counts.
-#   Complements bgp_peers.pl (neighbor state) with route-level detail.
-#
-# USAGE:
-#   bgp_route_analysis.pl --host 10.0.0.1 [options]
-#   bgp_route_analysis.pl --file hosts.txt [options]
-#
-# OPTIONS:
-#   --host ADDR       Single device IP or hostname
-#   --file FILE       File with one IP/hostname per line
-#   --user USER       SSH username (default: admin)
-#   --pass PASS       SSH password
-#   --log FILE        Write output to log file (default: bgp_routes_YYYYMMDD.log)
-#   --threshold N     Alert if received prefixes exceed N (default: 800000)
-#   --timeout N       SSH timeout in seconds (default: 30)
-#
-# PREREQUISITES:
-#   cpan Net::SSH::Expect
-#   SSH access with 'show bgp' privilege on target devices
-#
-# OUTPUT:
-#   Per-peer table: neighbor IP, AS, received prefixes, advertised prefixes,
-#   accepted prefixes, policy-suppressed count, avg AS path length.
-#   Flags peers at or near full-table threshold.
-# =============================================================================
+=head1 DEVICE HEALTH MONITOR
 
-my ($host, $hostfile, $user, $pass, $logfile, $threshold, $timeout);
-$user      = 'admin';
-$threshold = 800000;
-$timeout   = 30;
-$logfile   = 'bgp_routes_' . strftime('%Y%m%d', localtime) . '.log';
+Monitors device health metrics (uptime, CPU, memory) via SSH.
+Connects to network devices, executes health check commands,
+and logs results to both STDOUT and a log file.
 
+Usage:
+  device_health.pl --host 192.168.1.1 --user admin --password pass [--log health.log]
+  device_health.pl --file devices.txt --user admin --password pass
+  
+Arguments:
+  --host           Single device hostname/IP
+  --file           File with list of devices (one per line)
+  --user           SSH username (required)
+  --password       SSH password (required)
+  --log            Output log file (optional, default: device_health.log)
+  --timeout        SSH timeout in seconds (default: 10)
+
+Prerequisites:
+  - Net::SSH::Expect Perl module
+  - SSH access to network devices
+  - Device prompt detection (cisco% or cisco#)
+
+=cut
+
+my ($host, $device_file, $user, $password, $logfile, $timeout);
 GetOptions(
-    'host=s'      => \$host,
-    'file=s'      => \$hostfile,
-    'user=s'      => \$user,
-    'pass=s'      => \$pass,
-    'log=s'       => \$logfile,
-    'threshold=i' => \$threshold,
-    'timeout=i'   => \$timeout,
-) or die "Usage: $0 --host ADDR | --file FILE [--user USER] [--pass PASS]\n";
+    'host=s'     => \$host,
+    'file=s'     => \$device_file,
+    'user=s'     => \$user,
+    'password=s' => \$password,
+    'log=s'      => \$logfile,
+    'timeout=i'  => \$timeout,
+) or die "Error in command line arguments\n";
 
-die "Provide --host or --file\n" unless $host || $hostfile;
+$logfile ||= 'device_health.log';
+$timeout ||= 10;
+die "Username required (--user)\n" unless $user;
+die "Password required (--password)\n" unless $password;
+die "Provide --host or --file\n" unless $host || $device_file;
 
-my @devices;
-if ($host)     { push @devices, $host }
-if ($hostfile) {
-    open my $fh, '<', $hostfile or die "Cannot open $hostfile: $!\n";
-    while (<$fh>) { chomp; push @devices, $_ if /\S/ && !/^#/ }
-    close $fh;
+my @devices = $host ? ($host) : read_device_file($device_file);
+die "No devices specified\n" unless @devices;
+
+open(my $log_fh, '>>', $logfile) or die "Cannot open $logfile: $!\n";
+log_msg($log_fh, "=== Health Check Started ===");
+
+foreach my $device (@devices) {
+    check_device_health($device, $user, $password, $timeout, $log_fh);
 }
 
-open my $LOG, '>>', $logfile or die "Cannot open log $logfile: $!\n";
+log_msg($log_fh, "=== Health Check Completed ===");
+close($log_fh);
+print "Results logged to $logfile\n";
 
-sub log_out {
-    my $msg = shift;
-    print $msg;
-    print $LOG $msg;
-}
-
-sub analyze_device {
-    my $dev = shift;
-    log_out("\n=== BGP Route Analysis: $dev [" . strftime('%Y-%m-%d %H:%M:%S', localtime) . "] ===\n");
-
+sub check_device_health {
+    my ($dev, $usr, $pwd, $tout, $lfh) = @_;
+    
+    print "Checking $dev... ";
+    log_msg($lfh, "\nDevice: $dev");
+    
     my $ssh = Net::SSH::Expect->new(
-        host        => $dev,
-        user        => $user,
-        password    => $pass,
-        raw_pty     => 1,
-        timeout     => $timeout,
-        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=15',
+        host => $dev,
+        user => $usr,
+        password => $pwd,
+        timeout => $tout,
+        raw_pty => 1,
     );
-
-    unless (eval { $ssh->login() }) {
-        log_out("ERROR: Cannot connect to $dev: $@\n");
+    
+    unless ($ssh->login()) {
+        print "FAILED\n";
+        log_msg($lfh, "  ERROR: SSH login failed");
         return;
     }
-
-    $ssh->send('terminal length 0');
-    $ssh->waitfor('\$|#|>', 5);
-
-    $ssh->send('show bgp summary');
-    my $summary = $ssh->waitfor('\$|#|>', $timeout);
-
-    unless ($summary && $summary =~ /Neighbor/) {
-        log_out("ERROR: No BGP summary output from $dev (BGP may not be configured)\n");
-        $ssh->close();
-        return;
+    
+    # Execute show version to get uptime
+    $ssh->send("show version");
+    $ssh->waitfor('cisco#|cisco%', $tout) or return;
+    my $version_output = $ssh->before();
+    
+    # Parse uptime from version output
+    my ($uptime) = $version_output =~ /uptime is\s+([^\n]+)/i;
+    if ($uptime) {
+        print "OK\n";
+        log_msg($lfh, "  Uptime: $uptime");
+    } else {
+        print "PARTIAL\n";
+        log_msg($lfh, "  Uptime: Unable to parse");
     }
-
-    my @peers;
-    for my $line (split /\n/, $summary) {
-        next unless $line =~ /^\s*(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\d+)\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\d+)/;
-        push @peers, { ip => $1, as => $2, rcv => $3 };
+    
+    # Try to get CPU/memory for Cisco devices
+    $ssh->send("show processes cpu");
+    $ssh->waitfor('cisco#|cisco%', $tout) or goto CLOSE;
+    my $cpu_output = $ssh->before();
+    
+    my ($cpu_usage) = $cpu_output =~ /CPU utilization for five seconds:\s+(\d+)%/i;
+    log_msg($lfh, "  CPU 5sec: " . ($cpu_usage ? "$cpu_usage%" : "N/A"));
+    
+    $ssh->send("show memory");
+    $ssh->waitfor('cisco#|cisco%', $tout) or goto CLOSE;
+    my $mem_output = $ssh->before();
+    
+    if ($mem_output =~ /Processor.*\n.*(\d+)\s+\d+\s+(\d+)/m) {
+        my ($total, $free) = ($1, $2);
+        my $used_pct = int(100 * ($total - $free) / $total);
+        log_msg($lfh, "  Memory Usage: ${used_pct}%");
     }
-
-    if (!@peers) {
-        log_out("  No active BGP peers found.\n");
-        $ssh->close();
-        return;
-    }
-
-    log_out(sprintf("  %-18s %-8s %-12s %-12s %-10s %s\n",
-        'Neighbor', 'AS', 'Received', 'Advertised', 'Accepted', 'Status'));
-    log_out("  " . "-" x 68 . "\n");
-
-    for my $peer (@peers) {
-        $ssh->send("show bgp neighbors $peer->{ip} advertised-routes | include ^Total");
-        my $adv_out = $ssh->waitfor('\$|#|>', $timeout);
-        my $adv = ($adv_out =~ /Total number.*?(\d+)/i) ? $1 : 'N/A';
-
-        $ssh->send("show bgp neighbors $peer->{ip} | include ^  Prefixes");
-        my $prefix_out = $ssh->waitfor('\$|#|>', 10);
-        my $accepted = ($prefix_out =~ /Prefixes Current:\s+(\d+)/i) ? $1 : $peer->{rcv};
-
-        my $flag = ($peer->{rcv} >= $threshold) ? ' [FULL-TABLE]'
-                 : ($peer->{rcv} >= $threshold * 0.9) ? ' [NEAR-FULL]'
-                 : '';
-
-        log_out(sprintf("  %-18s %-8s %-12s %-12s %-10s %s\n",
-            $peer->{ip}, $peer->{as}, $peer->{rcv}, $adv, $accepted, $flag));
-    }
-
-    log_out("  Total peers analyzed: " . scalar(@peers) . "\n");
+    
+CLOSE:
     $ssh->close();
 }
 
-for my $dev (@devices) {
-    analyze_device($dev);
+sub read_device_file {
+    my ($file) = @_;
+    open(my $fh, '<', $file) or die "Cannot open $file: $!\n";
+    my @devs = grep { chomp; $_ && !/^#/ } <$fh>;
+    close($fh);
+    return @devs;
 }
 
-close $LOG;
-log_out("\nResults written to $logfile\n");
+sub log_msg {
+    my ($fh, $msg) = @_;
+    my $timestamp = scalar(localtime());
+    my $log_line = "[$timestamp] $msg\n";
+    print $log_line;
+    print $fh $log_line;
+}
+```
