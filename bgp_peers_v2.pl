@@ -1,136 +1,150 @@
-```perl
 #!/usr/bin/perl
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use Time::Localtime;
+use POSIX qw(strftime);
 
-=head1 DEVICE HEALTH MONITOR
+# bgp_prefix_audit.pl - BGP Prefix Filter and Policy Audit
+#
+# PURPOSE:
+#   Audits BGP neighbor prefix-lists and route-maps on Cisco IOS/IOS-XE routers.
+#   Identifies neighbors missing inbound prefix filters (security risk), shows
+#   current prefix counts, and validates policy is applied consistently.
+#
+# USAGE:
+#   ./bgp_prefix_audit.pl --host <ip> --user <username> [--pass <password>]
+#                         [--log <logfile>] [--hosts-file <file>]
+#
+# PREREQUISITES:
+#   cpan Net::SSH::Expect
+#   SSH access to device with 'show' privilege level
+#
+# OUTPUT:
+#   Per-neighbor summary: state, prefix-list/route-map applied, prefix count
+#   Flags peers with no inbound filtering as [UNFILTERED]
 
-Monitors device health metrics (uptime, CPU, memory) via SSH.
-Connects to network devices, executes health check commands,
-and logs results to both STDOUT and a log file.
+my ($host, $user, $pass, $logfile, $hosts_file, $timeout);
+$timeout = 30;
 
-Usage:
-  device_health.pl --host 192.168.1.1 --user admin --password pass [--log health.log]
-  device_health.pl --file devices.txt --user admin --password pass
-  
-Arguments:
-  --host           Single device hostname/IP
-  --file           File with list of devices (one per line)
-  --user           SSH username (required)
-  --password       SSH password (required)
-  --log            Output log file (optional, default: device_health.log)
-  --timeout        SSH timeout in seconds (default: 10)
-
-Prerequisites:
-  - Net::SSH::Expect Perl module
-  - SSH access to network devices
-  - Device prompt detection (cisco% or cisco#)
-
-=cut
-
-my ($host, $device_file, $user, $password, $logfile, $timeout);
 GetOptions(
-    'host=s'     => \$host,
-    'file=s'     => \$device_file,
-    'user=s'     => \$user,
-    'password=s' => \$password,
-    'log=s'      => \$logfile,
-    'timeout=i'  => \$timeout,
-) or die "Error in command line arguments\n";
+    'host=s'       => \$host,
+    'user=s'       => \$user,
+    'pass=s'       => \$pass,
+    'log=s'        => \$logfile,
+    'hosts-file=s' => \$hosts_file,
+    'timeout=i'    => \$timeout,
+) or die "Usage: $0 --host <ip> --user <user> [--pass <pass>] [--log <file>]\n";
 
-$logfile ||= 'device_health.log';
-$timeout ||= 10;
-die "Username required (--user)\n" unless $user;
-die "Password required (--password)\n" unless $password;
-die "Provide --host or --file\n" unless $host || $device_file;
+die "Provide --host or --hosts-file\n" unless $host || $hosts_file;
+die "Provide --user\n" unless $user;
 
-my @devices = $host ? ($host) : read_device_file($device_file);
-die "No devices specified\n" unless @devices;
+$pass //= $ENV{NET_SSH_PASS} // do {
+    system("stty -echo");
+    print "Password: ";
+    chomp($pass = <STDIN>);
+    system("stty echo");
+    print "\n";
+    $pass;
+};
 
-open(my $log_fh, '>>', $logfile) or die "Cannot open $logfile: $!\n";
-log_msg($log_fh, "=== Health Check Started ===");
+my @hosts = $host ? ($host) : do {
+    open my $fh, '<', $hosts_file or die "Cannot open $hosts_file: $!";
+    grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
+};
 
-foreach my $device (@devices) {
-    check_device_health($device, $user, $password, $timeout, $log_fh);
+my $log_fh;
+if ($logfile) {
+    open $log_fh, '>>', $logfile or die "Cannot open log $logfile: $!";
 }
 
-log_msg($log_fh, "=== Health Check Completed ===");
-close($log_fh);
-print "Results logged to $logfile\n";
+sub out {
+    my $msg = shift;
+    print $msg;
+    print $log_fh $msg if $log_fh;
+}
 
-sub check_device_health {
-    my ($dev, $usr, $pwd, $tout, $lfh) = @_;
-    
-    print "Checking $dev... ";
-    log_msg($lfh, "\nDevice: $dev");
-    
+sub audit_device {
+    my ($device) = @_;
+    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    out("\n=== BGP Prefix Policy Audit: $device [$ts] ===\n");
+
     my $ssh = Net::SSH::Expect->new(
-        host => $dev,
-        user => $usr,
-        password => $pwd,
-        timeout => $tout,
-        raw_pty => 1,
+        host        => $device,
+        user        => $user,
+        password    => $pass,
+        raw_pty     => 1,
+        timeout     => $timeout,
     );
-    
-    unless ($ssh->login()) {
-        print "FAILED\n";
-        log_msg($lfh, "  ERROR: SSH login failed");
+
+    my $login = eval { $ssh->login() };
+    if ($@ || !defined $login) {
+        out("ERROR: Connection failed to $device: $@\n");
         return;
     }
-    
-    # Execute show version to get uptime
-    $ssh->send("show version");
-    $ssh->waitfor('cisco#|cisco%', $tout) or return;
-    my $version_output = $ssh->before();
-    
-    # Parse uptime from version output
-    my ($uptime) = $version_output =~ /uptime is\s+([^\n]+)/i;
-    if ($uptime) {
-        print "OK\n";
-        log_msg($lfh, "  Uptime: $uptime");
-    } else {
-        print "PARTIAL\n";
-        log_msg($lfh, "  Uptime: Unable to parse");
+
+    $ssh->send("terminal length 0");
+    $ssh->waitfor('\$\s*#', 5);
+
+    $ssh->send("show ip bgp summary");
+    my $summary = $ssh->waitfor('\$\s*#', $timeout);
+
+    my %peers;
+    while ($summary =~ /^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\S+)\s+(\d+)/mg) {
+        my ($peer, $updown, $pfx_count) = ($1, $2, $3);
+        $peers{$peer} = { state => ($updown =~ /^\d/ ? 'Established' : $updown), prefixes => $pfx_count };
     }
-    
-    # Try to get CPU/memory for Cisco devices
-    $ssh->send("show processes cpu");
-    $ssh->waitfor('cisco#|cisco%', $tout) or goto CLOSE;
-    my $cpu_output = $ssh->before();
-    
-    my ($cpu_usage) = $cpu_output =~ /CPU utilization for five seconds:\s+(\d+)%/i;
-    log_msg($lfh, "  CPU 5sec: " . ($cpu_usage ? "$cpu_usage%" : "N/A"));
-    
-    $ssh->send("show memory");
-    $ssh->waitfor('cisco#|cisco%', $tout) or goto CLOSE;
-    my $mem_output = $ssh->before();
-    
-    if ($mem_output =~ /Processor.*\n.*(\d+)\s+\d+\s+(\d+)/m) {
-        my ($total, $free) = ($1, $2);
-        my $used_pct = int(100 * ($total - $free) / $total);
-        log_msg($lfh, "  Memory Usage: ${used_pct}%");
+
+    if (!%peers) {
+        out("  No BGP peers found or BGP not configured\n");
+        $ssh->close();
+        return;
     }
-    
-CLOSE:
+
+    $ssh->send("show ip bgp neighbors");
+    my $nbr_output = $ssh->waitfor('\$\s*#', $timeout);
+
+    my %policy;
+    my $current_peer = '';
+    for my $line (split /\n/, $nbr_output) {
+        if ($line =~ /BGP neighbor is (\d+\.\d+\.\d+\.\d+)/) {
+            $current_peer = $1;
+            $policy{$current_peer} //= { in_plist => '', out_plist => '', in_rmap => '', out_rmap => '' };
+        }
+        next unless $current_peer;
+        if ($line =~ /Inbound path policy configured is (.+)/)  { $policy{$current_peer}{in_rmap}  = $1 }
+        if ($line =~ /Outbound path policy configured is (.+)/) { $policy{$current_peer}{out_rmap} = $1 }
+        if ($line =~ /Incoming update prefix filter list is (.+)/) { $policy{$current_peer}{in_plist}  = $1 }
+        if ($line =~ /Outgoing update prefix filter list is (.+)/) { $policy{$current_peer}{out_plist} = $1 }
+    }
+
+    my ($filtered, $unfiltered) = (0, 0);
+    out(sprintf "  %-18s %-13s %-8s %-22s %-22s\n",
+        "Neighbor", "State", "Prefixes", "Inbound Filter", "Outbound Filter");
+    out("  " . "-" x 87 . "\n");
+
+    for my $peer (sort keys %peers) {
+        my $state    = $peers{$peer}{state};
+        my $pfx      = $peers{$peer}{prefixes} // '?';
+        my $p        = $policy{$peer} // {};
+        my $in_filt  = $p->{in_plist}  || $p->{in_rmap}  || '';
+        my $out_filt = $p->{out_plist} || $p->{out_rmap} || '';
+        my $flag     = (!$in_filt && $state eq 'Established') ? ' [UNFILTERED]' : '';
+        $flag ? $unfiltered++ : $filtered++;
+        out(sprintf "  %-18s %-13s %-8s %-22s %-22s%s\n",
+            $peer, $state, $pfx,
+            ($in_filt  || '(none)'),
+            ($out_filt || '(none)'),
+            $flag);
+    }
+
+    my $total = scalar keys %peers;
+    out("\n  Summary: $total peers | $unfiltered unfiltered (inbound) | $filtered filtered\n");
+    out("  WARNING: $unfiltered peer(s) have no inbound prefix filter!\n") if $unfiltered;
+
     $ssh->close();
 }
 
-sub read_device_file {
-    my ($file) = @_;
-    open(my $fh, '<', $file) or die "Cannot open $file: $!\n";
-    my @devs = grep { chomp; $_ && !/^#/ } <$fh>;
-    close($fh);
-    return @devs;
-}
-
-sub log_msg {
-    my ($fh, $msg) = @_;
-    my $timestamp = scalar(localtime());
-    my $log_line = "[$timestamp] $msg\n";
-    print $log_line;
-    print $fh $log_line;
-}
-```
+audit_device($_) for @hosts;
+out("\nDone.\n");
+close $log_fh if $log_fh;
