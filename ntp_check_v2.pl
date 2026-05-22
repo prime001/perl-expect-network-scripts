@@ -1,181 +1,183 @@
+```perl
 #!/usr/bin/perl
 # =============================================================================
-# ntp_policy_audit.pl - NTP Policy Compliance Auditor
+# ntp_compliance_audit.pl - NTP Server Compliance Auditor
 #
 # Purpose:
-#   Audits Cisco IOS/IOS-XE devices for NTP policy compliance. Verifies that
-#   configured NTP servers match an approved list, stratum levels are within
-#   acceptable bounds, and NTP authentication is enabled. Designed for
-#   environments where NTP accuracy and security are compliance requirements.
+#   Audits network devices to verify NTP configuration against an approved
+#   server whitelist. Checks for unauthorized NTP sources, verifies
+#   authentication is enabled, and flags stratum-1 references (potential
+#   misconfiguration). Essential for PCI-DSS / SOC2 time-source compliance.
 #
 # Usage:
-#   Single device:   ./ntp_policy_audit.pl -h 192.168.1.1
-#   Device list:     ./ntp_policy_audit.pl -f devices.txt
-#   With logging:    ./ntp_policy_audit.pl -f devices.txt -l audit.log
-#   Custom policy:   ./ntp_policy_audit.pl -f devices.txt -s 10.0.0.1,10.0.0.2 -m 3
+#   ./ntp_compliance_audit.pl -h 192.168.1.1 [-u admin] [-p password]
+#   ./ntp_compliance_audit.pl -f device_list.txt [-u admin] [-p password]
+#   ./ntp_compliance_audit.pl -h 10.0.0.1 -w whitelist.txt -l audit.log
 #
 # Options:
-#   -h <host>      Single device IP or hostname
-#   -f <file>      File containing device IPs, one per line (# for comments)
-#   -l <logfile>   Output log file path (optional)
-#   -u <user>      SSH username (default: admin)
-#   -p <pass>      SSH password (will prompt if omitted)
-#   -s <servers>   Comma-separated approved NTP server IPs to enforce
-#   -m <stratum>   Maximum acceptable stratum level (default: 4)
+#   -h <host>        Single device IP or hostname
+#   -f <file>        File containing one device IP per line
+#   -u <user>        SSH username (default: admin)
+#   -p <password>    SSH password (prompts if omitted)
+#   -w <whitelist>   File with approved NTP server IPs, one per line
+#   -l <logfile>     Output log file (default: ntp_audit_YYYYMMDD.log)
+#   -t <timeout>     SSH timeout in seconds (default: 15)
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
-#   cpan Getopt::Long
-#
-# Output:
-#   PASS/FAIL per device with specific policy violations listed.
-#   Exit code 0 = all pass, 1 = one or more failures.
+#   cpan Net::SSH::Expect Term::ReadKey
+#   Tested against Cisco IOS/IOS-XE. Adapts to NX-OS with minor changes.
 # =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Std;
 use POSIX qw(strftime);
+use Term::ReadKey;
 
-my ($opt_host, $opt_file, $opt_log, $opt_user, $opt_pass, $opt_servers, $opt_maxstratum);
-$opt_user       = 'admin';
-$opt_maxstratum = 4;
+my %opts;
+getopts('h:f:u:p:w:l:t:', \%opts);
 
-GetOptions(
-    'h=s' => \$opt_host,
-    'f=s' => \$opt_file,
-    'l=s' => \$opt_log,
-    'u=s' => \$opt_user,
-    'p=s' => \$opt_pass,
-    's=s' => \$opt_servers,
-    'm=i' => \$opt_maxstratum,
-) or die "Usage: $0 -h <host> | -f <file> [-l log] [-u user] [-p pass] [-s servers] [-m stratum]\n";
+my $username  = $opts{u} || 'admin';
+my $timeout   = $opts{t} || 15;
+my $timestamp = strftime('%Y%m%d_%H%M%S', localtime);
+my $logfile   = $opts{l} || "ntp_audit_${timestamp}.log";
 
-die "Specify -h <host> or -f <file>\n" unless $opt_host || $opt_file;
+unless ($opts{h} || $opts{f}) {
+    die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-w whitelist] [-l logfile]\n";
+}
 
-unless ($opt_pass) {
-    print "SSH password: ";
-    system('stty', '-echo');
-    chomp($opt_pass = <STDIN>);
-    system('stty', 'echo');
+my $password = $opts{p};
+unless ($password) {
+    print "SSH Password: ";
+    ReadMode('noecho');
+    chomp($password = <STDIN>);
+    ReadMode('restore');
     print "\n";
 }
 
-my @approved = $opt_servers ? split(/,\s*/, $opt_servers) : ();
+my %whitelist;
+if ($opts{w} && -f $opts{w}) {
+    open my $wfh, '<', $opts{w} or die "Cannot open whitelist $opts{w}: $!";
+    while (<$wfh>) {
+        chomp;
+        s/\s+//g;
+        $whitelist{$_} = 1 if $_;
+    }
+    close $wfh;
+}
 
 my @devices;
-if ($opt_file) {
-    open my $fh, '<', $opt_file or die "Cannot open '$opt_file': $!\n";
-    while (<$fh>) {
-        chomp; s/\s*#.*//;
-        push @devices, $_ if /\S/;
-    }
+if ($opts{h}) {
+    push @devices, $opts{h};
+} elsif ($opts{f}) {
+    open my $fh, '<', $opts{f} or die "Cannot open device file $opts{f}: $!";
+    while (<$fh>) { chomp; push @devices, $_ if /\S/; }
     close $fh;
-} else {
-    @devices = ($opt_host);
 }
 
-my $log_fh;
-if ($opt_log) {
-    open $log_fh, '>', $opt_log or die "Cannot open log '$opt_log': $!\n";
+open my $log, '>', $logfile or die "Cannot open log $logfile: $!";
+
+sub output {
+    my $msg = shift;
+    print $msg;
+    print $log $msg;
 }
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-log_out("=" x 68);
-log_out("NTP Policy Compliance Audit  --  $ts");
-log_out("Max stratum: $opt_maxstratum  |  Approved servers: " .
-    (@approved ? join(', ', @approved) : '(any)'));
-log_out("=" x 68);
+output("NTP Compliance Audit - $timestamp\n");
+output("=" x 60 . "\n");
+output(sprintf("Whitelist: %s\n", scalar(keys %whitelist) ? "$opts{w} (" . scalar(keys %whitelist) . " entries)" : "none (report-only mode)"));
+output("Devices: " . scalar(@devices) . "\n\n");
 
-my ($total_pass, $total_fail) = (0, 0);
+my ($pass_count, $fail_count, $error_count) = (0, 0, 0);
 
-for my $dev (@devices) {
-    log_out("\n[$dev]");
-    my @issues = audit_device($dev);
-    if (@issues) {
-        log_out("  STATUS: FAIL");
-        log_out("  - $_") for @issues;
-        $total_fail++;
-    } else {
-        log_out("  STATUS: PASS");
-        $total_pass++;
+for my $host (@devices) {
+    output("Device: $host\n");
+    output("-" x 40 . "\n");
+
+    my $ssh = Net::SSH::Expect->new(
+        host        => $host,
+        user        => $username,
+        password    => $password,
+        timeout     => $timeout,
+        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+    );
+
+    my $login_output;
+    eval { $login_output = $ssh->login() };
+    if ($@ || !defined $login_output) {
+        output("  ERROR: Connection failed - $@\n\n");
+        $error_count++;
+        next;
     }
-}
 
-my $total = $total_pass + $total_fail;
-log_out("\n" . "=" x 68);
-log_out(sprintf("Result: %d/%d compliant (%.0f%%)",
-    $total_pass, $total, $total ? $total_pass / $total * 100 : 0));
-log_out("=" x 68);
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('\$|#|>', 5);
 
-close $log_fh if $log_fh;
-exit($total_fail ? 1 : 0);
+    $ssh->send("show ntp associations\n");
+    my $assoc_output = $ssh->waitfor('\$|#|>', $timeout) // '';
 
-sub audit_device {
-    my ($dev) = @_;
-    my @issues;
+    $ssh->send("show ntp status\n");
+    my $status_output = $ssh->waitfor('\$|#|>', $timeout) // '';
 
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host     => $dev,
-            user     => $opt_user,
-            password => $opt_pass,
-            raw_pty  => 1,
-            timeout  => 20,
-        );
-    };
-    return ("Connection object creation failed: $@") if $@;
+    $ssh->send("show run | include ntp\n");
+    my $config_output = $ssh->waitfor('\$|#|>', $timeout) // '';
 
-    eval { $ssh->login() };
-    return ("Authentication failed: $@") if $@;
-
-    $ssh->exec('terminal length 0');
-
-    my $status = $ssh->exec('show ntp status')                        // '';
-    my $cfg    = $ssh->exec('show running-config | include ntp')      // '';
     $ssh->close();
 
-    # Sync state
-    if ($status =~ /unsynchronized|not synchronized/i || $status !~ /synchronized/i) {
-        push @issues, "NTP clock is not synchronized";
+    my @configured_servers;
+    while ($config_output =~ /ntp\s+server\s+(\S+)/gi) {
+        push @configured_servers, $1;
     }
 
-    # Stratum level
-    if ($status =~ /stratum\s+(\d+)/i) {
-        push @issues, "Stratum $1 exceeds policy maximum of $opt_maxstratum"
-            if $1 > $opt_maxstratum;
-    }
+    my $auth_enabled = ($config_output =~ /ntp\s+authenticate/i) ? 'YES' : 'NO';
+    my $synced       = ($status_output =~ /Clock is synchronized/i) ? 'YES' : 'NO';
 
-    # Approved server enforcement
-    if (@approved) {
-        my %approved_map = map { $_ => 1 } @approved;
-        my @configured;
-        push @configured, $1 while $cfg =~ /ntp\s+server\s+([\d\.]+)/gi;
+    my ($stratum) = ($status_output =~ /stratum\s+(\d+)/i);
+    $stratum //= 'unknown';
 
-        for my $s (@configured) {
-            push @issues, "Unauthorized NTP server configured: $s"
-                unless $approved_map{$s};
+    output("  Sync Status  : $synced\n");
+    output("  Stratum      : $stratum\n");
+    output("  Auth Enabled : $auth_enabled\n");
+    output("  Configured Servers:\n");
+
+    my $device_compliant = 1;
+    for my $srv (@configured_servers) {
+        my $status = '';
+        if (%whitelist) {
+            $status = $whitelist{$srv} ? '[APPROVED]' : '[UNAUTHORIZED]';
+            $device_compliant = 0 unless $whitelist{$srv};
         }
-        my %configured_map = map { $_ => 1 } @configured;
-        for my $s (@approved) {
-            push @issues, "Required NTP server missing: $s"
-                unless $configured_map{$s};
-        }
+        output("    $srv $status\n");
+    }
+    output("    (none configured)\n") unless @configured_servers;
+
+    if ($stratum eq '1') {
+        output("  WARNING: Device references a stratum-1 source directly\n");
+        $device_compliant = 0;
+    }
+    if ($auth_enabled eq 'NO') {
+        output("  WARNING: NTP authentication not enabled\n");
+        $device_compliant = 0 if %whitelist;
     }
 
-    # Authentication
-    push @issues, "NTP authentication not configured"
-        unless $cfg =~ /ntp\s+authenticate\b/i;
-
-    push @issues, "NTP authentication key not defined"
-        unless $cfg =~ /ntp\s+authentication-key\s+\d+/i;
-
-    return @issues;
+    if (%whitelist) {
+        my $verdict = $device_compliant ? 'PASS' : 'FAIL';
+        output("  Compliance   : $verdict\n");
+        $device_compliant ? $pass_count++ : $fail_count++;
+    }
+    output("\n");
 }
 
-sub log_out {
-    my ($line) = @_;
-    print "$line\n";
-    print $log_fh "$line\n" if $log_fh;
+output("=" x 60 . "\n");
+output("Summary: " . scalar(@devices) . " devices | ");
+if (%whitelist) {
+    output("PASS=$pass_count FAIL=$fail_count ERROR=$error_count\n");
+} else {
+    output("ERROR=$error_count (report-only, no whitelist provided)\n");
 }
+output("Log: $logfile\n");
+
+close $log;
+exit($fail_count > 0 ? 1 : 0);
+```
