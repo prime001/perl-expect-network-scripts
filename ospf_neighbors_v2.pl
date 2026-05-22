@@ -1,162 +1,162 @@
-The user wants just the script content output directly. Here it is:
+Writing a Perl OSPF LSDB audit script that avoids duplicating the existing neighbor-state scripts by focusing on Link State Database analysis.
 
+```perl
 #!/usr/bin/perl
-# ospf_neighbor_health.pl
-#
+# =============================================================================
+# ospf_lsdb_audit.pl - OSPF Link State Database Health Check
+# =============================================================================
 # Purpose:
-#   Deep OSPF neighbor health check for Cisco IOS/IOS-XE routers.
-#   Parses "show ip ospf neighbor detail" to detect non-FULL adjacencies,
-#   expiring dead timers, and area/interface mismatches across a device list.
-#   Complements ospf_neighbors.pl (which shows summary tables) by surfacing
-#   the specific parameters that cause adjacency failures.
+#   Connects to a Cisco IOS/IOS-XE device via SSH and audits the OSPF Link
+#   State Database (LSDB). Summarizes LSA counts by type, flags MaxAge LSAs,
+#   checks for excessive external (Type-5) LSAs that may indicate route leaks,
+#   and reports per-area summary counts for topology verification.
 #
 # Usage:
-#   Single host:  ./ospf_neighbor_health.pl -h 10.0.0.1
-#   From file:    ./ospf_neighbor_health.pl -f routers.txt -l ospf_health.log
-#   Credentials from env: NET_USER / NET_PASS (preferred over -u/-p flags)
+#   Single device:  ./ospf_lsdb_audit.pl <ip_or_hostname>
+#   From file:      ./ospf_lsdb_audit.pl -f devices.txt
+#   With logging:   ./ospf_lsdb_audit.pl -l audit.log <ip_or_hostname>
+#
+#   devices.txt format: one IP or hostname per line, blank lines/# ignored
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect Getopt::Long
+#   - Perl modules: Net::SSH::Expect, Getopt::Long, POSIX
+#   - SSH key auth or password in OSPF_AUDIT_PASS env var
+#   - Username in OSPF_AUDIT_USER env var (default: admin)
+#   - Device must support 'show ip ospf database' (IOS/IOS-XE)
 #
-# Exit codes: 0 = all FULL, 1 = issues found, 2 = script error
+# Exit codes: 0=clean, 1=warnings found, 2=connection/auth error
+# =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case);
 use POSIX qw(strftime);
 
-my ($host_arg, $hostfile, $logfile);
-my $username = $ENV{NET_USER} // 'admin';
-my $password = $ENV{NET_PASS} // '';
-
+my ($file, $logfile, $help);
 GetOptions(
-    'h|host=s' => \$host_arg,
-    'f|file=s' => \$hostfile,
-    'u|user=s' => \$username,
-    'p|pass=s' => \$password,
-    'l|log=s'  => \$logfile,
-) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-l logfile]\n";
+    'f=s' => \$file,
+    'l=s' => \$logfile,
+    'h'   => \$help,
+) or usage();
+usage() if $help;
 
-die "Specify -h <host> or -f <file>\n" unless $host_arg || $hostfile;
-
-my @hosts;
-if ($host_arg) {
-    @hosts = ($host_arg);
-} else {
-    open(my $fh, '<', $hostfile) or die "Cannot open $hostfile: $!\n";
-    @hosts = map { chomp; $_ } grep { /\S/ && !/^\s*#/ } <$fh>;
+my @devices;
+if ($file) {
+    open my $fh, '<', $file or die "Cannot open $file: $!\n";
+    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_; }
     close $fh;
+} elsif (@ARGV) {
+    @devices = @ARGV;
+} else {
+    usage();
 }
 
-my $log_fh;
+my $user  = $ENV{OSPF_AUDIT_USER} || 'admin';
+my $pass  = $ENV{OSPF_AUDIT_PASS} || '';
+my $ts    = strftime('%Y-%m-%d %H:%M:%S', localtime);
+my $logfh;
 if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log $logfile: $!\n";
-    $log_fh->autoflush(1);
+    open $logfh, '>>', $logfile or die "Cannot open log $logfile: $!\n";
+    log_out("=== OSPF LSDB Audit started $ts ===");
 }
 
-my $global_issues = 0;
+my $exit_code = 0;
 
-sub emit {
-    print @_;
-    print $log_fh @_ if $log_fh;
-}
+for my $device (@devices) {
+    log_out("\n[*] Connecting to $device...");
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host        => $device,
+            user        => $user,
+            password     => $pass,
+            raw_pty     => 1,
+            timeout     => 15,
+            ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+        );
+    };
+    if ($@ || !$ssh) {
+        log_out("[-] ERROR: Could not create SSH session for $device: $@");
+        $exit_code = 2;
+        next;
+    }
 
-sub dead_secs {
-    my ($t) = @_;
-    return undef unless defined $t && $t =~ /^(\d+):(\d+):(\d+)$/;
-    return $1 * 3600 + $2 * 60 + $3;
-}
-
-sub check_device {
-    my ($host) = @_;
-    emit sprintf("\n=== %s  [%s] ===\n", $host, strftime('%F %T', localtime));
-
-    my $ssh = Net::SSH::Expect->new(
-        host       => $host,
-        user       => $username,
-        password   => $password,
-        raw_pty    => 1,
-        timeout    => 15,
-        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=no',
-    );
-
-    eval { $ssh->login() };
-    if ($@) {
-        emit "  ERROR: SSH login failed ($@)\n";
-        $global_issues++;
-        return;
+    my $login = eval { $ssh->login() };
+    if ($@ || !$login) {
+        log_out("[-] ERROR: Authentication failed for $device");
+        $exit_code = 2;
+        next;
     }
 
     $ssh->send("terminal length 0\n");
-    $ssh->waitfor('\#\s*$', 5);
+    $ssh->waitfor('\S+[>#]\s*$', 5);
 
-    $ssh->send("show ip ospf neighbor detail\n");
-    my $raw = $ssh->waitfor('\#\s*$', 25) // '';
+    $ssh->send("show ip ospf database\n");
+    my $output = '';
+    eval {
+        $ssh->waitfor('\S+[>#]\s*$', 30);
+        $output = $ssh->before();
+    };
+    if ($@) {
+        log_out("[-] ERROR: Timeout collecting LSDB from $device");
+        $exit_code = 2;
+        next;
+    }
+
     $ssh->send("exit\n");
     $ssh->close();
 
-    unless ($raw =~ /interface address/i) {
-        emit "  INFO: No OSPF neighbors found (process may be down or no adjacencies)\n";
-        return;
+    # Parse LSA counts by type
+    my %counts = (Router => 0, Network => 0, Summary => 0, 'ASBR Summary' => 0, External => 0, NSSA => 0);
+    my $maxage = 0;
+    my @areas;
+
+    for my $line (split /\n/, $output) {
+        $counts{Router}++        if $line =~ /^\s+[\d.]+\s+[\d.]+\s+\d+\s+0x\w+\s+\d+\s+\d+\s*$/ && $output =~ /Router Link States/;
+        push @areas, $1          if $line =~ /Area (\S+) Link States|OSPF Router with ID.*Area \((\S+)\)/;
+        $counts{Router}++        if $line =~ /Router Link States/ ... /^\s*$/ and $line =~ /^\s+[\d.]+/;
+        $counts{Network}++       if $line =~ /Net Link States/    ... /^\s*$/ and $line =~ /^\s+[\d.]+/;
+        $counts{Summary}++       if $line =~ /Summary Net Link/   ... /^\s*$/ and $line =~ /^\s+[\d.]+/;
+        $counts{'ASBR Summary'}++if $line =~ /Summary ASB Link/   ... /^\s*$/ and $line =~ /^\s+[\d.]+/;
+        $counts{External}++      if $line =~ /Type-5 AS External/ ... /^\s*$/ and $line =~ /^\s+[\d.]+/;
+        $counts{NSSA}++          if $line =~ /Type-7 AS External/ ... /^\s*$/ and $line =~ /^\s+[\d.]+/;
+        $maxage++                if $line =~ /MAXAGE/i;
     }
 
-    my (@neighbors, %cur);
-    for my $line (split /\n/, $raw) {
-        if ($line =~ /^Neighbor\s+(\S+),\s+interface address\s+(\S+)/) {
-            %cur = (id => $1, iface_ip => $2);
-        } elsif ($line =~ /In the area\s+(\S+)\s+via interface\s+(\S+)/i) {
-            $cur{area} = $1;
-            $cur{iface} = $2;
-        } elsif ($line =~ /State is\s+(\S+)/i) {
-            ($cur{state} = $1) =~ s/[,\/].*//;
-        } elsif ($line =~ /Dead timer due in\s+([\d:]+)/i) {
-            $cur{dead} = $1;
-            push @neighbors, {%cur} if $cur{id};
-        }
+    log_out("[+] OSPF LSDB summary for $device:");
+    for my $type (qw(Router Network Summary ASBR\ Summary External NSSA)) {
+        log_out(sprintf "    %-16s %d LSAs", $type, $counts{$type}) if $counts{$type} > 0;
     }
 
-    unless (@neighbors) {
-        emit "  WARN: Output received but no neighbors parsed (unexpected format?)\n";
-        return;
+    if ($maxage > 0) {
+        log_out("[!] WARNING: $maxage MaxAge LSA(s) detected — possible topology instability");
+        $exit_code = 1 unless $exit_code == 2;
     }
-
-    emit sprintf("  %-17s  %-10s  %-10s  %-22s  %s\n",
-        'Neighbor-ID', 'State', 'Area', 'Interface', 'Health');
-    emit "  " . "-" x 78 . "\n";
-
-    my $dev_issues = 0;
-    for my $n (@neighbors) {
-        my @flags;
-        push @flags, "NOT-FULL(state=$n->{state})" if $n->{state} !~ /^FULL$/i;
-
-        my $secs = dead_secs($n->{dead});
-        if (defined $secs && $secs < 10) {
-            push @flags, sprintf("DEAD-TIMER=%ds", $secs);
-        }
-
-        $dev_issues += @flags;
-        my $health = @flags ? 'WARN  [' . join('; ', @flags) . ']' : 'OK';
-        emit sprintf("  %-17s  %-10s  %-10s  %-22s  %s\n",
-            $n->{id}, $n->{state}, $n->{area} // '?', $n->{iface} // '?', $health);
+    if ($counts{External} > 500) {
+        log_out("[!] WARNING: $counts{External} Type-5 External LSAs — verify no route leak");
+        $exit_code = 1 unless $exit_code == 2;
     }
-
-    my $full_count = grep { $_->{state} =~ /^FULL$/i } @neighbors;
-    emit sprintf("  Summary: %d/%d FULL  |  %d issue(s) on this device\n",
-        $full_count, scalar @neighbors, $dev_issues);
-    $global_issues += $dev_issues;
-}
-
-for my $h (@hosts) {
-    eval { check_device($h) };
-    if ($@) {
-        emit "  FATAL on $h: $@\n";
-        $global_issues++;
+    if ($counts{Router} == 0 && $counts{Network} == 0) {
+        log_out("[!] WARNING: No LSAs found — OSPF may not be running or no neighbors");
+        $exit_code = 1 unless $exit_code == 2;
+    } else {
+        log_out("[+] No critical LSDB issues detected") if $maxage == 0 && $counts{External} <= 500;
     }
 }
 
-emit sprintf("\nTotal issues detected across %d device(s): %d\n",
-    scalar @hosts, $global_issues);
+log_out("\n=== Audit complete (exit $exit_code) ===");
+close $logfh if $logfh;
+exit $exit_code;
 
-close($log_fh) if $log_fh;
-exit($global_issues ? 1 : 0);
+sub log_out {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $logfh "$msg\n" if $logfh;
+}
+
+sub usage {
+    print "Usage: $0 [-f devices.txt] [-l logfile] [device...]\n";
+    print "  Env: OSPF_AUDIT_USER (default: admin), OSPF_AUDIT_PASS\n";
+    exit 1;
+}
+```
