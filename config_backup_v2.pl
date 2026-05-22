@@ -1,178 +1,193 @@
-The write permission was denied. The task asks to "Output ONLY the script content" — here it is:
-
 #!/usr/bin/perl
-#
-# stp_audit.pl - Spanning Tree Protocol Audit Tool
-#
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE switches via SSH and audits the STP topology.
-#   Reports root bridge identity per VLAN, port roles/states, topology change
-#   counters, and flags potential issues (TCN storms, inconsistent ports,
-#   ports stuck in non-forwarding states).
-#
-# Usage:
-#   ./stp_audit.pl <host>                    # single device
-#   ./stp_audit.pl -f devices.txt            # batch from file (one IP per line)
-#   ./stp_audit.pl <host> -l stp_audit.log   # with log file
-#   ./stp_audit.pl <host> -v 10,20,100       # audit specific VLANs only
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH key auth or set NETDEV_PASS env variable for password auth
-#   NETDEV_USER env variable (default: admin)
-#
-# Output:
-#   Per-device summary: STP mode, root bridge, port count by state,
-#   topology change stats, and any flagged anomalies.
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config pass_through);
-use POSIX qw(strftime);
+use Getopt::Long;
+use Time::HiRes qw(time);
 
-my $user     = $ENV{NETDEV_USER} || 'admin';
-my $pass     = $ENV{NETDEV_PASS} || '';
-my $timeout  = 20;
-my $logfile  = '';
-my $devfile  = '';
-my $vlans    = '';
+=head1 NAME
+interface_error_monitor.pl - Monitor interface errors and status across network devices
 
+=head1 SYNOPSIS
+./interface_error_monitor.pl -host <ip|hostname> [-user <username>] [-pass <password>] [-file <device_list>] [-log <logfile>]
+
+=head1 DESCRIPTION
+Connects to network device(s) via SSH and monitors interface health by collecting:
+- Interface operational status (up/down)
+- Error counters (CRC, runts, giants, collisions)
+- Discard counters (input/output drops)
+- Interface statistics and anomalies
+
+Useful for network monitoring, NOC operations, and troubleshooting interface issues.
+Can process single device or read multiple devices from file (one per line).
+
+=head1 PREREQUISITES
+- Net::SSH::Expect module
+- Expect installed
+- SSH access to Cisco devices (IOS/IOS-XE/IOS-XR)
+- Device credentials (SSH username/password)
+
+=head1 EXAMPLES
+./interface_error_monitor.pl -host 192.168.1.1 -user admin -pass secret
+./interface_error_monitor.pl -file devices.txt -user netadmin -log interface_report.log
+./interface_error_monitor.pl -host router.local -user netadmin
+
+=head1 EXIT CODES
+0 = Success
+1 = Connection or authentication error
+2 = Device unreachable
+3 = Invalid input arguments
+
+=cut
+
+my ($host, $user, $pass, $devicefile, $logfile, $timeout);
 GetOptions(
-    'f=s' => \$devfile,
-    'l=s' => \$logfile,
-    'v=s' => \$vlans,
-);
+    'host=s'    => \$host,
+    'file=s'    => \$devicefile,
+    'user=s'    => \$user,
+    'pass=s'    => \$pass,
+    'log=s'     => \$logfile,
+    'timeout=i' => \$timeout,
+) or die "Usage: $0 -host <ip|hostname> | -file <device_list> [-user <username>] [-pass <password>] [-log <logfile>]\n";
 
-my @hosts = $devfile ? read_hosts($devfile) : @ARGV;
-die "Usage: $0 <host> [-f file] [-l logfile] [-v vlan_list]\n" unless @hosts;
+die "Usage: Specify either -host or -file argument\n" unless ($host || $devicefile);
 
-my $log_fh;
-if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open logfile $logfile: $!\n";
+$user    //= 'admin';
+$pass    //= $ENV{DEVICE_PASSWORD} || '';
+$timeout //= 20;
+
+my @devices = ();
+if ($devicefile) {
+    open my $fh, '<', $devicefile or die "Cannot open device file: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/;
+        next if /^\s*$/;
+        push @devices, $_;
+    }
+    close $fh;
+} else {
+    push @devices, $host;
 }
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-output("=== STP Audit started $ts ===\n", $log_fh);
-
-for my $host (@hosts) {
-    audit_device($host, $user, $pass, $timeout, $vlans, $log_fh);
-}
-
-close($log_fh) if $log_fh;
-
-sub audit_device {
-    my ($host, $user, $pass, $timeout, $vlans, $log_fh) = @_;
-
-    output("\n--- Device: $host ---\n", $log_fh);
-
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host        => $host,
-            user        => $user,
-            password    => $pass,
-            raw_pty     => 1,
-            timeout     => $timeout,
-            ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
-        );
-    };
-    if ($@) {
-        output("ERROR: Failed to create SSH session for $host: $@\n", $log_fh);
-        return;
-    }
-
-    my $login = eval { $ssh->login() };
-    if ($@ || !$login) {
-        output("ERROR: Authentication failed for $host\n", $log_fh);
-        return;
-    }
-
-    $ssh->exec("terminal length 0");
-
-    my $stp_sum = $ssh->exec("show spanning-tree summary");
-    if (!$stp_sum) {
-        output("ERROR: No response from $host — timed out\n", $log_fh);
-        return;
-    }
-
-    my ($mode) = $stp_sum =~ /Switch is in (\S+(?:\s+\S+)?)\s+mode/i;
-    $mode //= 'unknown';
-    output("STP Mode : $mode\n", $log_fh);
-
-    my $stp_detail = $vlans
-        ? $ssh->exec("show spanning-tree vlan $vlans")
-        : $ssh->exec("show spanning-tree");
-
-    parse_and_report($stp_detail, $log_fh);
-
-    my $tcn_output = $ssh->exec("show spanning-tree detail | include ieee|occur|topology");
-    report_tcn($tcn_output, $log_fh);
-
-    $ssh->close();
-}
-
-sub parse_and_report {
-    my ($output, $log_fh) = @_;
-    return unless $output;
-
-    my (%root_by_vlan, %port_states);
-    my $current_vlan = '';
-
-    for my $line (split /\n/, $output) {
-        if ($line =~ /^VLAN(\d+)\s*$/ || $line =~ /Spanning tree enabled.*VLAN\s*(\d+)/i) {
-            $current_vlan = $1;
-        }
-        if ($line =~ /This bridge is the root/i && $current_vlan) {
-            $root_by_vlan{$current_vlan} = 'THIS DEVICE';
-        }
-        if ($line =~ /Root ID.*Priority\s+(\d+)/i || $line =~ /Root\s+\S+\s+\d+\s+([\da-f]{4}\.[\da-f]{4}\.[\da-f]{4})/i) {
-            $root_by_vlan{$current_vlan} //= $1 if $current_vlan;
-        }
-        if ($line =~ /^\s+(\S+)\s+(Root|Desg|Altn|Back|BLK|FWD|LIS|LRN|Bkn)\s+(FWD|BLK|LIS|LRN|BKN)\s/i) {
-            my ($port, $role, $state) = ($1, uc($2), uc($3));
-            $port_states{$state}++;
-            if ($state =~ /^(BLK|BKN|LIS|LRN)$/ && $role eq 'DESG') {
-                output("WARN : Port $port role=DESG state=$state — check for topology issue\n", $log_fh);
-            }
-            if ($line =~ /Incon/i) {
-                output("WARN : Port $port in inconsistent state\n", $log_fh);
-            }
-        }
-    }
-
-    for my $vlan (sort { $a <=> $b } keys %root_by_vlan) {
-        output(sprintf("VLAN %-5s Root: %s\n", $vlan, $root_by_vlan{$vlan}), $log_fh);
-    }
-
-    for my $state (sort keys %port_states) {
-        output(sprintf("Ports %-4s: %d\n", $state, $port_states{$state}), $log_fh);
-    }
-}
-
-sub report_tcn {
-    my ($output, $log_fh) = @_;
-    return unless $output;
-
-    while ($output =~ /(\d+)\s+topology change(?:s)?\s+(?:occurred|detected)/gi) {
-        my $count = $1;
-        if ($count > 50) {
-            output("WARN : High topology change count ($count) — possible TCN storm\n", $log_fh);
-        } else {
-            output("Info : Topology changes: $count\n", $log_fh);
-        }
-    }
-}
-
-sub read_hosts {
-    my ($file) = @_;
-    open(my $fh, '<', $file) or die "Cannot open device file $file: $!\n";
-    my @hosts = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
-    close($fh);
-    return @hosts;
-}
-
-sub output {
-    my ($msg, $log_fh) = @_;
+sub log_msg {
+    my ($msg) = @_;
     print $msg;
-    print $log_fh $msg if $log_fh;
+    if ($logfile) {
+        open my $fh, '>>', $logfile or warn "Cannot write to $logfile: $!\n";
+        print $fh $msg;
+        close $fh;
+    }
 }
+
+sub check_device {
+    my ($device_ip) = @_;
+    my $start = time();
+    
+    my $ssh = Net::SSH::Expect->new(
+        host     => $device_ip,
+        user     => $user,
+        password => $pass,
+        timeout  => $timeout,
+        raw_pty  => 1,
+    );
+    
+    eval {
+        $ssh->login() or die "SSH login failed\n";
+        
+        log_msg "\n" . "=" x 70 . "\n";
+        log_msg "Device: $device_ip\n";
+        log_msg "=" x 70 . "\n";
+        
+        $ssh->send("terminal length 0");
+        $ssh->waitfor('timeout' => $timeout, 'match' => '/[>#]/');
+        
+        # Get device name
+        $ssh->send("show running-config | include hostname");
+        my $hostname_out = $ssh->waitfor('timeout' => $timeout, 'match' => '/[>#]/');
+        if ($hostname_out =~ /hostname\s+(\S+)/) {
+            log_msg "Hostname: $1\n";
+        }
+        
+        # Get interface status summary
+        $ssh->send("show interface summary");
+        my $summary = $ssh->waitfor('timeout' => $timeout, 'match' => '/[>#]/');
+        log_msg "\nInterface Status Summary:\n";
+        foreach my $line (split /\n/, $summary) {
+            next unless $line =~ /\d+.*\d+/;
+            log_msg "  $line\n";
+        }
+        
+        # Get detailed interface errors
+        $ssh->send("show interface | include (^[A-Za-z], errors|input errors|output errors)");
+        my $errors = $ssh->waitfor('timeout' => $timeout, 'match' => '/[>#]/');
+        
+        my @error_lines = grep { /\d+\s+errors?/i || /^\s*\d+ (input|output|CRC|runt|giant)/ } split /\n/, $errors;
+        
+        if (@error_lines > 0) {
+            log_msg "\nInterfaces with Errors/Discards:\n";
+            foreach my $line (@error_lines) {
+                $line =~ s/^\s+|\s+$//g;
+                log_msg "  $line\n" if $line;
+            }
+        } else {
+            log_msg "\nNo interface errors detected.\n";
+        }
+        
+        # Check for down interfaces
+        $ssh->send("show interface brief | include down");
+        my $down_intf = $ssh->waitfor('timeout' => $timeout, 'match' => '/[>#]/');
+        
+        if ($down_intf && $down_intf !~ /^\s*$/) {
+            log_msg "\nDown Interfaces:\n";
+            foreach my $line (split /\n/, $down_intf) {
+                next if $line =~ /^Interface|---/;
+                log_msg "  $line\n" if $line =~ /\S/;
+            }
+        }
+        
+        # Get CRC and collision errors
+        $ssh->send("show interface | include (CRC|collision|runts|giants)");
+        my $crc_out = $ssh->waitfor('timeout' => $timeout, 'match' => '/[>#]/');
+        
+        my @crc_lines = grep { /\d+/ && !/^\s*$/ } split /\n/, $crc_out;
+        if (@crc_lines > 0) {
+            log_msg "\nDetailed Error Counters:\n";
+            foreach my $line (@crc_lines) {
+                $line =~ s/^\s+|\s+$//g;
+                log_msg "  $line\n" if $line;
+            }
+        }
+        
+        $ssh->close();
+        
+        my $elapsed = time() - $start;
+        log_msg "\nCompleted in " . sprintf("%.2f", $elapsed) . "s\n";
+        return 1;
+        
+    } or do {
+        my $error = $@;
+        log_msg "\n[ERROR] Failed to check device: $error\n";
+        return 0;
+    };
+}
+
+log_msg "[START] Interface Error Monitor - " . scalar(localtime) . "\n";
+log_msg "Monitoring " . scalar(@devices) . " device(s)\n";
+
+my $success_count = 0;
+my $fail_count = 0;
+
+foreach my $dev (@devices) {
+    if (check_device($dev)) {
+        $success_count++;
+    } else {
+        $fail_count++;
+    }
+}
+
+log_msg "\n" . "=" x 70 . "\n";
+log_msg "Summary: $success_count successful, $fail_count failed\n";
+log_msg "[END] " . scalar(localtime) . "\n";
+
+exit ($fail_count > 0 ? 1 : 0);
