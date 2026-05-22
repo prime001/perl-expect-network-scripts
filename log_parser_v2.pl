@@ -1,159 +1,122 @@
 ```perl
 #!/usr/bin/perl
-# =============================================================================
-# syslog_analyzer.pl - Cisco IOS/IOS-XE Syslog Severity Analyzer
-#
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE devices via SSH, retrieves the syslog buffer,
-#   and classifies entries by severity level (0-7). Detects common event
-#   patterns: interface flaps, memory pressure, CPU spikes, auth failures,
-#   and routing protocol changes. Useful for rapid triage during incidents or
-#   as part of a scheduled health check pipeline.
-#
-# Usage:
-#   ./syslog_analyzer.pl <device_ip> [--user USER] [--pass PASS] [--log FILE]
-#   ./syslog_analyzer.pl --file devices.txt [--user USER] [--pass PASS] [--log FILE]
-#
-# Options:
-#   --user <username>   SSH username (default: admin)
-#   --pass <password>   SSH password (prompted securely if omitted)
-#   --log  <file>       Append output to log file in addition to STDOUT
-#   --file <file>       Read device IPs/hostnames from file (one per line)
-#
-# Prerequisites:
-#   cpan install Net::SSH::Expect
-#   SSH access (port 22) with 'show logging' privilege on target devices
-#
-# Examples:
-#   ./syslog_analyzer.pl 10.0.1.1 --user netops --log /var/log/syslog_rpt.txt
-#   ./syslog_analyzer.pl --file routers.txt --user netops --pass s3cret
-# =============================================================================
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
-use POSIX        qw(strftime);
+use Getopt::Long;
 
-my ($opt_file, $opt_user, $opt_pass, $opt_log);
+# DEVICE RESOURCE MONITOR - Network Health Check via SSH
+# Purpose: Monitor CPU, memory utilization on network devices
+# Usage: ./095_device_resource_monitor.pl --device 192.168.1.1 --user admin --pass password
+#        ./095_device_resource_monitor.pl --file devices.txt --logfile health.log
+# Prerequisites: Net::SSH::Expect, SSH access, appropriate privilege level
+# Notes: Thresholds - CPU >80%, Memory >85% trigger alerts
+#        Batch mode with --file (one device per line, use # for comments)
+
+my ($device, $user, $password, $device_file, $logfile, $timeout, $port);
 GetOptions(
-    'file=s' => \$opt_file,
-    'user=s' => \$opt_user,
-    'pass=s' => \$opt_pass,
-    'log=s'  => \$opt_log,
-) or die "Usage: $0 <device_ip> [--file FILE] [--user USER] [--pass PASS] [--log FILE]\n";
+    'device=s' => \$device,
+    'user=s' => \$user,
+    'pass=s' => \$password,
+    'file=s' => \$device_file,
+    'logfile=s' => \$logfile,
+    'timeout=i' => \$timeout,
+    'port=i' => \$port,
+) or die "Error in command line arguments\n";
 
-$opt_user //= 'admin';
+$user //= 'admin';
+$timeout //= 20;
+$port //= 22;
 
-my @devices;
-if ($opt_file) {
-    open(my $fh, '<', $opt_file) or die "Cannot open device file '$opt_file': $!\n";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_ }
-    close $fh;
-} elsif (@ARGV) {
-    push @devices, shift @ARGV;
-} else {
-    die "Usage: $0 <device_ip> [options]\n       $0 --file devices.txt [options]\n";
+die "Must specify --device or --file\n" unless ($device || $device_file);
+
+my @devices = $device ? ($device) : read_devices($device_file);
+my $logfh;
+if ($logfile) {
+    open($logfh, '>>', $logfile) or die "Cannot open $logfile: $!\n";
 }
 
-unless ($opt_pass) {
-    print STDERR "Password: ";
-    system('stty -echo 2>/dev/null');
-    chomp($opt_pass = <STDIN>);
-    system('stty echo 2>/dev/null');
-    print STDERR "\n";
+foreach my $host (@devices) {
+    check_device($host, $user, $password, $timeout, $port, $logfh);
 }
 
-my $log_fh;
-if ($opt_log) {
-    open($log_fh, '>>', $opt_log) or die "Cannot open log file '$opt_log': $!\n";
-}
+close($logfh) if $logfh;
 
-sub out {
-    my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
-}
-
-my %SEV_NAME = (
-    0 => 'EMERG', 1 => 'ALERT', 2 => 'CRIT',  3 => 'ERROR',
-    4 => 'WARN',  5 => 'NOTICE',6 => 'INFO',   7 => 'DEBUG',
-);
-
-my @PATTERNS = (
-    { re => qr/line protocol.*down|changed state to down/i, tag => 'Interface Down'        },
-    { re => qr/line protocol.*up|changed state to up/i,     tag => 'Interface Up'          },
-    { re => qr/memory.*low|insufficient memory/i,           tag => 'Memory Pressure'       },
-    { re => qr/cpu.*threshold|high cpu utilization/i,       tag => 'CPU Spike'             },
-    { re => qr/authentication fail|login fail|bad password/i,tag => 'Auth Failure'         },
-    { re => qr/neighbor.*down|adjacency.*lost|peer.*down/i, tag => 'Routing Proto Event'   },
-    { re => qr/sec_login|login.*denied|access.list.*denied/i,tag => 'Security Event'       },
-);
-
-sub analyze {
-    my ($device) = @_;
-    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-    out("\n" . ('=' x 62) . "\n");
-    out("  Device : $device\n  Time   : $ts\n");
-    out(('=' x 62) . "\n");
-
+sub check_device {
+    my ($host, $user, $pass, $timeout, $port, $logfh) = @_;
+    print "[*] Monitoring $host\n";
+    log_msg($logfh, "[*] Monitoring $host");
+    
     my $ssh = Net::SSH::Expect->new(
-        host     => $device,
-        user     => $opt_user,
-        password => $opt_pass,
-        raw_pty  => 1,
-        timeout  => 30,
+        host => $host,
+        user => $user,
+        password => $pass,
+        port => $port,
+        timeout => $timeout,
+        raw_pty => 1,
     );
-
-    my $output = eval {
-        $ssh->run_ssh()                          or die "SSH failed to start\n";
-        $ssh->waitfor('assword:\s*$', 10)        or die "Password prompt timed out\n";
-        $ssh->send($opt_pass);
-        $ssh->waitfor('[>#]\s*$', 15)            or die "Login timed out (bad credentials?)\n";
-        $ssh->send("terminal length 0");
-        $ssh->waitfor('[>#]\s*$', 10);
-        $ssh->send("show logging");
-        my $buf = $ssh->waitfor('[>#]\s*$', 45)  or die "Command timed out\n";
-        $ssh->send("exit");
-        $buf;
-    };
-    if ($@) { (my $e = $@) =~ s/\n$//; out("  ERROR: $e\n"); return }
-
-    my (%sev, %hits);
-    for my $line (split /\n/, $output) {
-        next unless $line =~ /%[A-Z0-9]+-(\d)-[A-Z0-9_]+:/;
-        my $s = $1;
-        $sev{$s}++;
-        for my $p (@PATTERNS) {
-            push @{$hits{$p->{tag}}}, $line if $line =~ $p->{re};
-        }
+    
+    eval { $ssh->login(); };
+    if ($@) {
+        print "  [!] Connection failed: $@\n";
+        log_msg($logfh, "  [!] Connection failed to $host");
+        return;
     }
-
-    if (%sev) {
-        out("\n  Severity Counts:\n");
-        for my $s (sort keys %sev) {
-            out(sprintf("    [%d] %-8s  %4d msg(s)\n", $s, $SEV_NAME{$s}//"SEV$s", $sev{$s}));
-        }
-    } else {
-        out("  No structured syslog entries found (buffer may be empty).\n");
-    }
-
-    if (%hits) {
-        out("\n  Event Patterns Detected:\n");
-        for my $tag (sort keys %hits) {
-            my @entries = @{$hits{$tag}};
-            out(sprintf("    %-22s  %d occurrence(s)\n", $tag . ':', scalar @entries));
-            for my $e (@entries) {
-                $e =~ s/^\s+|\s+$//g;
-                out("      > $e\n");
-            }
-        }
-    } else {
-        out("\n  No notable event patterns detected.\n");
-    }
+    
+    eval { $ssh->send("terminal length 0"); $ssh->waitfor('.*#', $timeout); };
+    
+    my $cpu = get_metric($ssh, "show processes cpu | include CPU utilization",
+                        'CPU utilization[^:]*:\s*(\d+)%', $timeout);
+    my $mem = get_metric($ssh, "show memory",
+                        'Processor.*?(\d+)%\s+used', $timeout);
+    my $ver = get_metric($ssh, "show version",
+                        'Cisco IOS Software.*?Version\s+(\S+)', $timeout);
+    
+    $cpu //= 0;
+    $mem //= 0;
+    $ver //= 'Unknown';
+    
+    my $status = "OK";
+    $status = "WARN" if ($cpu > 80 || $mem > 85);
+    
+    my $result = sprintf "  [%s] %s - CPU: %d%% | Memory: %d%%",
+        $status, $ver, $cpu, $mem;
+    
+    print "$result\n";
+    log_msg($logfh, $result);
+    
+    eval { $ssh->send("exit"); $ssh->waitfor('.*', 1); };
 }
 
-analyze($_) for @devices;
-out("\nAnalysis complete.\n");
-close $log_fh if $log_fh;
+sub get_metric {
+    my ($ssh, $cmd, $pattern, $timeout) = @_;
+    my $result;
+    eval {
+        $ssh->send($cmd);
+        my $output = $ssh->waitfor('.*#', $timeout);
+        $result = $1 if $output =~ /$pattern/;
+    };
+    return $result;
+}
+
+sub read_devices {
+    my ($file) = @_;
+    open my $fh, '<', $file or die "Cannot open $file: $!\n";
+    my @devices;
+    while (my $line = <$fh>) {
+        chomp($line);
+        $line =~ s/#.*//;
+        $line =~ s/^\s+|\s+$//g;
+        push @devices, $line if $line;
+    }
+    close($fh);
+    return @devices;
+}
+
+sub log_msg {
+    my ($fh, $msg) = @_;
+    return unless $fh;
+    my $timestamp = scalar(localtime);
+    print $fh "[$timestamp] $msg\n";
+}
 ```
