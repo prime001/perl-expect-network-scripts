@@ -1,144 +1,189 @@
 #!/usr/bin/perl
-#
-# vlan_trunk_audit.pl - VLAN Trunk Pruning & Utilization Auditor
-#
-# Purpose:
-#   SSH into Cisco IOS switches and audit trunk port VLAN configurations.
-#   Reports per-trunk utilization, VLANs that are allowed but inactive
-#   (pruning candidates), and allowed VLANs absent from the VLAN database.
-#   Useful for identifying trunk bloat prior to VLAN cleanup operations.
-#
-# Usage:
-#   ./vlan_trunk_audit.pl <device_ip> [username]
-#   ./vlan_trunk_audit.pl --file devices.txt [--log output.log]
-#
-# Prerequisites:
-#   SWITCH_PASS env var must be set (password auth)
-#   SWITCH_USER env var optional (default: admin)
-#   cpanm Net::SSH::Expect Getopt::Long
-#
+=head1 NAME
+device_neighbor_connectivity.pl - Audit neighbor reachability from network device
+
+=head1 DESCRIPTION
+Connects to a network device via SSH and performs ping tests to verify connectivity
+to neighbor devices. Reports reachability status, packet loss, and response times.
+Useful for validating network paths from the device's perspective and troubleshooting
+connectivity issues between network nodes.
+
+=head1 USAGE
+device_neighbor_connectivity.pl -device <ip|hostname> -targets <file|list> [options]
+
+Examples:
+  device_neighbor_connectivity.pl -device 10.1.1.1 -targets 10.1.1.2,10.1.1.3,10.1.1.4
+  device_neighbor_connectivity.pl -device core1 -targets neighbors.txt -log audit.log
+  device_neighbor_connectivity.pl -device 192.168.1.1 -targets targets.txt -user admin -pass mypass
+
+=head1 PREREQUISITES
+- Perl module: Net::SSH::Expect (install via: cpan Net::SSH::Expect)
+- SSH access to target network device
+- Target device must support 'ping <ip> count 4' command
+
+=head1 OPTIONS
+  -device <ip>      Target device IP or hostname (required)
+  -targets <source> Comma-separated IP list or file path (required)
+  -user <username>  SSH username (default: admin)
+  -pass <password>  SSH password (default: admin)
+  -log <file>       Append results to log file (optional)
+  -timeout <sec>    SSH timeout in seconds (default: 30)
+
+=cut
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config pass_through);
-use POSIX qw(strftime);
+use Getopt::Long;
+use Time::Localtime;
 
-my $username = $ENV{SWITCH_USER} // 'admin';
-my $password = $ENV{SWITCH_PASS} or die "Error: SWITCH_PASS env var not set\n";
-my $timeout  = 20;
-my ($file_opt, $log_file, $log_fh);
+my ($device, $targets_src, $user, $pass, $logfile, $timeout, $help);
 
-GetOptions('file=s' => \$file_opt, 'log=s' => \$log_file);
+GetOptions(
+    'device=s'  => \$device,
+    'targets=s' => \$targets_src,
+    'user=s'    => \$user,
+    'pass=s'    => \$pass,
+    'log=s'     => \$logfile,
+    'timeout=i' => \$timeout,
+    'help'      => \$help,
+) or die "Error in command line arguments\n";
 
-if ($log_file) {
-    open($log_fh, '>>', $log_file) or die "Cannot open log '$log_file': $!\n";
+if ($help || !$device || !$targets_src) {
+    print "Usage: $0 -device <ip> -targets <list|file> [-user user] [-pass pass] [-log file]\n";
+    exit $help ? 0 : 1;
 }
 
-sub out {
-    print @_;
-    print $log_fh @_ if $log_fh;
+$user    ||= 'admin';
+$pass    ||= 'admin';
+$timeout ||= 30;
+
+my @targets = parse_targets($targets_src);
+die "Error: No valid target IPs found\n" unless @targets;
+
+my $timestamp = get_timestamp();
+print "=== Device Neighbor Connectivity Audit ===\n";
+print "Device: $device | Targets: " . scalar(@targets) . " | Time: $timestamp\n";
+print "-" x 70 . "\n";
+
+my $log_fh;
+if ($logfile) {
+    open($log_fh, '>>', $logfile) or die "Cannot open log file $logfile: $!\n";
+    print $log_fh "\n=== Connectivity Audit - $timestamp ===\n";
+    print $log_fh "Device: $device\n";
 }
 
-sub expand_vlans {
-    my ($str) = @_;
-    my @vlans;
-    for my $seg (split /,/, $str) {
-        if ($seg =~ /^(\d+)-(\d+)$/) { push @vlans, ($1..$2) }
-        elsif ($seg =~ /^(\d+)$/)    { push @vlans, $1 }
-    }
-    return @vlans;
-}
-
-sub audit_device {
-    my ($host) = @_;
-    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-
-    my $ssh = Net::SSH::Expect->new(
-        host       => $host,
-        user       => $username,
-        password   => $password,
-        raw_pty    => 1,
-        timeout    => $timeout,
-        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+my $ssh;
+eval {
+    $ssh = Net::SSH::Expect->new(
+        host     => $device,
+        user     => $user,
+        password => $pass,
+        timeout  => $timeout,
+        raw_pty  => 1,
     );
+    $ssh->login();
+};
 
-    my $banner;
-    eval { $banner = $ssh->login() };
-    if ($@ or $banner !~ /[>#]/) {
-        out("[$ts] ERROR $host: login failed - " . ($@ || 'no prompt received') . "\n");
-        return;
-    }
-
-    $ssh->exec("terminal length 0");
-
-    my $trunk_raw = eval { $ssh->exec("show interfaces trunk") } // '';
-    my $vlan_raw  = eval { $ssh->exec("show vlan brief")       } // '';
-    $ssh->close();
-
-    # Parse active VLAN database entries
-    my %in_db;
-    $in_db{$1} = 1 while $vlan_raw =~ /^(\d+)\s+\S+\s+active/mg;
-
-    # State-machine parse of trunk output sections
-    my (%allowed, %active);
-    my $mode = '';
-    for my $line (split /\n/, $trunk_raw) {
-        $mode = 'allowed' if $line =~ /^Port\s+Vlans allowed on trunk/;
-        $mode = 'active'  if $line =~ /^Port\s+Vlans allowed and active/;
-        $mode = ''        if $line =~ /^Port\s+Vlans in spanning/;
-        next unless $mode && $line =~ /^(\S+)\s+([\d,\-]+)/;
-        my ($port, $vlans) = ($1, $2);
-        $allowed{$port} = [expand_vlans($vlans)] if $mode eq 'allowed';
-        $active{$port}  = {map { $_ => 1 } expand_vlans($vlans)} if $mode eq 'active';
-    }
-
-    out("\n=== VLAN Trunk Audit: $host  [$ts] ===\n");
-
-    unless (%allowed) {
-        out("  No trunk interfaces detected on $host\n");
-        return;
-    }
-
-    my ($total_prune, $total_ports) = (0, 0);
-    for my $port (sort keys %allowed) {
-        my @allow = @{$allowed{$port}};
-        my %act   = %{$active{$port} // {}};
-        my @prune = grep { !$act{$_} && $in_db{$_} } @allow;
-        my @no_db = grep { !$in_db{$_} && $_ != 1  } @allow;
-        my $pct   = @allow ? int(100 * keys(%act) / @allow) : 0;
-
-        out(sprintf("  %-22s  allowed: %4d  active: %4d  util: %3d%%\n",
-            $port, scalar(@allow), scalar(keys %act), $pct));
-
-        if (@prune) {
-            my $show = @prune > 10 ? join(',', @prune[0..9]) . ',...' : join(',', @prune);
-            out("    [PRUNE] ${\scalar @prune} allowed but inactive: $show\n");
-            $total_prune += @prune;
-        }
-        if (@no_db) {
-            out("    [WARN]  ${\scalar @no_db} allowed but absent from VLAN DB: " . join(',', @no_db) . "\n");
-        }
-        $total_ports++;
-    }
-
-    out(sprintf("  Summary: %d trunk(s), %d prunable VLAN slot(s) across all trunks\n",
-        $total_ports, $total_prune));
+if (!$ssh || $@) {
+    my $msg = "ERROR: Cannot connect to $device: $@";
+    print "$msg\n";
+    print $log_fh "$msg\n" if $log_fh;
+    close($log_fh) if $log_fh;
+    exit 1;
 }
 
-# --- Collect targets and run ---
-my @devices;
-if ($file_opt) {
-    open(my $fh, '<', $file_opt) or die "Cannot open '$file_opt': $!\n";
-    @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
-    close $fh;
-} elsif (@ARGV) {
-    @devices  = ($ARGV[0]);
-    $username = $ARGV[1] if $ARGV[1];
-} else {
-    die "Usage: $0 <device_ip> [username]\n" .
-        "       $0 --file devices.txt [--log audit.log]\n";
+my ($up_count, $down_count) = (0, 0);
+
+foreach my $target (@targets) {
+    my $result = ping_target($ssh, $target);
+    
+    if ($result->{reachable}) {
+        printf("%-18s UP    | Loss: %3d%% | RTT: %7s ms\n",
+            $target, $result->{loss}, $result->{rtt} // 'N/A');
+        print $log_fh "$target UP (loss: $result->{loss}%, rtt: $result->{rtt}ms)\n" if $log_fh;
+        $up_count++;
+    } else {
+        printf("%-18s DOWN  | Loss: 100%% | Unreachable\n", $target);
+        print $log_fh "$target DOWN (unreachable)\n" if $log_fh;
+        $down_count++;
+    }
 }
 
-audit_device($_) for @devices;
-close $log_fh if $log_fh;
+eval { $ssh->close(); };
+
+print "-" x 70 . "\n";
+printf("Result: %d reachable, %d unreachable\n", $up_count, $down_count);
+print $log_fh "Summary: $up_count reachable, $down_count unreachable\n" if $log_fh;
+
+close($log_fh) if $log_fh;
+exit($down_count > 0 ? 1 : 0);
+
+sub parse_targets {
+    my ($source) = @_;
+    my @ips;
+    
+    if (-f $source) {
+        open(my $fh, '<', $source) or die "Cannot read $source: $!\n";
+        while (my $line = <$fh>) {
+            chomp($line);
+            $line =~ s/#.*//;
+            $line =~ s/^\s+|\s+$//g;
+            if ($line && $line =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
+                push @ips, $line;
+            }
+        }
+        close($fh);
+    } else {
+        foreach my $ip (split /,/, $source) {
+            $ip =~ s/^\s+|\s+$//g;
+            if ($ip =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
+                push @ips, $ip;
+            }
+        }
+    }
+    
+    return @ips;
+}
+
+sub ping_target {
+    my ($ssh, $target) = @_;
+    my $result = {
+        reachable => 0,
+        loss      => 100,
+        rtt       => undef,
+    };
+    
+    eval {
+        $ssh->send("ping $target count 4");
+        my $output = '';
+        sleep 1;
+        
+        for (my $i = 0; $i < 5; $i++) {
+            last if $output =~ /\d+\s+packets?\s+(transmitted|sent)/i;
+            $output .= $ssh->read_all();
+            sleep 1 if $i < 4;
+        }
+        
+        if ($output =~ /(\d+)\s+packets?\s+transmitted.*?(\d+)\s+(?:packets?\s+)?received/i) {
+            my ($sent, $received) = ($1, $2);
+            $result->{loss} = $sent > 0 ? int((($sent - $received) / $sent) * 100) : 100;
+            $result->{reachable} = 1 if $received > 0;
+        }
+        
+        if ($output =~ /(?:round.?trip\s+)?min\/avg\/max[^=]*=\s*[\d.]+\/([\d.]+)\/[\d.]+/i) {
+            $result->{rtt} = int($1);
+        } elsif ($output =~ /average\s*=\s*([\d.]+)/i) {
+            $result->{rtt} = int($1);
+        }
+    };
+    
+    return $result;
+}
+
+sub get_timestamp {
+    my $t = localtime;
+    return sprintf("%04d-%02d-%02d %02d:%02d:%02d",
+        $t->year() + 1900, $t->mon() + 1, $t->mday(),
+        $t->hour(), $t->min(), $t->sec());
+}
