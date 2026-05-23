@@ -1,135 +1,143 @@
 ```perl
 #!/usr/bin/perl
-=pod
-device_health_check.pl - Network device CPU, memory, and temperature monitoring
-
-PURPOSE:
-  Remotely connects to network devices via SSH and collects health metrics
-  (CPU utilization, memory usage, temperature). Useful for operational
-  monitoring and capacity planning. Logs all results and alerts on thresholds.
-
-USAGE:
-  perl device_health_check.pl <device_ip> <username> <password> [--log <logfile>]
-
-EXAMPLES:
-  perl device_health_check.pl 192.168.1.1 admin password123
-  perl device_health_check.pl router1.example.com netadmin pass456 --log health.log
-
-PREREQUISITES:
-  - Expect Perl module (install via: cpan install Expect)
-  - SSH access to devices with password authentication
-  - Supported platforms: Cisco IOS, IOS-XE, ASA, Juniper, Arista
-  - Device commands: show processes cpu, show memory, show environment
-
-ERROR HANDLING:
-  - SSH connection failures cause immediate exit with logging
-  - Authentication failures are caught and reported
-  - Command timeouts default to N/A values
-  - All events logged to STDOUT and logfile with timestamps
-  - Thresholds trigger alerts: CPU 80%, Memory 85%, Temp 70°C
-
-=cut
+###############################################################################
+# Device Health Status Monitor
+#
+# Purpose:
+#   Remotely collects system health metrics from network devices (routers/switches)
+#   including CPU, memory, uptime, environmental sensors, and power supply status.
+#   Useful for NOC monitoring, troubleshooting, and capacity planning.
+#
+# Usage:
+#   perl device_health_monitor.pl -d <host> -u <user> -p <pass> [-l <logfile>]
+#   perl device_health_monitor.pl -d 192.168.1.1 -u netadmin -p MyP@ss -l health.log
+#
+# Prerequisites:
+#   - Net::SSH::Expect module installed
+#   - SSH access enabled on target devices
+#   - Device credentials provided or in script config
+#   - Target device must be a Cisco IOS/IOS-XE router or switch
+#
+# Author: Network Engineering Team
+# Version: 1.0
+###############################################################################
 
 use strict;
 use warnings;
-use Expect;
+use Net::SSH::Expect;
 use Getopt::Long;
-use Time::localtime;
+use Time::Piece;
 
-my $logfile;
-GetOptions('log=s' => \$logfile) or die "Error parsing options\n";
+my ($device, $username, $password, $logfile, $timeout);
+$timeout = 30;
 
-my ($device, $user, $pass) = @ARGV;
-die "Usage: $0 <device_ip> <username> <password> [--log logfile]\n" 
-    unless $device && $user && $pass;
+GetOptions(
+    'device|d=s'   => \$device,
+    'username|u=s' => \$username,
+    'password|p=s' => \$password,
+    'logfile|l=s'  => \$logfile,
+    'timeout|t=i'  => \$timeout,
+) or usage();
 
-$logfile ||= sprintf("health_check_%s_%d.log", $device, time());
-open my $LOG, '>>', $logfile or die "Cannot open logfile: $!\n";
+usage() unless ($device && $username && $password);
 
-sub log_entry {
-    my ($msg) = @_;
-    my $timestamp = scalar localtime;
-    print "$timestamp | $msg\n";
-    print $LOG "$timestamp | $msg\n";
-    $LOG->flush();
-}
-
-log_entry("Device health check initiated for $device");
-
-my $exp = Expect->new();
-$exp->log_stdout(0);
-$exp->timeout(10);
-
+my $ssh;
 eval {
-    log_entry("Establishing SSH connection to $device...");
-    $exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 $user\@$device")
-        or die "SSH spawn failed: $!";
+    $ssh = Net::SSH::Expect->new(
+        host => $device,
+        password => $password,
+        user => $username,
+        timeout => $timeout,
+        raw_pty => 1
+    );
     
-    $exp->expect(10, ['password:', sub { $exp->send("$pass\n"); exp_continue; }],
-                      ['Permission denied', sub { die "Authentication failed\n"; }],
-                      ['#', sub {}],
-                      ['>', sub {}]);
-    
-    log_entry("Connection and authentication successful");
-} or do {
-    log_entry("CRITICAL: Connection failed - $@");
-    close $LOG;
+    $ssh->connect() or die "SSH connection failed: " . $ssh->error();
+};
+if ($@) {
+    log_output("ERROR: Failed to connect to $device: $@", $logfile);
     exit 1;
-};
-
-my %metrics;
-
-eval {
-    log_entry("Collecting CPU utilization...");
-    $exp->send("show processes cpu | include CPU\n");
-    $exp->expect(8, qr/#|>/);
-    if ($exp->before() =~ /(\d+)%/) {
-        $metrics{cpu} = $1;
-        log_entry("CPU utilization: $metrics{cpu}%");
-    }
-};
-
-eval {
-    log_entry("Collecting memory statistics...");
-    $exp->send("show memory | include Processor\n");
-    $exp->expect(8, qr/#|>/);
-    if ($exp->before() =~ /(\d+)\s+bytes\s+total.*?(\d+)\s+bytes\s+free/s) {
-        my $used_pct = int(100 * ($1 - $2) / $1);
-        $metrics{mem} = $used_pct;
-        log_entry("Memory usage: $metrics{mem}%");
-    }
-};
-
-eval {
-    log_entry("Collecting temperature readings...");
-    $exp->send("show environment | include -i temperature\n");
-    $exp->expect(8, qr/#|>/);
-    if ($exp->before() =~ /(\d+)\s*°?C/) {
-        $metrics{temp} = $1;
-        log_entry("System temperature: $metrics{temp}°C");
-    }
-};
-
-$exp->send("exit\n");
-$exp->soft_close();
-
-log_entry("=== HEALTH CHECK RESULTS ===");
-log_entry(sprintf("Device: %s", $device));
-log_entry(sprintf("CPU Utilization: %s%%", $metrics{cpu} // "N/A"));
-log_entry(sprintf("Memory Usage: %s%%", $metrics{mem} // "N/A"));
-log_entry(sprintf("Temperature: %s°C", $metrics{temp} // "N/A"));
-
-if ($metrics{cpu} && $metrics{cpu} > 80) {
-    log_entry("ALERT: High CPU utilization detected");
-}
-if ($metrics{mem} && $metrics{mem} > 85) {
-    log_entry("ALERT: High memory usage detected");
-}
-if ($metrics{temp} && $metrics{temp} > 70) {
-    log_entry("ALERT: Elevated temperature detected");
 }
 
-log_entry("Health check completed successfully");
-close $LOG;
+# Disable pagination for clean output
+$ssh->send("terminal length 0");
+$ssh->waitfor('>', 5);
+
+my %metrics = ();
+my @commands = (
+    ['show version | include (Device ID|uptime)', 'Device Information'],
+    ['show processes cpu sorted | head 20', 'Top CPU Consumers'],
+    ['show memory statistics | include Processor', 'Memory Utilization'],
+    ['show environment all', 'Environmental Status'],
+    ['show power supply', 'Power Supply Status'],
+);
+
+foreach my $cmd (@commands) {
+    my ($command, $label) = @$cmd;
+    eval {
+        my $output = $ssh->send($command);
+        $metrics{$label} = $output;
+    };
+    if ($@) {
+        log_output("WARNING: Command '$command' failed: $@", $logfile);
+        $metrics{$label} = "Command execution failed";
+    }
+}
+
+$ssh->send("exit");
+$ssh->close();
+
+# Format and output report
+my $timestamp = localtime->strftime('%Y-%m-%d %H:%M:%S');
+my $report = "";
+$report .= "=" x 70 . "\n";
+$report .= "Device Health Status Report\n";
+$report .= "=" x 70 . "\n";
+$report .= "Device: $device\n";
+$report .= "Timestamp: $timestamp\n";
+$report .= "=" x 70 . "\n\n";
+
+foreach my $label (keys %metrics) {
+    $report .= "--- $label ---\n";
+    $report .= $metrics{$label} . "\n\n";
+}
+
+$report .= "=" x 70 . "\n";
+
+print $report;
+log_output($report, $logfile) if $logfile;
 exit 0;
+
+###############################################################################
+sub log_output {
+    my ($message, $file) = @_;
+    return unless $file;
+    
+    open my $fh, '>>', $file or warn "Cannot open logfile $file: $!\n";
+    print $fh $message . "\n" if $fh;
+    close $fh if $fh;
+}
+
+sub usage {
+    print << 'EOF';
+Device Health Status Monitor - Collects CPU, memory, environmental metrics
+
+Usage: perl device_health_monitor.pl [options]
+
+Required Options:
+  -d, --device <host>      Target device hostname or IP address
+  -u, --username <user>    SSH username for authentication
+  -p, --password <pass>    SSH password for authentication
+
+Optional Options:
+  -l, --logfile <path>     Append results to logfile (default: stdout only)
+  -t, --timeout <sec>      SSH timeout in seconds (default: 30)
+  -h, --help               Display this help message
+
+Examples:
+  perl device_health_monitor.pl -d 192.168.1.1 -u admin -p MyPass123
+  perl device_health_monitor.pl -d router1.example.com -u netadmin -p Secret -l /var/log/health.log
+
+EOF
+    exit 1;
+}
 ```
