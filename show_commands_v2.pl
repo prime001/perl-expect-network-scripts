@@ -1,191 +1,164 @@
+```perl
 #!/usr/bin/perl
-# =============================================================================
-# cpu_mem_health.pl - Cisco IOS/IOS-XE CPU and Memory Health Monitor
-# =============================================================================
-# Purpose:
-#   SSH to one or more Cisco devices, collect CPU utilization (5s/1m/5m
-#   intervals) and processor memory statistics, and flag any device exceeding
-#   configurable thresholds. Suitable for NOC dashboards or cron alerting.
 #
-# Usage:
-#   Single device:  ./cpu_mem_health.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:    ./cpu_mem_health.pl -f devices.txt -u admin -p secret
-#   With log:       ./cpu_mem_health.pl -f devices.txt -u admin -p secret -l health.log
-#   Custom thresh:  ./cpu_mem_health.pl -h 10.0.0.1 -u admin -p secret -c 70 -m 80
+# hardware_health.pl - Network Device Hardware Health Monitor
 #
-# Prerequisites:
+# PURPOSE:
+#   Collects CPU utilization, memory usage, temperature sensor readings,
+#   and power supply status from Cisco IOS/IOS-XE devices. Useful for
+#   proactive fault detection and capacity planning before alerts fire.
+#
+# USAGE:
+#   Single device:  ./hardware_health.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:    ./hardware_health.pl -f devices.txt -u admin -p secret
+#   With logging:   ./hardware_health.pl -h 192.168.1.1 -u admin -p secret -l health.log
+#
+# DEVICE FILE FORMAT:
+#   One IP or hostname per line; lines beginning with # are ignored.
+#
+# PREREQUISITES:
 #   cpan Net::SSH::Expect Getopt::Long
-#   SSH access to target devices; Cisco IOS 12.4+ / IOS-XE 3.x+ / IOS-XR
+#   SSH must be enabled on target devices (ip ssh version 2)
 #
-# Device file format: one IP or hostname per line; lines starting with # ignored
+# THRESHOLDS:
+#   CPU 1-min > 80% = WARN, > 95% = CRIT
+#   Memory used  > 70% = WARN, > 85% = CRIT
 #
-# Exit codes: 0 = all OK, 1 = threshold exceeded, 2 = connection/auth error
-# =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
+use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $device_file, $username, $password, $log_file);
-my $cpu_warn    = 80;
-my $mem_warn    = 85;
-my $ssh_timeout = 15;
-my $cmd_timeout = 10;
+my ($host, $user, $pass, $device_file, $log_file);
+my $timeout = 30;
 
 GetOptions(
-    'h|host=s' => \$host,
-    'f|file=s' => \$device_file,
-    'u|user=s' => \$username,
-    'p|pass=s' => \$password,
-    'l|log=s'  => \$log_file,
-    'c|cpu=i'  => \$cpu_warn,
-    'm|mem=i'  => \$mem_warn,
-) or die usage();
+    'h|host=s'    => \$host,
+    'u|user=s'    => \$user,
+    'p|pass=s'    => \$pass,
+    'f|file=s'    => \$device_file,
+    'l|log=s'     => \$log_file,
+    't|timeout=i' => \$timeout,
+) or die "Usage: $0 -h <host> -u <user> -p <pass> [-f <file>] [-l <logfile>] [-t <timeout>]\n";
 
-die usage() unless ($host || $device_file) && $username && $password;
+die "Username required (-u)\n"                          unless $user;
+die "Password required (-p)\n"                          unless $pass;
+die "Specify a host (-h) or device file (-f)\n"         unless $host || $device_file;
 
 my @devices;
 if ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_ }
+    open(my $fh, '<', $device_file) or die "Cannot open device file '$device_file': $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^\s*[#;]/ || /^\s*$/;
+        push @devices, $_;
+    }
     close $fh;
+    die "No valid devices found in $device_file\n" unless @devices;
 } else {
-    @devices = ($host);
+    push @devices, $host;
 }
 
 my $log_fh;
 if ($log_file) {
-    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
+    open($log_fh, '>>', $log_file) or die "Cannot open log file '$log_file': $!\n";
 }
 
-my $ts        = strftime('%Y-%m-%d %H:%M:%S', localtime);
-my $exit_code = 0;
-
-out("=" x 70);
-out("CPU/Memory Health Check  --  $ts");
-out("Thresholds: CPU(5m) >= ${cpu_warn}%   Memory >= ${mem_warn}%");
-out("=" x 70);
-
-for my $dev (@devices) {
-    out("\n[ $dev ]");
-    my $r = poll_device($dev);
-
-    if ($r->{error}) {
-        out("  ERROR: $r->{error}");
-        $exit_code = 2 unless $exit_code == 2;
-        next;
-    }
-
-    out(sprintf "  Hostname     : %s",               $r->{hostname} || 'unknown');
-    out(sprintf "  CPU  5s/1m/5m: %s%% / %s%% / %s%%", $r->{cpu_5s}, $r->{cpu_1m}, $r->{cpu_5m});
-    out(sprintf "  Memory       : %s KB used / %s KB free / %s KB total (%s%% used)",
-        $r->{mem_used}, $r->{mem_free}, $r->{mem_total}, $r->{mem_pct});
-
-    my @alerts;
-    push @alerts, "CPU 5m=$r->{cpu_5m}% >= ${cpu_warn}% threshold" if $r->{cpu_5m} >= $cpu_warn;
-    push @alerts, "Memory $r->{mem_pct}% used >= ${mem_warn}% threshold" if $r->{mem_pct} >= $mem_warn;
-
-    if (@alerts) {
-        out("  *** ALERT: " . join('; ', @alerts) . " ***");
-        $exit_code = 1 unless $exit_code == 2;
-    } else {
-        out("  Status       : OK");
-    }
+sub emit {
+    my ($msg) = @_;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
 
-out("\n" . "=" x 70);
-out(sprintf "Scan complete. Checked: %d device(s)", scalar @devices);
-out("=" x 70);
-close $log_fh if $log_fh;
-exit $exit_code;
+sub check_device {
+    my ($device) = @_;
+    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
 
-# ---------------------------------------------------------------------------
+    emit("\n=== Hardware Health: $device  [$ts] ===\n");
 
-sub poll_device {
-    my ($dev) = @_;
-    my %r;
-
-    my $ssh = Net::SSH::Expect->new(
-        host       => $dev,
-        user       => $username,
-        password   => $password,
-        raw_pty    => 1,
-        timeout    => $ssh_timeout,
-        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
-    );
-
+    my $ssh;
     eval {
-        my $out = $ssh->login();
-        die "Authentication failed\n" if $out =~ /Permission denied|Authentication failed/i;
+        $ssh = Net::SSH::Expect->new(
+            host     => $device,
+            user     => $user,
+            password => $pass,
+            raw_pty  => 1,
+            timeout  => $timeout,
+        );
+        my $banner = $ssh->login();
+        if ($banner =~ /[Aa]ccess [Dd]enied|[Bb]ad [Pp]assword|[Aa]uthentication [Ff]ailed/) {
+            die "Authentication failed\n";
+        }
     };
     if ($@) {
-        (my $msg = $@) =~ s/\n.*//s;
-        $r{error} = "SSH login failed: $msg";
-        return \%r;
+        my $err = $@;
+        $err =~ s/\s+$//;
+        emit("  [ERROR] $err\n");
+        return;
     }
 
-    send_cmd($ssh, 'terminal length 0');
+    $ssh->exec("terminal length 0");
 
-    # Grab hostname from prompt
-    $ssh->send('');
-    my $prompt = $ssh->waitfor('\S+[#>]', 3) // '';
-    $r{hostname} = ($prompt =~ /(\S+)[#>]\s*$/) ? $1 : 'unknown';
-
-    # CPU
-    my $cpu = send_cmd($ssh, 'show processes cpu | include CPU utilization');
-    if ($cpu =~ /five seconds:\s*(\d+)%.*one minute:\s*(\d+)%.*five minutes:\s*(\d+)%/s) {
-        @r{qw(cpu_5s cpu_1m cpu_5m)} = ($1, $2, $3);
+    # CPU utilization
+    my $cpu = $ssh->exec("show processes cpu | include CPU utilization");
+    if ($cpu =~ /five seconds: (\d+)%.*one minute: (\d+)%.*five minutes: (\d+)%/) {
+        my ($s5, $m1, $m5) = ($1, $2, $3);
+        my $status = ($m1 > 95) ? 'CRIT' : ($m1 > 80) ? 'WARN' : 'OK';
+        emit(sprintf("  CPU   : 5sec=%-3d%%  1min=%-3d%%  5min=%-3d%%   [%s]\n",
+            $s5, $m1, $m5, $status));
     } else {
-        @r{qw(cpu_5s cpu_1m cpu_5m)} = (0, 0, 0);
+        emit("  CPU   : [PARSE ERROR]\n");
     }
 
-    # Memory — IOS: 'show processes memory | include Processor'
-    my $mem = send_cmd($ssh, 'show processes memory | include Processor');
-    if ($mem =~ /Processor\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)/s) {
-        my ($total_b, $used_b, $free_b) = ($1, $2, $3);
-        @r{qw(mem_total mem_used mem_free)} = map { int($_ / 1024) } ($total_b, $used_b, $free_b);
-        $r{mem_pct} = $r{mem_total} > 0 ? int($r{mem_used} / $r{mem_total} * 100) : 0;
+    # Memory usage
+    my $mem = $ssh->exec("show processes memory | include Processor Pool");
+    if ($mem =~ /Total:\s*(\d+)\s+Used:\s*(\d+)\s+Free:\s*(\d+)/i) {
+        my ($total, $used, $free) = ($1, $2, $3);
+        my $pct = $total > 0 ? int($used / $total * 100) : 0;
+        my $status = ($pct > 85) ? 'CRIT' : ($pct > 70) ? 'WARN' : 'OK';
+        emit(sprintf("  MEMORY: used=%-6d KB  free=%-6d KB  (%d%%)  [%s]\n",
+            $used / 1024, $free / 1024, $pct, $status));
     } else {
-        # IOS-XE fallback: parse 'show platform resources'
-        my $plat = send_cmd($ssh, 'show platform resources | include DRAM');
-        if ($plat =~ /DRAM\s+(\d+)\s+MB.*?(\d+)%/s) {
-            $r{mem_total} = $1 * 1024;
-            $r{mem_pct}   = $2;
-            $r{mem_used}  = int($r{mem_total} * $2 / 100);
-            $r{mem_free}  = $r{mem_total} - $r{mem_used};
-        } else {
-            @r{qw(mem_total mem_used mem_free mem_pct)} = (0, 0, 0, 0);
-        }
+        emit("  MEMORY: [PARSE ERROR]\n");
     }
 
-    eval { $ssh->close() };
-    return \%r;
+    # Temperature
+    my $env = $ssh->exec("show environment temperature");
+    if ($env =~ /[Cc]ritical|CRITICAL|FAIL/m) {
+        emit("  TEMP  : Critical condition detected   [CRIT]\n");
+    } elsif ($env =~ /[Nn]ormal|OK|[Gg]reen/mi) {
+        emit("  TEMP  : All sensors normal             [OK]\n");
+    } else {
+        emit("  TEMP  : [NOT AVAILABLE]\n");
+    }
+
+    # Power supplies
+    my $pwr = $ssh->exec("show environment power");
+    if ($pwr =~ /[Ff]ail|FAIL|[Aa]bsent/m) {
+        emit("  POWER : Fault or absent supply         [CRIT]\n");
+    } elsif ($pwr =~ /[Gg]ood|OK|[Nn]ormal|[Pp]resent/mi) {
+        emit("  POWER : All supplies operating OK      [OK]\n");
+    } else {
+        emit("  POWER : [NOT AVAILABLE]\n");
+    }
+
+    # Uptime
+    my $ver = $ssh->exec("show version | include uptime");
+    if ($ver =~ /uptime is (.+)/) {
+        (my $uptime = $1) =~ s/\s+$//;
+        emit("  UPTIME: $uptime\n");
+    }
+
+    eval { $ssh->close(); };
 }
 
-sub send_cmd {
-    my ($ssh, $cmd) = @_;
-    $ssh->send($cmd);
-    return $ssh->waitfor('\S+[#>]', $cmd_timeout) // '';
-}
+my $total = scalar @devices;
+emit("Checking $total device(s)...\n");
 
-sub out {
-    print "$_[0]\n";
-    print $log_fh "$_[0]\n" if $log_fh;
-}
+check_device($_) for @devices;
 
-sub usage {
-    return <<'END';
-Usage: cpu_mem_health.pl -h <host> -u <user> -p <pass> [options]
-       cpu_mem_health.pl -f <device_file> -u <user> -p <pass> [options]
-Options:
-  -h, --host    Device IP or hostname
-  -f, --file    File with one device per line
-  -u, --user    SSH username
-  -p, --pass    SSH password
-  -l, --log     Append output to log file
-  -c, --cpu     CPU 5-min alert threshold % (default 80)
-  -m, --mem     Memory used alert threshold % (default 85)
-END
-}
+emit("\n--- Done: $total device(s) checked ---\n");
+close $log_fh if $log_fh;
+```
