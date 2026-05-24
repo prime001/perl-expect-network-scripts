@@ -1,179 +1,192 @@
+Writing a Perl STP audit script — spanning tree root bridge and port state analysis isn't covered by any existing scripts in the repo.
+
 ```perl
 #!/usr/bin/perl
 #
-# device_health_check.pl
+# stp_audit.pl - Spanning Tree Protocol Root Bridge and Port State Auditor
 #
 # Purpose:
-#   Remote device health monitoring via SSH. Collects CPU, memory,
-#   uptime, and interface error metrics for health assessment.
-#   Useful for ongoing device health baselines and alerting.
+#   Connects to Cisco IOS/IOS-XE devices via SSH, collects spanning tree
+#   status per VLAN, identifies root bridges, flags non-forwarding ports
+#   (BLK/LIS/LRN), and reports cumulative topology change counts.
+#   High topology change counts indicate L2 instability worth investigating.
 #
 # Usage:
-#   perl device_health_check.pl <device_ip> [<logfile>]
-#   perl device_health_check.pl 192.168.1.1 /tmp/health.log
+#   Single device:  ./stp_audit.pl -h 192.168.1.1 [-u admin] [-p secret]
+#   Device file:    ./stp_audit.pl -f devices.txt [-u admin] [-p secret]
+#   With logging:   ./stp_audit.pl -f devices.txt -l /var/log/stp_audit.log
 #
 # Prerequisites:
-#   - Net::SSH::Expect Perl module
-#   - SSH credentials in ENV: NET_USER, NET_PASS
-#   - Cisco IOS/IOS-XE device with SSH enabled
-#   - Commands: show version, show processes cpu, show memory, show interfaces
+#   cpan install Net::SSH::Expect
+#   SSH must be enabled on target devices (Cisco IOS-style CLI assumed)
 #
-# Error Handling:
-#   - SSH connection timeout: 10 seconds
-#   - Command timeout: 5 seconds
-#   - Authentication failures logged with details
-#   - Unreachable devices reported with timestamp
+# devices.txt format: one IP or hostname per line; lines starting with # skipped
 #
+# Environment variables: NET_USER, NET_PASS (override defaults; avoid -p on CLI)
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use DateTime;
+use Getopt::Long;
+use POSIX qw(strftime);
 
-my $device   = $ARGV[0] || die "Usage: $0 <device_ip> [<logfile>]\n";
-my $logfile  = $ARGV[1];
-my $username = $ENV{NET_USER} || 'admin';
-my $password = $ENV{NET_PASS} || '';
-my $timeout  = 10;
+my ($host, $file, $user, $pass, $logfile, $help);
+my $timeout = 15;
+my $tc_warn_threshold = 100;
 
-sub log_msg {
-    my ($msg) = @_;
-    my $dt = DateTime->now(time_zone => 'UTC')->iso8601;
-    print "[$dt] $msg\n";
-    if ($logfile) {
-        open my $fh, '>>', $logfile or warn "Cannot write to $logfile: $!\n";
-        print $fh "[$dt] $msg\n";
-        close $fh;
-    }
-}
+GetOptions(
+    'h|host=s'   => \$host,
+    'f|file=s'   => \$file,
+    'u|user=s'   => \$user,
+    'p|pass=s'   => \$pass,
+    'l|log=s'    => \$logfile,
+    'timeout=i'  => \$timeout,
+    'help'       => \$help,
+) or usage();
 
-sub connect_ssh {
-    my ($host, $user, $pass) = @_;
-    my $ssh = Net::SSH::Expect->new(
-        host        => $host,
-        user        => $user,
-        password    => $pass,
-        raw_pty     => 1,
-        timeout     => $timeout,
-    );
-    
-    eval { $ssh->login(); };
-    if ($@) {
-        log_msg("ERROR: SSH connection to $host failed - $@");
-        return undef;
-    }
-    return $ssh;
-}
+usage() if $help || (!$host && !$file);
 
-sub disable_paging {
-    my ($ssh) = @_;
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('.*#', 2);
-}
-
-sub get_hostname {
-    my ($ssh) = @_;
-    $ssh->send("show version | include -i ^hostname");
-    my $output = $ssh->waitfor('.*#', 3);
-    return $1 if $output =~ /hostname\s+(\S+)/i;
-    return 'UNKNOWN';
-}
-
-sub get_uptime {
-    my ($ssh) = @_;
-    $ssh->send("show version | include uptime");
-    my $output = $ssh->waitfor('.*#', 3);
-    return $1 if $output =~ /uptime is\s+(.+?)[\r\n]/;
-    return 'N/A';
-}
-
-sub get_cpu {
-    my ($ssh) = @_;
-    $ssh->send("show processes cpu | include CPU utilization");
-    my $output = $ssh->waitfor('.*#', 3);
-    if ($output =~ /(\d+)%/) {
-        return $1;
-    }
-    return undef;
-}
-
-sub get_memory {
-    my ($ssh) = @_;
-    $ssh->send("show memory | include Processor");
-    my $output = $ssh->waitfor('.*#', 3);
-    if ($output =~ /(\d+)K\s+total.*?(\d+)K\s+free/s) {
-        my $used = $1 - $2;
-        my $percent = int(($used / $1) * 100);
-        return { used => $used, total => $1, free => $2, percent => $percent };
-    }
-    return { used => 0, total => 0, free => 0, percent => 0 };
-}
-
-sub count_interface_errors {
-    my ($ssh) = @_;
-    $ssh->send("show interfaces | include -E 'input errors|CRC'");
-    my $output = $ssh->waitfor('.*#', 5);
-    my $count = 0;
-    foreach my $line (split /\n/, $output) {
-        $count++ if $line =~ /\d+\s+input errors/i || $line =~ /\d+\s+CRC/i;
-    }
-    return $count;
-}
-
-sub assess_health {
-    my (%data) = @_;
-    my $status = 'HEALTHY';
-    
-    if ($data{cpu} && $data{cpu} > 80) {
-        $status = 'WARNING: High CPU (' . $data{cpu} . '%)';
-    }
-    if ($data{memory}->{percent} && $data{memory}->{percent} > 85) {
-        $status = 'WARNING: High Memory (' . $data{memory}->{percent} . '%)';
-    }
-    if ($data{errors} && $data{errors} > 0) {
-        $status = 'WARNING: ' . $data{errors} . ' interface(s) with errors';
-    }
-    
-    return $status;
-}
-
-# Main execution
-log_msg("Starting health check for $device");
-
-my $ssh = connect_ssh($device, $username, $password);
-unless ($ssh) {
-    log_msg("CRITICAL: Cannot connect to $device");
-    exit 1;
-}
-
-eval {
-    disable_paging($ssh);
-    
-    my %health = (
-        hostname => get_hostname($ssh),
-        uptime   => get_uptime($ssh),
-        cpu      => get_cpu($ssh),
-        memory   => get_memory($ssh),
-        errors   => count_interface_errors($ssh),
-    );
-    
-    my $status = assess_health(%health);
-    
-    log_msg("--- Device: $device ($health{hostname}) ---");
-    log_msg("Uptime: $health{uptime}");
-    log_msg("CPU: " . ($health{cpu} // 'N/A') . "%");
-    log_msg("Memory: $health{memory}->{percent}% ($health{memory}->{used}K/$health{memory}->{total}K)");
-    log_msg("Interface Errors: $health{errors}");
-    log_msg("Status: $status");
-    log_msg("-----");
+$user //= $ENV{NET_USER} // 'admin';
+$pass //= $ENV{NET_PASS} // do {
+    local $| = 1;
+    print 'Password: ';
+    my $p = <STDIN>;
+    chomp $p;
+    $p;
 };
 
-if ($@) {
-    log_msg("ERROR: Command execution failed - $@");
+my @devices;
+if ($host) {
+    push @devices, $host;
+} else {
+    open my $fh, '<', $file or die "Cannot open device file '$file': $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^\s*[#;]/ || /^\s*$/;
+        push @devices, $_;
+    }
+    close $fh;
 }
 
-eval { $ssh->close(); };
-log_msg("Connection closed");
+my $log_fh;
+if ($logfile) {
+    open $log_fh, '>>', $logfile or die "Cannot open log '$logfile': $!\n";
+}
 
-exit 0;
+out("=== STP Audit: " . strftime('%Y-%m-%d %H:%M:%S', localtime) . " ===\n");
+out(sprintf("Devices: %d  |  Threshold for TC warning: %d changes\n\n",
+    scalar @devices, $tc_warn_threshold));
+
+my ($ok, $fail) = (0, 0);
+for my $dev (@devices) {
+    out("--- $dev ---\n");
+    if (audit_stp($dev)) { $ok++ } else { $fail++ }
+    out("\n");
+}
+
+out("=== Done: " . strftime('%Y-%m-%d %H:%M:%S', localtime)
+    . "  OK=$ok  FAIL=$fail ===\n");
+close $log_fh if $log_fh;
+exit($fail ? 1 : 0);
+
+sub audit_stp {
+    my ($dev) = @_;
+
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host     => $dev,
+            user     => $user,
+            password => $pass,
+            raw_pty  => 1,
+            timeout  => $timeout,
+        );
+    };
+    if ($@) {
+        out("  ERROR: object init failed: $@\n");
+        return 0;
+    }
+
+    my $login_out = eval { $ssh->login() };
+    if ($@ || !defined $login_out || $login_out =~ /incorrect|denied|failed/i) {
+        out("  ERROR: login failed" . ($@ ? ": $@" : '') . "\n");
+        return 0;
+    }
+
+    $ssh->send('terminal length 0');
+    $ssh->waitfor('[$#>]', $timeout);
+
+    # Per-VLAN root bridge table
+    $ssh->send('show spanning-tree root');
+    my $root_out = $ssh->waitfor('[$#>]', $timeout) // '';
+
+    my %vlan_root;
+    for my $line (split /\n/, $root_out) {
+        # VLAN0001   32769  aabb.cc00.0100   20  15  15  Gi0/1
+        if ($line =~ /^(VLAN\d+)\s+\d+\s+(\S+:\S+|\S{4}\.\S{4}\.\S{4})\s+\d+\s+\d+\s+\d+\s+(\S+)/) {
+            $vlan_root{$1} = { bridge => $2, root_port => $3 };
+        }
+    }
+
+    if (%vlan_root) {
+        out("  Root bridges:\n");
+        for my $vlan (sort keys %vlan_root) {
+            out(sprintf("    %-12s  bridge=%-20s  root_port=%s\n",
+                $vlan, $vlan_root{$vlan}{bridge}, $vlan_root{$vlan}{root_port}));
+        }
+    } else {
+        out("  Root bridges: no data (STP may be disabled or parse failed)\n");
+    }
+
+    # Non-forwarding ports
+    $ssh->send('show spanning-tree | include BLK|LIS|LRN');
+    my $nonfwd = $ssh->waitfor('[$#>]', $timeout) // '';
+
+    my @blocked = grep { /\b(?:BLK|LIS|LRN)\b/ }
+                  map  { s/^\s+|\s+$//gr }
+                  split(/\n/, $nonfwd);
+
+    if (@blocked) {
+        out("  Non-forwarding ports (" . scalar(@blocked) . "):\n");
+        out("    $_\n") for @blocked;
+    } else {
+        out("  Non-forwarding ports: none\n");
+    }
+
+    # Topology change count from summary
+    $ssh->send('show spanning-tree summary totals');
+    my $summary = $ssh->waitfor('[$#>]', $timeout) // '';
+
+    my $tc_total = 0;
+    $tc_total += $1 while $summary =~ /(\d+)\s+topology\s+change/gi;
+
+    out("  Topology changes (cumulative): $tc_total\n");
+    out("  WARNING: high topology change count - investigate L2 instability\n")
+        if $tc_total > $tc_warn_threshold;
+
+    $ssh->close();
+    return 1;
+}
+
+sub out {
+    my ($msg) = @_;
+    print $msg;
+    print $log_fh $msg if $log_fh;
+}
+
+sub usage {
+    print <<'END';
+Usage: stp_audit.pl -h <host> | -f <file> [options]
+
+  -h, --host     Single device IP or hostname
+  -f, --file     File listing devices, one per line (# = comment)
+  -u, --user     SSH username (default: admin or \$NET_USER)
+  -p, --pass     SSH password (default: \$NET_PASS or interactive prompt)
+  -l, --log      Append output to log file
+      --timeout  SSH timeout in seconds (default: 15)
+      --help     Show this help
+
+Exits 0 if all devices succeeded, 1 if any failed.
+END
+    exit 1;
+}
 ```
