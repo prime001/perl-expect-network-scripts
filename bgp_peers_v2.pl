@@ -1,26 +1,26 @@
 ```perl
 #!/usr/bin/perl
 # =============================================================================
-# bgp_prefix_monitor.pl - BGP Prefix Limit and Advertisement Audit
+# bgp_prefix_limits.pl - BGP Prefix Limit Monitor
 #
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE routers and audits BGP neighbor prefix
-#   counts against configured prefix limits. Flags sessions approaching
-#   their maximum-prefix threshold (default: 80%) to prevent unexpected
-#   session drops due to prefix limit exhaustion.
+# PURPOSE:
+#   Connects to Cisco IOS/IOS-XE routers and checks BGP neighbor prefix counts
+#   against configured maximum-prefix limits. Flags peers approaching or
+#   exceeding thresholds before the router tears down the session.
 #
-# Usage:
-#   ./bgp_prefix_monitor.pl <device_ip> [username] [password]
-#   ./bgp_prefix_monitor.pl --file devices.txt [--log output.log]
-#   ./bgp_prefix_monitor.pl --file devices.txt --threshold 75
+# USAGE:
+#   Single device:  ./bgp_prefix_limits.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:    ./bgp_prefix_limits.pl -f devices.txt -u admin -p secret
+#   With log:       ./bgp_prefix_limits.pl -h 10.0.0.1 -u admin -p secret -l bgp_check.log
+#   Custom warn%:   ./bgp_prefix_limits.pl -h 10.0.0.1 -u admin -p secret -w 70
 #
-# Prerequisites:
-#   cpanm Net::SSH::Expect
+# PREREQUISITES:
+#   cpan Net::SSH::Expect
+#   SSH access to devices with 'show bgp' privilege
 #
-# Output:
-#   STDOUT + optional log file. Exits non-zero if any peer exceeds threshold.
-#
-# Author: Erik Anderson
+# OUTPUT:
+#   Per-peer status: neighbor IP, AS, prefix count, limit, % used, status
+#   Status levels: OK | WARN (>80% by default) | CRITICAL (>95%) | OVER_LIMIT
 # =============================================================================
 
 use strict;
@@ -29,51 +29,48 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($device_file, $log_file, $threshold, $username, $password);
-$threshold = 80;
+my ($host_arg, $device_file, $username, $password, $log_file, $warn_pct);
+$warn_pct = 80;
 
 GetOptions(
-    'file=s'      => \$device_file,
-    'log=s'       => \$log_file,
-    'threshold=i' => \$threshold,
-    'user=s'      => \$username,
-    'pass=s'      => \$password,
-) or die "Usage: $0 <device> [--file file] [--log file] [--threshold pct]\n";
+    'h|host=s'     => \$host_arg,
+    'f|file=s'     => \$device_file,
+    'u|user=s'     => \$username,
+    'p|pass=s'     => \$password,
+    'l|log=s'      => \$log_file,
+    'w|warn=i'     => \$warn_pct,
+) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOG] [-w WARN_PCT]\n";
 
-$username //= $ENV{NET_USER} // 'admin';
-$password //= $ENV{NET_PASS} // die "Set NET_PASS or pass --pass\n";
+die "Specify -h HOST or -f FILE\n" unless $host_arg || $device_file;
+die "Username required (-u)\n" unless $username;
+die "Password required (-p)\n" unless $password;
 
-my @devices;
-if ($device_file) {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    @devices = grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
-    close $fh;
-} elsif (@ARGV) {
-    @devices = ($ARGV[0]);
-} else {
-    die "Provide a device IP or --file devices.txt\n";
-}
+my @devices = $host_arg ? ($host_arg) : do {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+    grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
+};
 
 my $log_fh;
 if ($log_file) {
-    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
+    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
 }
 
-my $ts        = strftime('%Y-%m-%d %H:%M:%S', localtime);
-my $exit_code = 0;
+my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
 
-sub out {
-    my $msg = shift;
+sub output {
+    my ($msg) = @_;
     print $msg;
-    print {$log_fh} $msg if $log_fh;
+    print $log_fh $msg if $log_fh;
 }
 
-out("=" x 70 . "\n");
-out("BGP Prefix Limit Audit  |  $ts  |  Threshold: ${threshold}%\n");
-out("=" x 70 . "\n");
+output("=" x 72 . "\n");
+output("BGP Prefix Limit Check - $timestamp\n");
+output("Warn threshold: ${warn_pct}%\n");
+output("=" x 72 . "\n\n");
 
 for my $host (@devices) {
-    out("\n[+] Connecting to $host...\n");
+    output("Device: $host\n");
+    output("-" x 50 . "\n");
 
     my $ssh = eval {
         Net::SSH::Expect->new(
@@ -82,90 +79,88 @@ for my $host (@devices) {
             password    => $password,
             raw_pty     => 1,
             timeout     => 15,
-            ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
         );
     };
-    if ($@) {
-        out("    ERROR: Failed to create SSH session: $@\n");
-        $exit_code = 1;
+    if ($@ || !$ssh) {
+        output("  ERROR: Failed to create SSH session: $@\n\n");
         next;
     }
 
     my $login = eval { $ssh->login() };
-    if ($@ || !defined $login) {
-        out("    ERROR: Authentication failed for $host\n");
-        $exit_code = 1;
+    if ($@ || !$login) {
+        output("  ERROR: Authentication failed or connection refused\n\n");
         next;
     }
 
     $ssh->send("terminal length 0\n");
-    $ssh->waitfor('>#', 5);
+    $ssh->waitfor('\#', 5);
 
-    $ssh->send("show bgp summary\n");
-    my $summary = $ssh->waitfor('>#', 30) // '';
+    $ssh->send("show bgp all neighbors | include BGP neighbor|Prefixes Current|maximum-prefix\n");
+    my $raw = $ssh->waitfor('\#', 30);
 
-    $ssh->send("show running-config | section ^router bgp\n");
-    my $bgp_config = $ssh->waitfor('>#', 30) // '';
+    unless ($raw) {
+        output("  ERROR: Timeout waiting for BGP output\n\n");
+        $ssh->close();
+        next;
+    }
+
+    my (%neighbors, $current_peer);
+    for my $line (split /\n/, $raw) {
+        if ($line =~ /BGP neighbor is (\S+),\s+remote AS (\d+)/) {
+            $current_peer = $1;
+            $neighbors{$current_peer}{as} = $2;
+        }
+        if ($current_peer && $line =~ /Prefixes Current:\s+(\d+)/) {
+            $neighbors{$current_peer}{prefixes} = $1;
+        }
+        if ($current_peer && $line =~ /maximum-prefix\s+(\d+)/) {
+            $neighbors{$current_peer}{limit} //= $1;
+        }
+    }
+
+    if (!%neighbors) {
+        output("  No BGP neighbors found or BGP not configured\n\n");
+        $ssh->close();
+        next;
+    }
+
+    my $fmt = "  %-18s %-8s %8s %8s %6s  %s\n";
+    output(sprintf($fmt, "Neighbor", "AS", "Prefixes", "Limit", "Used%", "Status"));
+    output("  " . "-" x 60 . "\n");
+
+    for my $peer (sort keys %neighbors) {
+        my $pfx   = $neighbors{$peer}{prefixes} // 0;
+        my $limit = $neighbors{$peer}{limit};
+        my ($pct_str, $status);
+
+        if ($limit && $limit > 0) {
+            my $pct = ($pfx / $limit) * 100;
+            $pct_str = sprintf("%.1f%%", $pct);
+            if    ($pfx >= $limit)    { $status = "OVER_LIMIT" }
+            elsif ($pct >= 95)        { $status = "CRITICAL"   }
+            elsif ($pct >= $warn_pct) { $status = "WARN"       }
+            else                      { $status = "OK"         }
+        } else {
+            $pct_str = "N/A";
+            $status  = "NO_LIMIT";
+            $limit   = "none";
+        }
+
+        output(sprintf($fmt,
+            $peer,
+            $neighbors{$peer}{as} // "?",
+            $pfx,
+            $limit,
+            $pct_str,
+            $status
+        ));
+    }
 
     $ssh->send("exit\n");
-
-    # Parse neighbor IPs and their current prefix counts from summary
-    my %peer_prefixes;
-    for my $line (split /\n/, $summary) {
-        # Cisco BGP summary: IP Ver AS MsgRcvd MsgSent TblVer InQ OutQ Up/Down State/PfxRcd
-        if ($line =~ /^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\S+\s+(\d+)/) {
-            $peer_prefixes{$1} = { asn => $2, received => $3, limit => 0, warn_pct => 0 };
-        }
-    }
-
-    # Parse max-prefix limits from running config
-    my $current_neighbor = '';
-    for my $line (split /\n/, $bgp_config) {
-        if ($line =~ /neighbor\s+(\d+\.\d+\.\d+\.\d+)\s+maximum-prefix\s+(\d+)/) {
-            my ($ip, $limit) = ($1, $2);
-            if (exists $peer_prefixes{$ip} && $limit > 0) {
-                $peer_prefixes{$ip}{limit}    = $limit;
-                $peer_prefixes{$ip}{warn_pct} = int($peer_prefixes{$ip}{received} / $limit * 100);
-            }
-        }
-    }
-
-    # Report
-    out(sprintf "\n  %-18s %-8s %10s %10s %8s  %s\n",
-        'Neighbor', 'ASN', 'Rcvd Pfx', 'Max Pfx', 'Usage', 'Status');
-    out("  " . "-" x 65 . "\n");
-
-    my $flagged = 0;
-    for my $ip (sort keys %peer_prefixes) {
-        my $p      = $peer_prefixes{$ip};
-        my $limit  = $p->{limit} || 'none';
-        my $pct    = $p->{limit} ? $p->{warn_pct} : 0;
-        my $status = 'OK';
-
-        if ($p->{limit} && $pct >= $threshold) {
-            $status    = "WARN: ${pct}% of limit";
-            $exit_code = 1;
-            $flagged++;
-        } elsif (!$p->{limit}) {
-            $status = 'no max-prefix set';
-        }
-
-        out(sprintf "  %-18s %-8s %10s %10s %7s%%  %s\n",
-            $ip, $p->{asn}, $p->{received}, $limit,
-            ($p->{limit} ? $pct : '-'), $status);
-    }
-
-    if (!%peer_prefixes) {
-        out("  No established BGP peers found or BGP not running.\n");
-    } elsif ($flagged) {
-        out("\n  *** $flagged peer(s) at or above ${threshold}% prefix limit ***\n");
-    } else {
-        out("\n  All peers within prefix limits.\n");
-    }
+    $ssh->close();
+    output("\n");
 }
 
-out("\n" . "=" x 70 . "\n");
-out("Audit complete. Exit code: $exit_code\n");
-close $log_fh if $log_fh;
-exit $exit_code;
+output("Check complete: $timestamp\n");
+close($log_fh) if $log_fh;
 ```
