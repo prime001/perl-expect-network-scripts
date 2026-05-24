@@ -1,193 +1,147 @@
 #!/usr/bin/perl
+# Route Table Analyzer - Analyze routing table entries and identify anomalies
+# Purpose: SSH into network devices, collect routing table statistics, detect anomalies
+# Usage: ./route_analyzer.pl --device 192.168.1.1 --username admin --password secret
+#        ./route_analyzer.pl --file devices.txt --username admin --password secret [--logfile results.log]
+# Prerequisites: Expect module, SSH access with sufficient privileges, password/key auth
+
 use strict;
 use warnings;
-use Net::SSH::Expect;
+use Expect;
 use Getopt::Long;
-use Time::HiRes qw(time);
+use Time::gmtime;
 
-=head1 NAME
-interface_error_monitor.pl - Monitor interface errors and status across network devices
-
-=head1 SYNOPSIS
-./interface_error_monitor.pl -host <ip|hostname> [-user <username>] [-pass <password>] [-file <device_list>] [-log <logfile>]
-
-=head1 DESCRIPTION
-Connects to network device(s) via SSH and monitors interface health by collecting:
-- Interface operational status (up/down)
-- Error counters (CRC, runts, giants, collisions)
-- Discard counters (input/output drops)
-- Interface statistics and anomalies
-
-Useful for network monitoring, NOC operations, and troubleshooting interface issues.
-Can process single device or read multiple devices from file (one per line).
-
-=head1 PREREQUISITES
-- Net::SSH::Expect module
-- Expect installed
-- SSH access to Cisco devices (IOS/IOS-XE/IOS-XR)
-- Device credentials (SSH username/password)
-
-=head1 EXAMPLES
-./interface_error_monitor.pl -host 192.168.1.1 -user admin -pass secret
-./interface_error_monitor.pl -file devices.txt -user netadmin -log interface_report.log
-./interface_error_monitor.pl -host router.local -user netadmin
-
-=head1 EXIT CODES
-0 = Success
-1 = Connection or authentication error
-2 = Device unreachable
-3 = Invalid input arguments
-
-=cut
-
-my ($host, $user, $pass, $devicefile, $logfile, $timeout);
+my ($device, $file, $username, $password, $logfile, $timeout);
 GetOptions(
-    'host=s'    => \$host,
-    'file=s'    => \$devicefile,
-    'user=s'    => \$user,
-    'pass=s'    => \$pass,
-    'log=s'     => \$logfile,
-    'timeout=i' => \$timeout,
-) or die "Usage: $0 -host <ip|hostname> | -file <device_list> [-user <username>] [-pass <password>] [-log <logfile>]\n";
+    'device=s'   => \$device,
+    'file=s'     => \$file,
+    'username=s' => \$username,
+    'password=s' => \$password,
+    'logfile=s'  => \$logfile,
+    'timeout=i'  => \$timeout,
+) or die "Error in command line arguments\n";
 
-die "Usage: Specify either -host or -file argument\n" unless ($host || $devicefile);
+die "Specify --device or --file\n" unless ($device || $file);
+die "Username and password required\n" unless ($username && $password);
 
-$user    //= 'admin';
-$pass    //= $ENV{DEVICE_PASSWORD} || '';
-$timeout //= 20;
+$timeout ||= 10;
+my @devices = $device ? ($device) : read_device_file($file);
 
-my @devices = ();
-if ($devicefile) {
-    open my $fh, '<', $devicefile or die "Cannot open device file: $!\n";
+print "=" x 80 . "\nRoute Table Analysis Report\n" . "=" x 80 . "\n";
+
+foreach my $dev (@devices) {
+    analyze_routes($dev, $username, $password, $timeout, $logfile);
+}
+
+sub analyze_routes {
+    my ($dev, $user, $pass, $to, $log) = @_;
+    my $exp = Expect->new();
+    $exp->raw_pty(1);
+    $exp->log_stdout(0);
+    
+    eval {
+        $exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -l $user $dev");
+    };
+    if ($@) {
+        log_output("[$dev] ERROR: Connection failed - $@", $log);
+        return;
+    }
+    
+    unless ($exp->expect($to, ['assword:', 'timeout'])) {
+        log_output("[$dev] ERROR: Timeout waiting for password prompt", $log);
+        $exp->hard_close();
+        return;
+    }
+    
+    $exp->send("$pass\n");
+    unless ($exp->expect($to, ['[#>]', 'denied', 'timeout'])) {
+        log_output("[$dev] ERROR: Authentication timeout", $log);
+        $exp->hard_close();
+        return;
+    }
+    
+    if ($exp->before() =~ /denied|incorrect/i) {
+        log_output("[$dev] ERROR: Authentication failed", $log);
+        $exp->hard_close();
+        return;
+    }
+    
+    $exp->send("show ip route\n");
+    $exp->expect($to, '[#>]');
+    my $route_output = $exp->before();
+    
+    $exp->send("exit\n");
+    $exp->expect($to, 'timeout');
+    $exp->hard_close();
+    
+    my %stats = parse_routes($route_output);
+    generate_report($dev, \%stats, $log);
+}
+
+sub parse_routes {
+    my ($output) = @_;
+    my %stats = (total => 0, connected => 0, static => 0, ospf => 0, bgp => 0, rip => 0, eigrp => 0);
+    
+    foreach my $line (split /\n/, $output) {
+        next if $line =~ /^\s*$/;
+        $stats{total}++ if $line =~ /^\s*[OCS\*]/;
+        $stats{connected}++ if $line =~ /C\s+\*?.*directly connected/i;
+        $stats{static}++ if $line =~ /^\s*S/;
+        $stats{ospf}++ if $line =~ /^\s*O/;
+        $stats{bgp}++ if $line =~ /^\s*B/;
+        $stats{rip}++ if $line =~ /^\s*R\s/;
+        $stats{eigrp}++ if $line =~ /^\s*D\s/;
+    }
+    
+    return %stats;
+}
+
+sub generate_report {
+    my ($dev, $stats, $log) = @_;
+    
+    my $output = "\n[Device: $dev]\n" . ("-" x 70) . "\n";
+    $output .= sprintf("Total Routes: %-4d | Connected: %-3d | Static: %-3d | OSPF: %-3d | BGP: %-3d | RIP: %-3d | EIGRP: %-3d\n",
+        $stats->{total}, $stats->{connected}, $stats->{static}, $stats->{ospf}, $stats->{bgp}, $stats->{rip}, $stats->{eigrp});
+    
+    if ($stats->{total} == 0) {
+        $output .= "WARNING: No routes detected - check device connectivity\n";
+    }
+    if ($stats->{total} > 500) {
+        $output .= "ALERT: Excessive route count detected (>500 routes)\n";
+    }
+    if (($stats->{ospf} + $stats->{bgp}) == 0 && $stats->{total} > 2) {
+        $output .= "ALERT: No dynamic routing protocols detected\n";
+    }
+    if ($stats->{static} > ($stats->{total} * 0.5) && $stats->{total} > 5) {
+        $output .= "ALERT: Static routes exceed 50% of total - verify routing redundancy\n";
+    }
+    
+    print $output;
+    log_output($output, $log);
+}
+
+sub read_device_file {
+    my ($file) = @_;
+    die "File not found: $file\n" unless -f $file;
+    open my $fh, '<', $file or die "Cannot open $file: $!\n";
+    my @devices;
     while (<$fh>) {
         chomp;
-        next if /^\s*#/;
-        next if /^\s*$/;
+        next if /^#/ || /^\s*$/;
         push @devices, $_;
     }
     close $fh;
-} else {
-    push @devices, $host;
+    die "No devices found in $file\n" unless @devices;
+    return @devices;
 }
 
-sub log_msg {
-    my ($msg) = @_;
-    print $msg;
-    if ($logfile) {
-        open my $fh, '>>', $logfile or warn "Cannot write to $logfile: $!\n";
-        print $fh $msg;
-        close $fh;
-    }
-}
-
-sub check_device {
-    my ($device_ip) = @_;
-    my $start = time();
-    
-    my $ssh = Net::SSH::Expect->new(
-        host     => $device_ip,
-        user     => $user,
-        password => $pass,
-        timeout  => $timeout,
-        raw_pty  => 1,
-    );
-    
-    eval {
-        $ssh->login() or die "SSH login failed\n";
-        
-        log_msg "\n" . "=" x 70 . "\n";
-        log_msg "Device: $device_ip\n";
-        log_msg "=" x 70 . "\n";
-        
-        $ssh->send("terminal length 0");
-        $ssh->waitfor('timeout' => $timeout, 'match' => '/[>#]/');
-        
-        # Get device name
-        $ssh->send("show running-config | include hostname");
-        my $hostname_out = $ssh->waitfor('timeout' => $timeout, 'match' => '/[>#]/');
-        if ($hostname_out =~ /hostname\s+(\S+)/) {
-            log_msg "Hostname: $1\n";
-        }
-        
-        # Get interface status summary
-        $ssh->send("show interface summary");
-        my $summary = $ssh->waitfor('timeout' => $timeout, 'match' => '/[>#]/');
-        log_msg "\nInterface Status Summary:\n";
-        foreach my $line (split /\n/, $summary) {
-            next unless $line =~ /\d+.*\d+/;
-            log_msg "  $line\n";
-        }
-        
-        # Get detailed interface errors
-        $ssh->send("show interface | include (^[A-Za-z], errors|input errors|output errors)");
-        my $errors = $ssh->waitfor('timeout' => $timeout, 'match' => '/[>#]/');
-        
-        my @error_lines = grep { /\d+\s+errors?/i || /^\s*\d+ (input|output|CRC|runt|giant)/ } split /\n/, $errors;
-        
-        if (@error_lines > 0) {
-            log_msg "\nInterfaces with Errors/Discards:\n";
-            foreach my $line (@error_lines) {
-                $line =~ s/^\s+|\s+$//g;
-                log_msg "  $line\n" if $line;
-            }
-        } else {
-            log_msg "\nNo interface errors detected.\n";
-        }
-        
-        # Check for down interfaces
-        $ssh->send("show interface brief | include down");
-        my $down_intf = $ssh->waitfor('timeout' => $timeout, 'match' => '/[>#]/');
-        
-        if ($down_intf && $down_intf !~ /^\s*$/) {
-            log_msg "\nDown Interfaces:\n";
-            foreach my $line (split /\n/, $down_intf) {
-                next if $line =~ /^Interface|---/;
-                log_msg "  $line\n" if $line =~ /\S/;
-            }
-        }
-        
-        # Get CRC and collision errors
-        $ssh->send("show interface | include (CRC|collision|runts|giants)");
-        my $crc_out = $ssh->waitfor('timeout' => $timeout, 'match' => '/[>#]/');
-        
-        my @crc_lines = grep { /\d+/ && !/^\s*$/ } split /\n/, $crc_out;
-        if (@crc_lines > 0) {
-            log_msg "\nDetailed Error Counters:\n";
-            foreach my $line (@crc_lines) {
-                $line =~ s/^\s+|\s+$//g;
-                log_msg "  $line\n" if $line;
-            }
-        }
-        
-        $ssh->close();
-        
-        my $elapsed = time() - $start;
-        log_msg "\nCompleted in " . sprintf("%.2f", $elapsed) . "s\n";
-        return 1;
-        
-    } or do {
-        my $error = $@;
-        log_msg "\n[ERROR] Failed to check device: $error\n";
-        return 0;
+sub log_output {
+    my ($message, $logfile) = @_;
+    return unless $logfile;
+    open my $fh, '>>', $logfile or do {
+        warn "WARNING: Cannot write to $logfile: $!\n";
+        return;
     };
+    print $fh $message;
+    close $fh;
 }
-
-log_msg "[START] Interface Error Monitor - " . scalar(localtime) . "\n";
-log_msg "Monitoring " . scalar(@devices) . " device(s)\n";
-
-my $success_count = 0;
-my $fail_count = 0;
-
-foreach my $dev (@devices) {
-    if (check_device($dev)) {
-        $success_count++;
-    } else {
-        $fail_count++;
-    }
-}
-
-log_msg "\n" . "=" x 70 . "\n";
-log_msg "Summary: $success_count successful, $fail_count failed\n";
-log_msg "[END] " . scalar(localtime) . "\n";
-
-exit ($fail_count > 0 ? 1 : 0);
