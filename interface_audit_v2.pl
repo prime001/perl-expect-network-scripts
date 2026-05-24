@@ -1,28 +1,31 @@
+```perl
 #!/usr/bin/perl
-#
-# device_health.pl - Network Device Health Monitor
+# =============================================================================
+# interface_errors.pl - Interface Error Counter Auditor
 #
 # Purpose:
-#   Collects CPU utilization, memory usage, and environmental status
-#   (temperature, fans, power supplies) from Cisco IOS/IOS-XE devices.
-#   Useful for capacity planning, proactive monitoring, and pre-change checks.
+#   SSH into Cisco IOS/IOS-XE devices and scan all interface error counters
+#   (input errors, CRC, giants, runts, output drops). Reports non-zero counters
+#   and flags interfaces where error rate exceeds a configurable threshold.
+#   Useful for proactive fault detection, capacity planning, and pre-maintenance
+#   baselining before circuit swaps or hardware replacements.
 #
 # Usage:
-#   Single device:  perl device_health.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:    perl device_health.pl -f devices.txt -u admin -p secret
-#   With logging:   perl device_health.pl -h 192.168.1.1 -u admin -p secret -l health.log
-#   Custom timeout: perl device_health.pl -h 192.168.1.1 -u admin -p secret -t 45
+#   ./interface_errors.pl -h 192.168.1.1 -u admin -p secret
+#   ./interface_errors.pl -f devices.txt -u admin -p secret -l audit.log
+#   ./interface_errors.pl -h 10.0.0.1 -u admin -p secret -t 0.5
+#
+# Options:
+#   -h  Device IP/hostname (or use -f for multiple)
+#   -f  File with one device per line (# for comments)
+#   -u  SSH username
+#   -p  SSH password
+#   -l  Log file path (appends; optional)
+#   -t  Error rate % threshold to flag [WARN] (default: 1.0)
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
-#   cpan Getopt::Long
-#
-# Device file format (one IP or hostname per line; blank lines and # comments ignored):
-#   192.168.1.1
-#   core-router-01
-#   # standby unit
-#   192.168.1.2
-#
+#   cpan Net::SSH::Expect Getopt::Long
+# =============================================================================
 
 use strict;
 use warnings;
@@ -30,114 +33,136 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $user, $pass, $device_file, $log_file);
-my $timeout = 30;
+my ($host, $user, $pass, $device_file, $log_file, $threshold);
+$threshold = 1.0;
 
 GetOptions(
-    'h|host=s'    => \$host,
-    'u|user=s'    => \$user,
-    'p|pass=s'    => \$pass,
-    'f|file=s'    => \$device_file,
-    'l|log=s'     => \$log_file,
-    't|timeout=i' => \$timeout,
-) or die "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-l <log>] [-t <secs>]\n";
+    'h|host=s'      => \$host,
+    'u|user=s'      => \$user,
+    'p|pass=s'      => \$pass,
+    'f|file=s'      => \$device_file,
+    'l|log=s'       => \$log_file,
+    't|threshold=f' => \$threshold,
+) or die "Usage: $0 -h HOST -u USER -p PASS [-f FILE] [-l LOG] [-t THRESH%]\n";
 
-die "ERROR: Specify -h <host> or -f <file>\n"  unless $host || $device_file;
-die "ERROR: -u <username> is required\n"        unless $user;
-die "ERROR: -p <password> is required\n"        unless $pass;
+die "ERROR: -u username required\n"        unless $user;
+die "ERROR: -p password required\n"        unless $pass;
+die "ERROR: specify -h HOST or -f FILE\n"  unless $host || $device_file;
 
 my @devices;
-if ($host) {
-    @devices = ($host);
-} else {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) {
-        chomp;
-        next if /^\s*$/ || /^\s*#/;
-        push @devices, $_;
-    }
+if ($device_file) {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_ }
     close $fh;
-    die "ERROR: No devices found in $device_file\n" unless @devices;
+} else {
+    @devices = ($host);
 }
 
 my $log_fh;
 if ($log_file) {
-    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
+    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
 }
 
-sub emit {
-    my ($msg) = @_;
+sub out {
+    my $msg = shift;
     print $msg;
     print $log_fh $msg if $log_fh;
 }
 
-sub check_device {
-    my ($device) = @_;
+for my $device (@devices) {
     my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-
-    emit("\n" . "=" x 60 . "\n");
-    emit("Host: $device    Checked: $ts\n");
-    emit("=" x 60 . "\n");
+    out("\n" . "=" x 65 . "\n");
+    out("Host: $device   Scanned: $ts   Threshold: ${threshold}%\n");
+    out("=" x 65 . "\n");
 
     my $ssh = Net::SSH::Expect->new(
         host     => $device,
         user     => $user,
         password => $pass,
         raw_pty  => 1,
-        timeout  => $timeout,
+        timeout  => 20,
     );
 
-    eval {
-        my $login = $ssh->login();
-        die "Unexpected prompt — check credentials or enable password\n"
-            unless $login =~ /[>#]/;
-    };
+    eval { $ssh->login() };
     if ($@) {
-        emit("CONNECT ERROR [$device]: $@\n");
-        return;
+        out("ERROR: Cannot connect to $device: $@\n");
+        next;
     }
 
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('\s*[>#]', $timeout) or warn "Pager disable timed out on $device\n";
+    $ssh->exec("terminal length 0");
+    my $output = $ssh->exec("show interfaces");
 
-    my %commands = (
-        'CPU Utilization'     => 'show processes cpu | include CPU utilization',
-        'Memory Utilization'  => 'show processes memory | include Processor',
-        'Device Uptime'       => 'show version | include uptime',
-        'Environmental Status'=> 'show environment all',
-    );
-
-    for my $section ('CPU Utilization', 'Memory Utilization', 'Device Uptime', 'Environmental Status') {
-        my $cmd = $commands{$section};
-        emit("\n--- $section ---\n");
-
-        $ssh->send($cmd);
-        my $output = $ssh->waitfor('\s*[>#]', $timeout);
-
-        unless (defined $output && $output =~ /\S/) {
-            emit("  [no output or timeout]\n");
-            next;
-        }
-
-        # Strip echoed command and trailing prompt
-        $output =~ s/^\Q$cmd\E\r?\n//;
-        $output =~ s/\s*[>#]\s*$//;
-
-        for my $line (split /\r?\n/, $output) {
-            next unless $line =~ /\S/;
-            emit("  $line\n");
-        }
+    unless ($output) {
+        out("ERROR: No output from $device — possible timeout or privilege issue\n");
+        $ssh->close();
+        next;
     }
 
     $ssh->close();
-    emit("\nDone: $device\n");
+
+    my @results;
+    my @blocks = split /\n(?=\S+\s+is\s+(?:up|down|administratively))/, $output;
+
+    for my $block (@blocks) {
+        my ($iface) = $block =~ /^(\S+)\s+is\s+/      or next;
+        my ($state) = $block =~ /is\s+([\w\s]+?),/i   or next;
+        $state =~ s/\s+$//;
+
+        my ($in_pkts)  = ($block =~ /(\d+)\s+packets\s+input/i);
+        my ($in_err)   = ($block =~ /(\d+)\s+input\s+errors/i);
+        my ($crc)      = ($block =~ /(\d+)\s+CRC/i);
+        my ($runts)    = ($block =~ /(\d+)\s+runts/i);
+        my ($giants)   = ($block =~ /(\d+)\s+giants/i);
+        my ($out_pkts) = ($block =~ /(\d+)\s+packets\s+output/i);
+        my ($out_drop) = ($block =~ /(\d+)\s+output\s+drops/i);
+
+        for ($in_pkts, $in_err, $crc, $runts, $giants, $out_pkts, $out_drop) {
+            $_ //= 0;
+        }
+
+        my $total_err = $in_err + $crc + $runts + $giants + $out_drop;
+        next if $total_err == 0;
+
+        my $in_rate  = $in_pkts  > 0 ? ($in_err  / $in_pkts  * 100) : 0;
+        my $out_rate = $out_pkts > 0 ? ($out_drop / $out_pkts * 100) : 0;
+        my $max_rate = $in_rate > $out_rate ? $in_rate : $out_rate;
+        my $flag     = $max_rate >= $threshold ? '[WARN]' : '';
+
+        push @results, {
+            iface    => $iface,
+            state    => substr($state, 0, 8),
+            in_err   => $in_err,
+            crc      => $crc,
+            runts    => $runts,
+            giants   => $giants,
+            out_drop => $out_drop,
+            rate     => $max_rate,
+            flag     => $flag,
+        };
+    }
+
+    if (!@results) {
+        out("All interfaces: zero error counters.\n");
+        next;
+    }
+
+    @results = sort { ($b->{flag} cmp $a->{flag}) || ($b->{rate} <=> $a->{rate}) } @results;
+
+    out(sprintf("%-26s %-8s %8s %8s %6s %6s %9s  %s\n",
+        'Interface', 'State', 'InErr', 'CRC', 'Runts', 'Giants', 'OutDrop', 'Status'));
+    out("-" x 82 . "\n");
+
+    for my $r (@results) {
+        out(sprintf("%-26s %-8s %8d %8d %6d %6d %9d  %s\n",
+            $r->{iface}, $r->{state},
+            $r->{in_err}, $r->{crc}, $r->{runts},
+            $r->{giants}, $r->{out_drop}, $r->{flag}));
+    }
+
+    my $warn_count = grep { $_->{flag} } @results;
+    out(sprintf("\nSummary: %d interface(s) with errors, %d exceed %.1f%% threshold\n",
+        scalar @results, $warn_count, $threshold));
 }
 
-for my $device (@devices) {
-    eval { check_device($device) };
-    emit("FATAL [$device]: $@\n") if $@;
-}
-
-my $finish = strftime('%Y-%m-%d %H:%M:%S', localtime);
-emit("\nHealth check complete: $finish\n");
 close $log_fh if $log_fh;
+```
