@@ -1,189 +1,155 @@
+```perl
 #!/usr/bin/perl
-=head1 NAME
-device_neighbor_connectivity.pl - Audit neighbor reachability from network device
-
-=head1 DESCRIPTION
-Connects to a network device via SSH and performs ping tests to verify connectivity
-to neighbor devices. Reports reachability status, packet loss, and response times.
-Useful for validating network paths from the device's perspective and troubleshooting
-connectivity issues between network nodes.
-
-=head1 USAGE
-device_neighbor_connectivity.pl -device <ip|hostname> -targets <file|list> [options]
-
-Examples:
-  device_neighbor_connectivity.pl -device 10.1.1.1 -targets 10.1.1.2,10.1.1.3,10.1.1.4
-  device_neighbor_connectivity.pl -device core1 -targets neighbors.txt -log audit.log
-  device_neighbor_connectivity.pl -device 192.168.1.1 -targets targets.txt -user admin -pass mypass
-
-=head1 PREREQUISITES
-- Perl module: Net::SSH::Expect (install via: cpan Net::SSH::Expect)
-- SSH access to target network device
-- Target device must support 'ping <ip> count 4' command
-
-=head1 OPTIONS
-  -device <ip>      Target device IP or hostname (required)
-  -targets <source> Comma-separated IP list or file path (required)
-  -user <username>  SSH username (default: admin)
-  -pass <password>  SSH password (default: admin)
-  -log <file>       Append results to log file (optional)
-  -timeout <sec>    SSH timeout in seconds (default: 30)
-
-=cut
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use Time::Localtime;
+use Time::localtime;
 
-my ($device, $targets_src, $user, $pass, $logfile, $timeout, $help);
+# stp_audit.pl - Spanning Tree Protocol topology and configuration audit
+# Audits STP status, bridge priorities, port roles, and topology stability
+# Usage: perl stp_audit.pl --host 192.168.1.1 --user admin --pass pass123
+#        perl stp_audit.pl --file devices.txt --user admin --pass pass123 --logdir ./logs
+# Prerequisites: Net::SSH::Expect, SSH access to Cisco switches
+
+my ($host, $file, $user, $pass, $logfile, $logdir, $timeout, $help);
+$timeout = 30;
 
 GetOptions(
-    'device=s'  => \$device,
-    'targets=s' => \$targets_src,
+    'host=s'    => \$host,
+    'file=s'    => \$file,
     'user=s'    => \$user,
     'pass=s'    => \$pass,
-    'log=s'     => \$logfile,
+    'logfile=s' => \$logfile,
+    'logdir=s'  => \$logdir,
     'timeout=i' => \$timeout,
     'help'      => \$help,
-) or die "Error in command line arguments\n";
+) or die "Invalid command line arguments\n";
 
-if ($help || !$device || !$targets_src) {
-    print "Usage: $0 -device <ip> -targets <list|file> [-user user] [-pass pass] [-log file]\n";
-    exit $help ? 0 : 1;
-}
+die "Error: Specify --host or --file\n" unless ($host || $file);
+die "Error: --user and --pass required\n" unless ($user && $pass);
 
-$user    ||= 'admin';
-$pass    ||= 'admin';
-$timeout ||= 30;
-
-my @targets = parse_targets($targets_src);
-die "Error: No valid target IPs found\n" unless @targets;
-
-my $timestamp = get_timestamp();
-print "=== Device Neighbor Connectivity Audit ===\n";
-print "Device: $device | Targets: " . scalar(@targets) . " | Time: $timestamp\n";
-print "-" x 70 . "\n";
-
-my $log_fh;
-if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log file $logfile: $!\n";
-    print $log_fh "\n=== Connectivity Audit - $timestamp ===\n";
-    print $log_fh "Device: $device\n";
-}
-
-my $ssh;
-eval {
-    $ssh = Net::SSH::Expect->new(
-        host     => $device,
-        user     => $user,
-        password => $pass,
-        timeout  => $timeout,
-        raw_pty  => 1,
-    );
-    $ssh->login();
-};
-
-if (!$ssh || $@) {
-    my $msg = "ERROR: Cannot connect to $device: $@";
+sub log_msg {
+    my ($msg, $logfh) = @_;
     print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
-    close($log_fh) if $log_fh;
-    exit 1;
+    print $logfh "$msg\n" if defined $logfh;
 }
 
-my ($up_count, $down_count) = (0, 0);
-
-foreach my $target (@targets) {
-    my $result = ping_target($ssh, $target);
-    
-    if ($result->{reachable}) {
-        printf("%-18s UP    | Loss: %3d%% | RTT: %7s ms\n",
-            $target, $result->{loss}, $result->{rtt} // 'N/A');
-        print $log_fh "$target UP (loss: $result->{loss}%, rtt: $result->{rtt}ms)\n" if $log_fh;
-        $up_count++;
-    } else {
-        printf("%-18s DOWN  | Loss: 100%% | Unreachable\n", $target);
-        print $log_fh "$target DOWN (unreachable)\n" if $log_fh;
-        $down_count++;
-    }
-}
-
-eval { $ssh->close(); };
-
-print "-" x 70 . "\n";
-printf("Result: %d reachable, %d unreachable\n", $up_count, $down_count);
-print $log_fh "Summary: $up_count reachable, $down_count unreachable\n" if $log_fh;
-
-close($log_fh) if $log_fh;
-exit($down_count > 0 ? 1 : 0);
-
-sub parse_targets {
-    my ($source) = @_;
-    my @ips;
-    
-    if (-f $source) {
-        open(my $fh, '<', $source) or die "Cannot read $source: $!\n";
-        while (my $line = <$fh>) {
-            chomp($line);
-            $line =~ s/#.*//;
-            $line =~ s/^\s+|\s+$//g;
-            if ($line && $line =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
-                push @ips, $line;
-            }
-        }
-        close($fh);
-    } else {
-        foreach my $ip (split /,/, $source) {
-            $ip =~ s/^\s+|\s+$//g;
-            if ($ip =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
-                push @ips, $ip;
-            }
-        }
-    }
-    
-    return @ips;
-}
-
-sub ping_target {
-    my ($ssh, $target) = @_;
-    my $result = {
-        reachable => 0,
-        loss      => 100,
-        rtt       => undef,
-    };
+sub ssh_connect {
+    my ($host, $user, $pass, $timeout) = @_;
+    my $expect;
     
     eval {
-        $ssh->send("ping $target count 4");
-        my $output = '';
-        sleep 1;
-        
-        for (my $i = 0; $i < 5; $i++) {
-            last if $output =~ /\d+\s+packets?\s+(transmitted|sent)/i;
-            $output .= $ssh->read_all();
-            sleep 1 if $i < 4;
-        }
-        
-        if ($output =~ /(\d+)\s+packets?\s+transmitted.*?(\d+)\s+(?:packets?\s+)?received/i) {
-            my ($sent, $received) = ($1, $2);
-            $result->{loss} = $sent > 0 ? int((($sent - $received) / $sent) * 100) : 100;
-            $result->{reachable} = 1 if $received > 0;
-        }
-        
-        if ($output =~ /(?:round.?trip\s+)?min\/avg\/max[^=]*=\s*[\d.]+\/([\d.]+)\/[\d.]+/i) {
-            $result->{rtt} = int($1);
-        } elsif ($output =~ /average\s*=\s*([\d.]+)/i) {
-            $result->{rtt} = int($1);
-        }
+        $expect = Net::SSH::Expect->new(
+            host     => $host,
+            user     => $user,
+            password => $pass,
+            timeout  => $timeout,
+            raw_pty  => 1,
+        );
+        $expect->connect() or die "SSH connection failed\n";
+        $expect->exec("terminal length 0");
     };
     
-    return $result;
+    if ($@) {
+        warn "Connection to $host failed: $@";
+        return undef;
+    }
+    
+    return $expect;
 }
 
-sub get_timestamp {
-    my $t = localtime;
-    return sprintf("%04d-%02d-%02d %02d:%02d:%02d",
-        $t->year() + 1900, $t->mon() + 1, $t->mday(),
-        $t->hour(), $t->min(), $t->sec());
+sub audit_stp {
+    my ($host, $expect, $logfh) = @_;
+    
+    log_msg("\n" . "="x60, $logfh);
+    log_msg("STP Audit: $host [" . scalar(localtime()) . "]", $logfh);
+    log_msg("="x60, $logfh);
+    
+    my %commands = (
+        'STP Summary' => 'show spanning-tree summary',
+        'Root Bridge' => 'show spanning-tree root',
+        'Bridge Priorities' => 'show spanning-tree vlan 1 | include Bridge',
+        'Port States' => 'show spanning-tree interface brief',
+        'BPDU Guard' => 'show spanning-tree portfast bpdu-guard',
+        'Topology Changes' => 'show spanning-tree | include Topology',
+    );
+    
+    foreach my $label (sort keys %commands) {
+        log_msg("\n--- $label ---", $logfh);
+        
+        my @output;
+        eval {
+            @output = $expect->exec($commands{$label});
+        };
+        
+        if ($@) {
+            log_msg("ERROR executing command: $@", $logfh);
+            next;
+        }
+        
+        my $count = 0;
+        foreach my $line (@output) {
+            chomp($line);
+            next if $line =~ /^\s*$/ || $line =~ /^$/;
+            log_msg($line, $logfh);
+            $count++;
+            last if $count > 25;
+        }
+    }
+    
+    log_msg("\n" . "="x60 . "\n", $logfh);
 }
+
+my @devices = ();
+if ($host) {
+    @devices = ($host);
+} elsif ($file) {
+    open(my $fh, '<', $file) or die "Cannot open $file: $!\n";
+    while (my $line = <$fh>) {
+        chomp($line);
+        next if $line =~ /^\s*#/ || $line =~ /^\s*$/;
+        push @devices, $line;
+    }
+    close($fh);
+}
+
+my $success_count = 0;
+foreach my $device (@devices) {
+    my $logfh;
+    
+    if ($logdir) {
+        mkdir($logdir) unless -d $logdir;
+        my $path = "$logdir/${device}_stp_audit.log";
+        if (open($logfh, '>', $path)) {
+            print "[LOG] Writing to $path\n";
+        } else {
+            warn "Cannot write to $path: $!\n";
+        }
+    } elsif ($logfile) {
+        if (!open($logfh, '>', $logfile)) {
+            warn "Cannot write to $logfile: $!\n";
+        }
+    }
+    
+    my $ssh = ssh_connect($device, $user, $pass, $timeout);
+    if ($ssh) {
+        eval {
+            audit_stp($device, $ssh, $logfh);
+            $success_count++;
+        };
+        
+        if ($@) {
+            log_msg("ERROR during audit: $@", $logfh);
+        }
+        
+        eval { $ssh->close(); };
+    } else {
+        log_msg("FAILED: Cannot connect to $device", $logfh);
+    }
+    
+    close($logfh) if defined $logfh && fileno($logfh);
+}
+
+print "\nAudit completed: $success_count/" . scalar(@devices) . " successful\n";
+```
