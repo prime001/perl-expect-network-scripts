@@ -1,136 +1,149 @@
-The repo path wasn't specified as a local directory — I'll output the script content directly as requested.
-
-```
 #!/usr/bin/perl
 #
-# stp_audit.pl - Spanning Tree Protocol topology audit for Cisco IOS switches
+# Device Health Monitor
 #
-# Purpose:
-#   Connects to one or more Cisco IOS switches via SSH and collects STP state.
-#   Identifies root bridge placement, reports ports in BLOCKING state, and flags
-#   high topology-change counts that indicate instability. Use before/after
-#   maintenance windows or during network triage.
-#
-# Usage:
-#   ./stp_audit.pl -h <host> [-u user] [-p pass] [-l logfile]
-#   ./stp_audit.pl -f <hosts_file> [-u user] [-p pass] [-l logfile]
-#
-#   Credentials fall back to NET_USER / NET_PASS environment variables.
+# Purpose: Collect CPU, memory, and uptime metrics from network devices via SSH
+# Usage: ./device_health_monitor.pl -h <hostname> [-u <user>] [-p <password>] [-l <logfile>]
+#        ./device_health_monitor.pl -f <device_list> [-u <user>] [-p <password>] [-l <logfile>]
 #
 # Prerequisites:
-#   cpan install Net::SSH::Expect
-#   SSH must be enabled on target devices; key-based auth recommended.
+#   - Net::SSH::Expect Perl module (cpan Net::SSH::Expect)
+#   - SSH access to network devices with enable mode
+#   - Device must run Cisco IOS, IOS-XE, IOS-XR, or NX-OS
 #
-# Output:
-#   Per-device summary: VLANs where switch is root, topology change count,
-#   and any ports in BLOCKING state with associated VLAN.
+# Output: Prints metrics to STDOUT; appends timestamped results to logfile if specified
+# Example: perl device_health_monitor.pl -h 192.168.1.1 -u admin -p mypass -l health.log
+#
 
 use strict;
 use warnings;
-use Getopt::Long;
 use Net::SSH::Expect;
+use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $hosts_file, $username, $password, $logfile);
-$username = $ENV{NET_USER} // 'admin';
-$password = $ENV{NET_PASS} // '';
+my ($hostname, $username, $password, $logfile, $device_file);
+my $timeout = 30;
 
 GetOptions(
-    'h|host=s'   => \$host,
-    'f|file=s'   => \$hosts_file,
-    'u|user=s'   => \$username,
-    'p|pass=s'   => \$password,
-    'l|log=s'    => \$logfile,
-) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-l logfile]\n";
+    'h|host=s'     => \$hostname,
+    'u|user=s'     => \$username,
+    'p|pass=s'     => \$password,
+    'l|log=s'      => \$logfile,
+    'f|file=s'     => \$device_file,
+    't|timeout=i'  => \$timeout,
+) or die "Error in command line arguments\n";
 
-die "ERROR: Specify -h <host> or -f <file>\n" unless $host || $hosts_file;
+die "Must specify either -h <hostname> or -f <device_file>\n" 
+    unless ($hostname || $device_file);
+
+$username ||= prompt_input("SSH Username: ");
+$password ||= prompt_input("SSH Password: ", 1);
 
 my @devices;
-if ($host) {
-    push @devices, $host;
+if ($hostname) {
+    push @devices, $hostname;
 } else {
-    open my $fh, '<', $hosts_file or die "ERROR: Cannot open $hosts_file: $!\n";
-    @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^#/ || /^\s*$/;
+        push @devices, $_;
+    }
     close $fh;
-    die "ERROR: No valid hosts found in $hosts_file\n" unless @devices;
 }
 
 my $log_fh;
 if ($logfile) {
-    open $log_fh, '>>', $logfile or die "ERROR: Cannot open logfile $logfile: $!\n";
+    open $log_fh, '>>', $logfile or die "Cannot open $logfile: $!\n";
 }
 
-sub out {
-    print $_[0];
-    print $log_fh $_[0] if $log_fh;
+print "Device Health Monitor\n" . "=" x 70 . "\n";
+
+foreach my $device (@devices) {
+    collect_health($device, $username, $password, $log_fh);
 }
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-out("=" x 60 . "\n");
-out("STP Audit Report -- $ts\n");
-out("=" x 60 . "\n\n");
-
-for my $dev (@devices) {
-    out("Device: $dev\n");
-    out("-" x 40 . "\n");
-
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host     => $dev,
-            user     => $username,
-            password => $password,
-            raw_pty  => 1,
-            timeout  => 15,
-        );
-    };
-    if ($@ || !$ssh) {
-        out("  ERROR: Could not create SSH session -- $@\n\n");
-        next;
-    }
-
-    my $logged_in = eval { $ssh->login() };
-    if ($@ || !$logged_in) {
-        out("  ERROR: Authentication failed or connection refused\n\n");
-        next;
-    }
-
-    $ssh->exec("terminal length 0");
-
-    my $summary = $ssh->exec("show spanning-tree summary") // '';
-    my $detail  = $ssh->exec("show spanning-tree detail")  // '';
-    $ssh->exec("exit");
-    $ssh->close();
-
-    my $root_vlans = 0;
-    my $tc_count   = 0;
-    $root_vlans = $1 if $summary =~ /(\d+)\s+vlans?\s+(?:are\s+)?participating\s+as\s+root/i;
-    $tc_count   = $1 if $summary =~ /(\d+)\s+topology\s+changes/i;
-
-    out(sprintf("  Root bridge for %d VLAN(s)\n", $root_vlans));
-    out(sprintf("  Topology changes    : %d", $tc_count));
-    out($tc_count > 100 ? "  <-- WARNING: possible port flap\n" : "\n");
-
-    my %blocking;
-    my $cur_vlan = '';
-    for my $line (split /\n/, $detail) {
-        $cur_vlan = $1 if $line =~ /VLAN(\d+)\s+is\s+executing/i;
-        if ($cur_vlan && $line =~ /(\S+(?:Ethernet|thernet|channel)\S*)\s+of\s+\S+\s+is\s+BLK/i) {
-            push @{$blocking{$cur_vlan}}, $1;
-        }
-    }
-
-    if (%blocking) {
-        out("  Blocking ports:\n");
-        for my $vlan (sort { $a <=> $b } keys %blocking) {
-            out(sprintf("    VLAN %-5s  %s\n", $vlan, join(', ', @{$blocking{$vlan}})));
-        }
-    } else {
-        out("  No ports in BLOCKING state\n");
-    }
-
-    out("\n");
-}
-
-out("Audit complete.\n");
 close $log_fh if $log_fh;
-```
+print "\nComplete.\n";
+
+sub collect_health {
+    my ($host, $user, $pass, $log) = @_;
+    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    
+    print "\n[$ts] Connecting to $host...";
+    
+    my $ssh = Net::SSH::Expect->new(
+        host       => $host,
+        password   => $pass,
+        user       => $user,
+        timeout    => $timeout,
+        raw_pty    => 1,
+    );
+    
+    my $login_output;
+    eval { $login_output = $ssh->login(); };
+    
+    if ($@ || !$login_output) {
+        my $error = "FAILED: Connection error";
+        print " $error\n";
+        print $log "$ts | $host | $error\n" if $log;
+        return;
+    }
+    print " OK\n";
+    
+    $ssh->exec_cmd("terminal length 0");
+    
+    my %metrics = ();
+    
+    eval {
+        my $version_output = $ssh->exec_cmd("show version");
+        if ($version_output =~ /[Uu]ptime is (.+?)(?:\n|$)/) {
+            $metrics{uptime} = $1;
+        } elsif ($version_output =~ /[Ss]ystem [Uu]ptime is (.+?)(?:\n|$)/) {
+            $metrics{uptime} = $1;
+        }
+        
+        my $cpu_output = $ssh->exec_cmd("show processes cpu | include CPU utilization");
+        if ($cpu_output =~ /CPU utilization[^:]*:\s+([\d.]+)%/) {
+            $metrics{cpu} = $1;
+        }
+        
+        my $mem_output = $ssh->exec_cmd("show memory | include Processor");
+        if ($mem_output =~ /Processor.*?(\d+)K\s+total.*?(\d+)K\s+used/) {
+            my $total = $1;
+            my $used = $2;
+            $metrics{mem_pct} = sprintf("%.1f", ($used / $total) * 100);
+        }
+    };
+    
+    if ($@) {
+        my $error = "FAILED: Command execution error";
+        print "  $error: $@\n";
+        print $log "$ts | $host | $error\n" if $log;
+        $ssh->close();
+        return;
+    }
+    
+    my $cpu_str = defined $metrics{cpu} ? sprintf("%5.1f%%", $metrics{cpu}) : "  N/A ";
+    my $mem_str = defined $metrics{mem_pct} ? sprintf("%5.1f%%", $metrics{mem_pct}) : "  N/A ";
+    my $uptime_str = $metrics{uptime} || "N/A";
+    
+    my $result = sprintf("  %-18s CPU: %s | Memory: %s | Uptime: %s", 
+        $host, $cpu_str, $mem_str, $uptime_str);
+    
+    print $result . "\n";
+    print $log "$ts | $result\n" if $log;
+    
+    $ssh->close();
+}
+
+sub prompt_input {
+    my ($prompt, $hidden) = @_;
+    print $prompt;
+    system("stty -echo") if $hidden;
+    my $input = <STDIN>;
+    system("stty echo") if $hidden;
+    print "\n" if $hidden;
+    chomp $input;
+    return $input;
+}
