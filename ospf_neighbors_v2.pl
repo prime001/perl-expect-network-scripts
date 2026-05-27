@@ -1,191 +1,154 @@
-Here is the complete script — you'll need to save it yourself as the working directory requires permission. The file should be named `106_ospf_timer_audit.pl`:
-
-```perl
 #!/usr/bin/perl
-# =============================================================================
-# ospf_timer_audit.pl — OSPF Interface Timer & Authentication Consistency Check
 #
-# PURPOSE:
-#   Audits OSPF hello/dead timers and authentication configuration on all OSPF-
-#   enabled interfaces across one or more Cisco IOS/IOS-XE devices. Timer
-#   mismatches between adjacent routers are a leading cause of OSPF neighbor
-#   flaps; this script surfaces them before they cause outages.
+# ospf_neighbor_monitor.pl - OSPF Neighbor Flap Detector
 #
-# USAGE:
-#   Single device:   perl ospf_timer_audit.pl -h 192.168.1.1 -u admin -p secret
-#   Device list:     perl ospf_timer_audit.pl -f devices.txt -u admin -p secret
-#   With log file:   perl ospf_timer_audit.pl -h 192.168.1.1 -u admin -p secret -l audit.log
-#   Custom timeout:  perl ospf_timer_audit.pl -h 192.168.1.1 -u admin -p secret -t 45
+# Purpose:
+#   Polls one or more Cisco IOS devices at a configurable interval and detects
+#   OSPF neighbor state changes (e.g., FULL -> INIT, neighbor disappears).
+#   Transient flaps that self-heal are missed by spot checks; this catches them.
 #
-# PREREQUISITES:
-#   cpan install Expect
-#   Expects Cisco IOS/IOS-XE prompt ending in # (privilege EXEC mode)
-#   SSH must be enabled on target devices
+# Usage:
+#   ./ospf_neighbor_monitor.pl -h 192.168.1.1 [-u admin] [-i 60] [-c 20] [-l flaps.log]
+#   ./ospf_neighbor_monitor.pl -f devices.txt  [-i 30]  [-c 0]  [-l flaps.log]
 #
-# OUTPUT:
-#   Per-interface: hello timer, dead timer, auth type, OSPF area, network type
-#   Flags interfaces with non-default timers (hello != 10s or dead != 40s)
-#   Flags interfaces with no authentication configured
-# =============================================================================
+#   -h  Device IP/hostname
+#   -f  File with devices (one per line: IP|username|password)
+#   -u  SSH username (default: admin)
+#   -i  Poll interval in seconds (default: 60)
+#   -c  Poll count before exiting, 0 = run forever (default: 0)
+#   -l  Log file path (optional; stdout always gets output)
+#
+# Prerequisites:
+#   cpan install Net::SSH::Expect
+#   SSH key auth recommended; password read from device file or prompted.
+#
 
 use strict;
 use warnings;
-use Expect;
-use Getopt::Long;
+use Net::SSH::Expect;
+use Getopt::Std;
 use POSIX qw(strftime);
+use Term::ReadKey;
 
-my ($host, $device_file, $username, $password, $log_file);
-my $timeout = 30;
+our %opts;
+getopts('h:f:u:i:c:l:', \%opts);
 
-GetOptions(
-    'h|host=s'     => \$host,
-    'f|file=s'     => \$device_file,
-    'u|user=s'     => \$username,
-    'p|pass=s'     => \$password,
-    'l|log=s'      => \$log_file,
-    't|timeout=i'  => \$timeout,
-) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOG] [-t TIMEOUT]\n";
+my $username    = $opts{u} || 'admin';
+my $interval    = $opts{i} || 60;
+my $max_polls   = $opts{c} // 0;
+my $logfile     = $opts{l} || '';
+my $log_fh;
 
-die "Provide -h HOST or -f FILE\n"    unless $host || $device_file;
-die "Username required (-u)\n"        unless $username;
-die "Password required (-p)\n"        unless $password;
+if ($logfile) {
+    open($log_fh, '>>', $logfile) or die "Cannot open log '$logfile': $!";
+    $log_fh->autoflush(1);
+}
+
+sub emit {
+    my ($msg) = @_;
+    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    my $line = "[$ts] $msg";
+    print "$line\n";
+    print $log_fh "$line\n" if $log_fh;
+}
+
+sub get_password {
+    my ($host) = @_;
+    print "Password for $username\@$host: ";
+    ReadMode('noecho');
+    my $pw = ReadLine(0);
+    ReadMode('restore');
+    print "\n";
+    chomp $pw;
+    return $pw;
+}
+
+sub fetch_neighbors {
+    my ($host, $user, $pass) = @_;
+    my $ssh = Net::SSH::Expect->new(
+        host        => $host,
+        user        => $user,
+        password    => $pass,
+        raw_pty     => 1,
+        timeout     => 15,
+    );
+
+    eval { $ssh->login() };
+    if ($@) {
+        emit("ERROR [$host] Login failed: $@");
+        return undef;
+    }
+
+    $ssh->send("terminal length 0");
+    $ssh->waitfor('\$|#', 5);
+    $ssh->send("show ip ospf neighbor");
+    my $output = $ssh->waitfor('\$|#', 10);
+    $ssh->send("exit");
+    $ssh->close();
+
+    my %neighbors;
+    for my $line (split /\n/, $output) {
+        # Neighbor ID    Pri   State     Dead Time   Address     Interface
+        if ($line =~ /^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\S+)\s+/) {
+            $neighbors{$1} = $2;
+        }
+    }
+    return \%neighbors;
+}
 
 my @devices;
-if ($host) {
-    push @devices, $host;
-} else {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+if ($opts{f}) {
+    open(my $fh, '<', $opts{f}) or die "Cannot open device file '$opts{f}': $!";
     while (<$fh>) {
         chomp;
-        s/#.*//;
-        s/^\s+|\s+$//g;
-        push @devices, $_ if $_;
+        next if /^\s*$/ || /^#/;
+        my ($host, $user, $pass) = split /\|/, $_;
+        push @devices, { host => $host, user => $user || $username, pass => $pass || '' };
     }
     close $fh;
+} elsif ($opts{h}) {
+    my $pass = get_password($opts{h});
+    push @devices, { host => $opts{h}, user => $username, pass => $pass };
+} else {
+    die "Usage: $0 -h <host> | -f <devices_file> [-u user] [-i interval] [-c count] [-l logfile]\n";
 }
 
-my $log_fh;
-if ($log_file) {
-    open($log_fh, '>', $log_file) or die "Cannot open log $log_file: $!\n";
+my %prev_state;
+my $polls = 0;
+
+emit("Starting OSPF neighbor monitor: " . scalar(@devices) . " device(s), interval=${interval}s" .
+     ($max_polls ? ", max_polls=$max_polls" : ", running indefinitely"));
+
+while (1) {
+    for my $dev (@devices) {
+        my $host = $dev->{host};
+        my $nbrs = fetch_neighbors($host, $dev->{user}, $dev->{pass});
+        next unless defined $nbrs;
+
+        my $prev = $prev_state{$host} || {};
+
+        for my $nbr (sort keys %$nbrs) {
+            my $state     = $nbrs->{$nbr};
+            my $old_state = $prev->{$nbr};
+            if (!defined $old_state) {
+                emit("NEW    [$host] neighbor $nbr state=$state");
+            } elsif ($old_state ne $state) {
+                emit("CHANGE [$host] neighbor $nbr $old_state -> $state");
+            }
+        }
+        for my $nbr (sort keys %$prev) {
+            unless (exists $nbrs->{$nbr}) {
+                emit("LOST   [$host] neighbor $nbr (was $prev->{$nbr}) -- no longer in table");
+            }
+        }
+
+        $prev_state{$host} = $nbrs;
+    }
+
+    $polls++;
+    last if $max_polls > 0 && $polls >= $max_polls;
+    sleep $interval;
 }
 
-sub log_output {
-    my $msg = shift;
-    print $msg;
-    print $log_fh $msg if $log_fh;
-}
-
-my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-log_output("=" x 70 . "\n");
-log_output("OSPF Timer & Authentication Audit — $ts\n");
-log_output("=" x 70 . "\n\n");
-
-for my $device (@devices) {
-    log_output("--- Device: $device ---\n");
-
-    my $exp = Expect->new();
-    $exp->raw_pty(1);
-    $exp->log_stdout(0);
-
-    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=$timeout $username\@$device")) {
-        log_output("  [ERROR] Failed to spawn SSH to $device\n\n");
-        next;
-    }
-
-    my $logged_in = 0;
-    $exp->expect($timeout,
-        [ qr/[Pp]assword:/ => sub {
-            $exp->send("$password\n");
-            exp_continue;
-        }],
-        [ qr/#\s*$/ => sub { $logged_in = 1; }],
-        [ qr/[Pp]ermission denied/ => sub {
-            log_output("  [ERROR] Authentication failed\n\n");
-        }],
-        [ timeout => sub {
-            log_output("  [ERROR] Connection timed out\n\n");
-        }],
-    );
-
-    unless ($logged_in) {
-        $exp->hard_close();
-        next;
-    }
-
-    $exp->send("terminal length 0\n");
-    $exp->expect($timeout, qr/#\s*$/);
-
-    $exp->send("show ip ospf interface\n");
-    my $output = '';
-    $exp->expect($timeout,
-        [ qr/#\s*$/ => sub { $output = $exp->before(); }],
-        [ timeout   => sub { log_output("  [ERROR] Command timed out\n"); }],
-    );
-
-    $exp->send("exit\n");
-    $exp->soft_close();
-
-    if (!$output) {
-        log_output("  [WARN] No output received — OSPF may not be configured\n\n");
-        next;
-    }
-
-    my @interfaces;
-    my $current;
-
-    for my $line (split /\n/, $output) {
-        if ($line =~ /^(\S+)\s+is\s+(?:up|down),\s+line\s+protocol\s+is\s+(?:up|down)/i) {
-            push @interfaces, $current if $current;
-            $current = { name => $1, hello => '?', dead => '?', auth => 'none', area => '?', net_type => '?' };
-        }
-        next unless $current;
-
-        if ($line =~ /Internet Address\s+[\d.]+\/\d+,\s+Area\s+([\d.]+)/) {
-            $current->{area} = $1;
-        }
-        if ($line =~ /Network Type\s+(\S+)/) {
-            $current->{net_type} = $1;
-        }
-        if ($line =~ /Timer intervals configured.*Hello\s+(\d+),\s+Dead\s+(\d+)/) {
-            $current->{hello} = $1;
-            $current->{dead}  = $2;
-        }
-        if ($line =~ /Simple password authentication enabled/i) {
-            $current->{auth} = 'simple';
-        } elsif ($line =~ /Message digest authentication enabled/i) {
-            $current->{auth} = 'md5';
-        } elsif ($line =~ /No authentication/i) {
-            $current->{auth} = 'none';
-        }
-    }
-    push @interfaces, $current if $current;
-
-    if (!@interfaces) {
-        log_output("  No OSPF interfaces found on this device\n\n");
-        next;
-    }
-
-    my $issues = 0;
-    for my $iface (@interfaces) {
-        my @flags;
-        push @flags, "NON-DEFAULT hello=$iface->{hello}s"  if $iface->{hello} ne '?' && $iface->{hello} != 10;
-        push @flags, "NON-DEFAULT dead=$iface->{dead}s"    if $iface->{dead}  ne '?' && $iface->{dead}  != 40;
-        push @flags, "NO-AUTH"                              if $iface->{auth} eq 'none';
-
-        $issues++ if @flags;
-
-        log_output(sprintf("  %-28s  Area:%-8s  Hello:%-4s  Dead:%-4s  Auth:%-6s  Type:%s%s\n",
-            $iface->{name}, $iface->{area},
-            $iface->{hello}, $iface->{dead},
-            $iface->{auth}, $iface->{net_type},
-            @flags ? "\n         [!] " . join(", ", @flags) : ""));
-    }
-
-    log_output("\n  Summary: " . scalar(@interfaces) . " OSPF interface(s), $issues issue(s) flagged\n\n");
-}
-
-log_output("Audit complete.\n");
+emit("Monitor complete after $polls poll(s).");
 close $log_fh if $log_fh;
-```
-
-The script audits `show ip ospf interface` output per device, parses hello/dead timers and auth type per interface, and flags anything non-default or missing auth — a distinct operational use case from the existing neighbor-state scripts. It handles connection failures, auth errors, and timeouts cleanly, supports both single-host and device-list modes, and optionally tees output to a log file.
