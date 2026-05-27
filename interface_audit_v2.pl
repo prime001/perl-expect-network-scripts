@@ -1,31 +1,25 @@
-```perl
 #!/usr/bin/perl
-# =============================================================================
-# interface_errors.pl - Interface Error Counter Auditor
+#
+# stp_audit.pl - Spanning Tree Protocol Audit Script
 #
 # Purpose:
-#   SSH into Cisco IOS/IOS-XE devices and scan all interface error counters
-#   (input errors, CRC, giants, runts, output drops). Reports non-zero counters
-#   and flags interfaces where error rate exceeds a configurable threshold.
-#   Useful for proactive fault detection, capacity planning, and pre-maintenance
-#   baselining before circuit swaps or hardware replacements.
+#   Connects to Cisco IOS/IOS-XE devices via SSH and audits STP topology.
+#   Reports root bridge status, topology change counts per VLAN, ports in
+#   blocking state, and flags ports stuck in transitional states (Listening/
+#   Learning) that may indicate a flapping link or misconfiguration.
 #
 # Usage:
-#   ./interface_errors.pl -h 192.168.1.1 -u admin -p secret
-#   ./interface_errors.pl -f devices.txt -u admin -p secret -l audit.log
-#   ./interface_errors.pl -h 10.0.0.1 -u admin -p secret -t 0.5
-#
-# Options:
-#   -h  Device IP/hostname (or use -f for multiple)
-#   -f  File with one device per line (# for comments)
-#   -u  SSH username
-#   -p  SSH password
-#   -l  Log file path (appends; optional)
-#   -t  Error rate % threshold to flag [WARN] (default: 1.0)
+#   Single device:   ./stp_audit.pl 192.168.1.1
+#   Device list:     ./stp_audit.pl -f devices.txt
+#   With log file:   ./stp_audit.pl 192.168.1.1 -l /var/log/stp_audit.log
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect Getopt::Long
-# =============================================================================
+#   cpan install Net::SSH::Expect
+#   Set DEVICE_USER and DEVICE_PASS env vars, or edit defaults below.
+#   SSH must be enabled on target devices.
+#
+# Author: Network Engineering
+# Version: 1.0
 
 use strict;
 use warnings;
@@ -33,136 +27,141 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $user, $pass, $device_file, $log_file, $threshold);
-$threshold = 1.0;
+my $DEFAULT_USER    = $ENV{DEVICE_USER} // 'admin';
+my $DEFAULT_PASS    = $ENV{DEVICE_PASS} // 'cisco';
+my $DEFAULT_TIMEOUT = 15;
+my $TC_THRESHOLD    = 100;  # topology change count worth flagging
 
+my ($file, $logfile, $help);
 GetOptions(
-    'h|host=s'      => \$host,
-    'u|user=s'      => \$user,
-    'p|pass=s'      => \$pass,
-    'f|file=s'      => \$device_file,
-    'l|log=s'       => \$log_file,
-    't|threshold=f' => \$threshold,
-) or die "Usage: $0 -h HOST -u USER -p PASS [-f FILE] [-l LOG] [-t THRESH%]\n";
+    'f|file=s' => \$file,
+    'l|log=s'  => \$logfile,
+    'h|help'   => \$help,
+) or die "Usage: $0 [-f devices.txt] [-l logfile.log] [host]\n";
 
-die "ERROR: -u username required\n"        unless $user;
-die "ERROR: -p password required\n"        unless $pass;
-die "ERROR: specify -h HOST or -f FILE\n"  unless $host || $device_file;
-
-my @devices;
-if ($device_file) {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_ }
-    close $fh;
-} else {
-    @devices = ($host);
+if ($help) {
+    print "Usage: $0 [options] [host]\n";
+    print "  -f FILE   Read device hostnames/IPs from file (one per line)\n";
+    print "  -l FILE   Append output to log file\n";
+    print "  -h        Show this help\n";
+    exit 0;
 }
 
+my @devices;
+if ($file) {
+    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!";
+    while (<$fh>) {
+        chomp; s/#.*//; s/^\s+|\s+$//g;
+        push @devices, $_ if /\S/;
+    }
+    close $fh;
+} elsif (@ARGV) {
+    push @devices, $ARGV[0];
+} else {
+    die "Usage: $0 [-f devices.txt] [-l logfile.log] [host]\n";
+}
+
+die "No devices specified or found in file\n" unless @devices;
+
 my $log_fh;
-if ($log_file) {
-    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
+if ($logfile) {
+    open($log_fh, '>>', $logfile) or die "Cannot open log '$logfile': $!";
 }
 
 sub out {
-    my $msg = shift;
+    my ($msg) = @_;
     print $msg;
     print $log_fh $msg if $log_fh;
 }
 
-for my $device (@devices) {
+sub audit_device {
+    my ($host) = @_;
     my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-    out("\n" . "=" x 65 . "\n");
-    out("Host: $device   Scanned: $ts   Threshold: ${threshold}%\n");
-    out("=" x 65 . "\n");
 
-    my $ssh = Net::SSH::Expect->new(
-        host     => $device,
-        user     => $user,
-        password => $pass,
-        raw_pty  => 1,
-        timeout  => 20,
-    );
+    out("\n" . "=" x 62 . "\n");
+    out("STP Audit | $host | $ts\n");
+    out("=" x 62 . "\n");
 
-    eval { $ssh->login() };
+    my $ssh;
+    eval {
+        $ssh = Net::SSH::Expect->new(
+            host       => $host,
+            user       => $DEFAULT_USER,
+            password   => $DEFAULT_PASS,
+            raw_pty    => 1,
+            timeout    => $DEFAULT_TIMEOUT,
+            ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+        );
+        $ssh->run_ssh() or die "SSH process failed to start";
+        my $banner = $ssh->login();
+        die "Authentication failed or no device prompt" unless $banner && $banner =~ /[>#]/;
+    };
     if ($@) {
-        out("ERROR: Cannot connect to $device: $@\n");
-        next;
+        out("ERROR connecting to $host: $@\n");
+        return;
     }
 
-    $ssh->exec("terminal length 0");
-    my $output = $ssh->exec("show interfaces");
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('#\s*$', 5);
 
-    unless ($output) {
-        out("ERROR: No output from $device — possible timeout or privilege issue\n");
-        $ssh->close();
-        next;
-    }
+    $ssh->send("show spanning-tree summary\n");
+    my $summary = $ssh->waitfor('#\s*$', 15) // '';
 
+    $ssh->send("show spanning-tree detail\n");
+    my $detail = $ssh->waitfor('#\s*$', 20) // '';
+
+    $ssh->send("exit\n");
     $ssh->close();
 
-    my @results;
-    my @blocks = split /\n(?=\S+\s+is\s+(?:up|down|administratively))/, $output;
-
-    for my $block (@blocks) {
-        my ($iface) = $block =~ /^(\S+)\s+is\s+/      or next;
-        my ($state) = $block =~ /is\s+([\w\s]+?),/i   or next;
-        $state =~ s/\s+$//;
-
-        my ($in_pkts)  = ($block =~ /(\d+)\s+packets\s+input/i);
-        my ($in_err)   = ($block =~ /(\d+)\s+input\s+errors/i);
-        my ($crc)      = ($block =~ /(\d+)\s+CRC/i);
-        my ($runts)    = ($block =~ /(\d+)\s+runts/i);
-        my ($giants)   = ($block =~ /(\d+)\s+giants/i);
-        my ($out_pkts) = ($block =~ /(\d+)\s+packets\s+output/i);
-        my ($out_drop) = ($block =~ /(\d+)\s+output\s+drops/i);
-
-        for ($in_pkts, $in_err, $crc, $runts, $giants, $out_pkts, $out_drop) {
-            $_ //= 0;
+    # Root bridge status
+    if ($summary =~ /Root bridge for:\s*(.+)/i) {
+        out("ROOT BRIDGE for: $1\n");
+    } elsif ($summary =~ /This bridge is the root/i) {
+        out("ROOT BRIDGE (all VLANs)\n");
+    } else {
+        out("Not root bridge on this device\n");
+        if ($summary =~ /Root ID\s+Priority\s+(\d+)\s+Address\s+(\S+)/i) {
+            out("  Root:  priority=$1  mac=$2\n");
         }
-
-        my $total_err = $in_err + $crc + $runts + $giants + $out_drop;
-        next if $total_err == 0;
-
-        my $in_rate  = $in_pkts  > 0 ? ($in_err  / $in_pkts  * 100) : 0;
-        my $out_rate = $out_pkts > 0 ? ($out_drop / $out_pkts * 100) : 0;
-        my $max_rate = $in_rate > $out_rate ? $in_rate : $out_rate;
-        my $flag     = $max_rate >= $threshold ? '[WARN]' : '';
-
-        push @results, {
-            iface    => $iface,
-            state    => substr($state, 0, 8),
-            in_err   => $in_err,
-            crc      => $crc,
-            runts    => $runts,
-            giants   => $giants,
-            out_drop => $out_drop,
-            rate     => $max_rate,
-            flag     => $flag,
-        };
     }
 
-    if (!@results) {
-        out("All interfaces: zero error counters.\n");
-        next;
+    # Topology change counts per VLAN
+    my %tc;
+    while ($detail =~ /^VLAN(\d+)\b.*?Number of topology changes\s+(\d+)/gims) {
+        $tc{$1} = $2;
+    }
+    if (%tc) {
+        out("\nTopology Change Counts per VLAN:\n");
+        for my $vlan (sort { $a <=> $b } keys %tc) {
+            my $flag = $tc{$vlan} > $TC_THRESHOLD ? '  *** HIGH - investigate' : '';
+            out(sprintf("  VLAN%-5s  TC=%d%s\n", $vlan, $tc{$vlan}, $flag));
+        }
     }
 
-    @results = sort { ($b->{flag} cmp $a->{flag}) || ($b->{rate} <=> $a->{rate}) } @results;
-
-    out(sprintf("%-26s %-8s %8s %8s %6s %6s %9s  %s\n",
-        'Interface', 'State', 'InErr', 'CRC', 'Runts', 'Giants', 'OutDrop', 'Status'));
-    out("-" x 82 . "\n");
-
-    for my $r (@results) {
-        out(sprintf("%-26s %-8s %8d %8d %6d %6d %9d  %s\n",
-            $r->{iface}, $r->{state},
-            $r->{in_err}, $r->{crc}, $r->{runts},
-            $r->{giants}, $r->{out_drop}, $r->{flag}));
+    # Ports in blocking state (expected for redundant links, listed for awareness)
+    my @blocking;
+    while ($detail =~ /^(\S+)\s+of \S+ is Blocking/gim) {
+        push @blocking, $1;
+    }
+    if (@blocking) {
+        out("\nBlocking ports (redundant, normal): " . join(', ', @blocking) . "\n");
     }
 
-    my $warn_count = grep { $_->{flag} } @results;
-    out(sprintf("\nSummary: %d interface(s) with errors, %d exceed %.1f%% threshold\n",
-        scalar @results, $warn_count, $threshold));
+    # Ports stuck in transitional states (potential issue)
+    my @transitional;
+    while ($detail =~ /^(\S+)\s+of \S+ is (Listening|Learning)/gim) {
+        push @transitional, "$1[$2]";
+    }
+    if (@transitional) {
+        out("\nWARNING - Transitional port states (possible flap or reconfiguration):\n");
+        out("  " . join(', ', @transitional) . "\n");
+    }
+
+    out("\nAudit complete.\n");
+}
+
+for my $host (@devices) {
+    audit_device($host);
 }
 
 close $log_fh if $log_fh;
-```
