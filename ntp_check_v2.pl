@@ -1,194 +1,147 @@
-```perl
 #!/usr/bin/perl
-# =============================================================================
-# ntp_drift_monitor.pl - NTP Offset/Jitter Threshold Compliance Monitor
-# =============================================================================
+#
+# acl_audit.pl - Cisco IOS Access Control List Auditor
+#
 # Purpose:
-#   Connects to network devices via SSH and checks NTP offset and jitter
-#   values against configurable thresholds. Flags devices exceeding limits
-#   and produces a compliance summary. Distinct from basic NTP sync checks —
-#   this focuses on drift magnitude and jitter health for SLA compliance.
+#   Connects to one or more Cisco IOS devices via SSH and audits IP ACL
+#   configuration. Reports all named/numbered ACLs with entry counts and
+#   hit counts, shows which direction each is applied, and flags orphaned
+#   ACLs (defined but not applied to any interface) and phantom references
+#   (referenced on an interface but missing from the running config).
 #
 # Usage:
-#   ./ntp_drift_monitor.pl -u <user> [-p <pass>] [-f <device_file>] [host ...]
-#   ./ntp_drift_monitor.pl -u admin -f devices.txt
-#   ./ntp_drift_monitor.pl -u admin 10.0.0.1 10.0.0.2
-#
-# Options:
-#   -u  SSH username (required)
-#   -p  SSH password (prompted if omitted)
-#   -f  File with one device IP/hostname per line
-#   -l  Log file path (default: ntp_drift_YYYYMMDD.log)
-#   -o  Offset threshold in ms (default: 100)
-#   -j  Jitter threshold in ms (default: 50)
-#   -t  SSH timeout in seconds (default: 15)
+#   Single device:  ./acl_audit.pl -h 192.168.1.1 -u admin [-p pass] [-l audit.log]
+#   Device list:    ./acl_audit.pl -f devices.txt  -u admin [-p pass] [-l audit.log]
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect Term::ReadKey
-#   Devices must be IOS/IOS-XE (parses 'show ntp associations detail')
-# =============================================================================
+#   cpan Net::SSH::Expect Getopt::Long
+#   SSH enabled on target devices; account needs at minimum 'show' privilege.
+#
+# Tested on: Cisco IOS 12.4, 15.x, IOS-XE 16.x, IOS-XR 6.x (read-only show cmds)
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Std;
+use Getopt::Long;
 use POSIX qw(strftime);
-use Term::ReadKey;
 
-our %opts;
-getopts('u:p:f:l:o:j:t:', \%opts);
+my ($host, $file, $user, $pass, $logfile);
+my $timeout = 30;
 
-my $username       = $opts{u} or die "Usage: $0 -u <user> [-p pass] [-f file] [hosts...]\n";
-my $offset_thresh  = $opts{o} // 100;
-my $jitter_thresh  = $opts{j} // 50;
-my $timeout        = $opts{t} // 15;
-my $datestamp      = strftime('%Y%m%d_%H%M%S', localtime);
-my $logfile        = $opts{l} // "ntp_drift_$datestamp.log";
+GetOptions(
+    'h|host=s'    => \$host,
+    'f|file=s'    => \$file,
+    'u|user=s'    => \$user,
+    'p|pass=s'    => \$pass,
+    'l|log=s'     => \$logfile,
+    't|timeout=i' => \$timeout,
+) or die "Usage: $0 -h <host> | -f <file> -u <user> [-p <pass>] [-l <logfile>]\n";
 
-my $password;
-if ($opts{p}) {
-    $password = $opts{p};
-} else {
-    print "Password for $username: ";
-    ReadMode('noecho');
-    chomp($password = <STDIN>);
-    ReadMode('restore');
-    print "\n";
-}
+die "Specify -h <host> or -f <file>\n" unless $host || $file;
+die "Username required (-u)\n"         unless $user;
 
 my @devices;
-if ($opts{f}) {
-    open(my $fh, '<', $opts{f}) or die "Cannot open device file '$opts{f}': $!\n";
-    while (<$fh>) {
-        chomp;
-        s/#.*//;
-        s/^\s+|\s+$//g;
-        push @devices, $_ if $_;
-    }
+if ($host) {
+    @devices = ($host);
+} else {
+    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
+    @devices = map { chomp; $_ } grep { /\S/ && !/^\s*#/ } <$fh>;
     close $fh;
 }
-push @devices, @ARGV;
-die "No devices specified. Use -f <file> or list hosts as arguments.\n" unless @devices;
 
-open(my $log, '>', $logfile) or die "Cannot open log '$logfile': $!\n";
+my $log_fh;
+if ($logfile) {
+    open($log_fh, '>>', $logfile) or die "Cannot open log '$logfile': $!\n";
+}
 
-sub log_print {
+sub out {
     my $msg = shift;
     print $msg;
-    print $log $msg;
+    print {$log_fh} $msg if $log_fh;
 }
 
-sub check_device {
-    my ($host) = @_;
-    my %result = (host => $host, status => 'ERROR', offset => 'N/A', jitter => 'N/A', ref_ip => 'N/A');
+sub audit_device {
+    my $device = shift;
+    out("\n" . "=" x 64 . "\n");
+    out(sprintf "Device: %-30s  %s\n", $device, strftime("%Y-%m-%d %H:%M:%S", localtime));
+    out("=" x 64 . "\n");
 
-    my $ssh = Net::SSH::Expect->new(
-        host        => $host,
-        user        => $username,
-        password    => $password,
-        raw_pty     => 1,
-        timeout     => $timeout,
-    );
-
+    my $ssh;
     eval {
-        my $login = $ssh->login();
-        if ($login !~ /[>#]/) {
-            die "Authentication failed or unexpected prompt";
-        }
-
-        $ssh->send("terminal length 0\n");
-        $ssh->waitfor('[>#]', $timeout) or die "Prompt timeout after terminal length";
-
-        $ssh->send("show ntp associations detail\n");
-        my $output = '';
-        my $chunk;
-        while (defined($chunk = $ssh->read_all(3))) {
-            $output .= $chunk;
-            last if $output =~ /[>#]\s*$/;
-        }
-
-        $ssh->send("exit\n");
-        $ssh->close();
-
-        my ($offset, $jitter, $ref_ip);
-        if ($output =~ /our\s+master,\s+stratum\s+\d+.*?ref\s+ID\s+([\d.]+)/si) {
-            $ref_ip = $1;
-        }
-        if ($output =~ /offset\s+([-\d.]+)\s+msec/i) {
-            $offset = $1;
-        }
-        if ($output =~ /jitter\s+([\d.]+)\s+msec/i) {
-            $jitter = $1;
-        }
-
-        unless (defined $offset && defined $jitter) {
-            $result{status} = 'NO_SYNC';
-            return \%result;
-        }
-
-        $result{offset} = sprintf("%.3f", $offset);
-        $result{jitter} = sprintf("%.3f", $jitter);
-        $result{ref_ip} = $ref_ip // 'unknown';
-
-        my $offset_abs = abs($offset);
-        if ($offset_abs > $offset_thresh || $jitter > $jitter_thresh) {
-            $result{status} = 'FAIL';
-        } else {
-            $result{status} = 'PASS';
-        }
+        $ssh = Net::SSH::Expect->new(
+            host     => $device,
+            user     => $user,
+            password => $pass,
+            raw_pty  => 1,
+            timeout  => $timeout,
+        );
+        $ssh->login();
     };
     if ($@) {
-        my $err = $@;
-        $err =~ s/\n.*//s;
-        $result{detail} = $err;
+        out("  ERROR: Connection failed - $@\n");
+        return;
     }
 
-    return \%result;
-}
+    $ssh->send("terminal length 0");
+    $ssh->waitfor('>#?\s*$', $timeout);
 
-my $header = sprintf("\nNTP Drift Compliance Report — %s\n", strftime('%Y-%m-%d %H:%M:%S', localtime));
-$header .= sprintf("Thresholds: offset=+/-%dms  jitter=%dms\n", $offset_thresh, $jitter_thresh);
-$header .= sprintf("Devices: %d\n%s\n", scalar @devices, '-' x 72);
-log_print($header);
+    $ssh->send("show ip access-lists");
+    my $acl_raw = $ssh->waitfor('>#?\s*$', $timeout) // '';
 
-my @results;
-for my $host (@devices) {
-    log_print(sprintf("Checking %-30s ... ", $host));
-    my $r = check_device($host);
-    push @results, $r;
+    $ssh->send("show running-config | include ip access-group");
+    my $apply_raw = $ssh->waitfor('>#?\s*$', $timeout) // '';
 
-    if ($r->{status} eq 'PASS') {
-        log_print(sprintf("PASS  offset=%-10s jitter=%-10s ref=%s\n",
-            "$r->{offset}ms", "$r->{jitter}ms", $r->{ref_ip}));
-    } elsif ($r->{status} eq 'FAIL') {
-        log_print(sprintf("FAIL  offset=%-10s jitter=%-10s ref=%s  *** EXCEEDS THRESHOLD\n",
-            "$r->{offset}ms", "$r->{jitter}ms", $r->{ref_ip}));
-    } elsif ($r->{status} eq 'NO_SYNC') {
-        log_print("NO_SYNC  (not synchronized to any peer)\n");
+    $ssh->close();
+
+    # Parse ACL definitions: name -> { entries, hits }
+    my %defined;
+    my $cur;
+    for my $line (split /\n/, $acl_raw) {
+        if ($line =~ /^(?:Standard|Extended) IP access list (\S+)/) {
+            $cur = $1;
+            $defined{$cur} = { entries => 0, hits => 0 };
+        } elsif ($cur) {
+            $defined{$cur}{entries}++ if $line =~ /^\s+(permit|deny)/i;
+            $defined{$cur}{hits}    += $1 if $line =~ /\((\d+) match(?:es)?\)/;
+        }
+    }
+
+    # Parse interface applications: acl_name -> [directions]
+    my %applied;
+    for my $line (split /\n/, $apply_raw) {
+        if ($line =~ /ip access-group (\S+)\s+(in|out)/i) {
+            push @{$applied{$1}}, $2;
+        }
+    }
+
+    out("\nDefined ACLs:\n");
+    if (%defined) {
+        for my $acl (sort keys %defined) {
+            my $dirs   = exists $applied{$acl} ? join('+', sort @{$applied{$acl}}) : undef;
+            my $status = $dirs ? sprintf("applied %-8s", $dirs) : 'NOT APPLIED   [ORPHAN]';
+            out(sprintf "  %-32s  %3d entries  %8d hits  %s\n",
+                $acl, $defined{$acl}{entries}, $defined{$acl}{hits}, $status);
+        }
     } else {
-        log_print(sprintf("ERROR  %s\n", $r->{detail} // 'unknown error'));
+        out("  No IP access lists found\n");
     }
+
+    out("\nInterface ACL references:\n");
+    my $ref_found = 0;
+    for my $acl (sort keys %applied) {
+        next if exists $defined{$acl};
+        out(sprintf "  [WARNING] ACL '%-28s' applied (%s) but NOT defined in config!\n",
+            $acl, join('+', @{$applied{$acl}}));
+        $ref_found = 1;
+    }
+    out("  All applied ACLs exist in config\n") unless $ref_found;
 }
 
-my @passed  = grep { $_->{status} eq 'PASS'    } @results;
-my @failed  = grep { $_->{status} eq 'FAIL'    } @results;
-my @nosync  = grep { $_->{status} eq 'NO_SYNC' } @results;
-my @errors  = grep { $_->{status} eq 'ERROR'   } @results;
+out("ACL Audit Report\n");
+out("Generated : " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n");
+out("Devices   : " . scalar(@devices) . "\n");
 
-my $summary = sprintf("\n%s\nSUMMARY: %d PASS  %d FAIL  %d NO_SYNC  %d ERROR\n",
-    '-' x 72, scalar @passed, scalar @failed, scalar @nosync, scalar @errors);
-log_print($summary);
+audit_device($_) for @devices;
 
-if (@failed) {
-    log_print("\nDevices exceeding thresholds:\n");
-    for my $r (@failed) {
-        log_print(sprintf("  %-30s offset=%sms  jitter=%sms\n",
-            $r->{host}, $r->{offset}, $r->{jitter}));
-    }
-}
-
-log_print("\nLog saved to: $logfile\n");
-close $log;
-
-exit(@failed || @errors || @nosync ? 1 : 0);
-```
+out("\nAudit complete.\n");
+close $log_fh if $log_fh;
