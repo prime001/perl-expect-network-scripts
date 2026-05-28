@@ -1,34 +1,31 @@
-The script is ready — here's the complete content to write to `109_ntp_compliance_audit.pl`:
-
 ```perl
 #!/usr/bin/perl
 # =============================================================================
-# ntp_compliance_audit.pl - NTP Policy Compliance Auditor
-#
+# ntp_drift_monitor.pl - NTP Offset/Jitter Threshold Compliance Monitor
+# =============================================================================
 # Purpose:
-#   Audits NTP configuration across multiple network devices against a defined
-#   policy: approved source IPs, maximum stratum, and acceptable clock offset.
-#   Produces a PASS/FAIL compliance summary suitable for audit reports.
+#   Connects to network devices via SSH and checks NTP offset and jitter
+#   values against configurable thresholds. Flags devices exceeding limits
+#   and produces a compliance summary. Distinct from basic NTP sync checks —
+#   this focuses on drift magnitude and jitter health for SLA compliance.
 #
 # Usage:
-#   perl ntp_compliance_audit.pl -f devices.txt [-l audit.log] [-s sources.txt]
-#   perl ntp_compliance_audit.pl -d 10.0.0.1 [-l audit.log]
-#
-#   devices.txt format:  ip username password
-#   sources.txt format:  one approved NTP server IP per line
+#   ./ntp_drift_monitor.pl -u <user> [-p <pass>] [-f <device_file>] [host ...]
+#   ./ntp_drift_monitor.pl -u admin -f devices.txt
+#   ./ntp_drift_monitor.pl -u admin 10.0.0.1 10.0.0.2
 #
 # Options:
-#   -f <file>     File containing device list
-#   -d <ip>       Single device IP (prompts for credentials)
-#   -l <file>     Log file path (default: ntp_audit_YYYYMMDD.log)
-#   -s <file>     Approved NTP sources file (default: warn if not provided)
-#   -m <stratum>  Maximum allowed stratum (default: 3)
-#   -o <ms>       Maximum allowed offset in ms (default: 500)
-#   -t <sec>      SSH timeout (default: 15)
+#   -u  SSH username (required)
+#   -p  SSH password (prompted if omitted)
+#   -f  File with one device IP/hostname per line
+#   -l  Log file path (default: ntp_drift_YYYYMMDD.log)
+#   -o  Offset threshold in ms (default: 100)
+#   -j  Jitter threshold in ms (default: 50)
+#   -t  SSH timeout in seconds (default: 15)
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
-#   Cisco IOS/IOS-XE devices (adjust prompts for other vendors)
+#   cpan Net::SSH::Expect Term::ReadKey
+#   Devices must be IOS/IOS-XE (parses 'show ntp associations detail')
 # =============================================================================
 
 use strict;
@@ -36,158 +33,162 @@ use warnings;
 use Net::SSH::Expect;
 use Getopt::Std;
 use POSIX qw(strftime);
+use Term::ReadKey;
 
-my %opts;
-getopts('f:d:l:s:m:o:t:', \%opts);
+our %opts;
+getopts('u:p:f:l:o:j:t:', \%opts);
 
-my $MAX_STRATUM   = $opts{m} || 3;
-my $MAX_OFFSET_MS = $opts{o} || 500;
-my $TIMEOUT       = $opts{t} || 15;
-my $timestamp     = strftime("%Y%m%d_%H%M%S", localtime);
-my $logfile       = $opts{l} || "ntp_audit_${timestamp}.log";
+my $username       = $opts{u} or die "Usage: $0 -u <user> [-p pass] [-f file] [hosts...]\n";
+my $offset_thresh  = $opts{o} // 100;
+my $jitter_thresh  = $opts{j} // 50;
+my $timeout        = $opts{t} // 15;
+my $datestamp      = strftime('%Y%m%d_%H%M%S', localtime);
+my $logfile        = $opts{l} // "ntp_drift_$datestamp.log";
 
-die "Usage: $0 -f devices.txt | -d ip [-l logfile] [-s approved_sources.txt]\n"
-    unless $opts{f} || $opts{d};
-
-open(my $LOG, '>>', $logfile) or die "Cannot open log $logfile: $!";
-sub log_out {
-    my $msg = shift;
-    print $msg;
-    print $LOG $msg;
-}
-
-my %approved_sources;
-if ($opts{s} && -f $opts{s}) {
-    open(my $sf, '<', $opts{s}) or die "Cannot open sources file: $!";
-    while (<$sf>) {
-        chomp;
-        s/#.*//; s/^\s+|\s+$//g;
-        $approved_sources{$_} = 1 if $_;
-    }
-    close $sf;
+my $password;
+if ($opts{p}) {
+    $password = $opts{p};
+} else {
+    print "Password for $username: ";
+    ReadMode('noecho');
+    chomp($password = <STDIN>);
+    ReadMode('restore');
+    print "\n";
 }
 
 my @devices;
-if ($opts{d}) {
-    print "Username: "; chomp(my $u = <STDIN>);
-    print "Password: "; system("stty -echo"); chomp(my $p = <STDIN>); system("stty echo"); print "\n";
-    push @devices, { ip => $opts{d}, user => $u, pass => $p };
-} else {
-    open(my $df, '<', $opts{f}) or die "Cannot open device file: $!";
-    while (<$df>) {
-        chomp; s/#.*//; s/^\s+|\s+$//g;
-        next unless $_;
-        my ($ip, $user, $pass) = split(/\s+/, $_, 3);
-        push @devices, { ip => $ip, user => $user, pass => $pass } if $ip && $user;
+if ($opts{f}) {
+    open(my $fh, '<', $opts{f}) or die "Cannot open device file '$opts{f}': $!\n";
+    while (<$fh>) {
+        chomp;
+        s/#.*//;
+        s/^\s+|\s+$//g;
+        push @devices, $_ if $_;
     }
-    close $df;
+    close $fh;
+}
+push @devices, @ARGV;
+die "No devices specified. Use -f <file> or list hosts as arguments.\n" unless @devices;
+
+open(my $log, '>', $logfile) or die "Cannot open log '$logfile': $!\n";
+
+sub log_print {
+    my $msg = shift;
+    print $msg;
+    print $log $msg;
 }
 
-my ($pass_count, $fail_count) = (0, 0);
-log_out("=" x 70 . "\n");
-log_out("NTP Compliance Audit  |  $timestamp\n");
-log_out("Policy: stratum<=$MAX_STRATUM, offset<=${MAX_OFFSET_MS}ms" .
-        (keys %approved_sources ? ", approved-sources enforced" : ", no source policy") . "\n");
-log_out("=" x 70 . "\n\n");
+sub check_device {
+    my ($host) = @_;
+    my %result = (host => $host, status => 'ERROR', offset => 'N/A', jitter => 'N/A', ref_ip => 'N/A');
 
-for my $dev (@devices) {
-    my $ip   = $dev->{ip};
-    my @failures;
+    my $ssh = Net::SSH::Expect->new(
+        host        => $host,
+        user        => $username,
+        password    => $password,
+        raw_pty     => 1,
+        timeout     => $timeout,
+    );
 
-    log_out("--- $ip ---\n");
-
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host        => $ip,
-            user        => $dev->{user},
-            password    => $dev->{pass},
-            raw_pty     => 1,
-            timeout     => $TIMEOUT,
-        );
-    };
-    if ($@ || !$ssh) {
-        log_out("  [ERROR] SSH init failed: $@\n\n");
-        $fail_count++;
-        next;
-    }
-
-    my $login = eval { $ssh->login() };
-    if ($@ || !$login) {
-        log_out("  [ERROR] Login failed (auth error or timeout)\n\n");
-        $fail_count++;
-        next;
-    }
-
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('\$\s*$|#\s*$', 5);
-
-    $ssh->send("show ntp status");
-    my $ntp_status = $ssh->waitfor('#\s*$', 10) // '';
-
-    $ssh->send("show ntp associations detail");
-    my $ntp_assoc = $ssh->waitfor('#\s*$', 10) // '';
-
-    $ssh->send("exit");
-
-    if ($ntp_status =~ /Clock is unsynchronized/i) {
-        push @failures, "Clock is UNSYNCHRONIZED";
-    }
-
-    if ($ntp_status =~ /stratum\s+(\d+)/i) {
-        my $stratum = $1;
-        log_out("  Stratum  : $stratum\n");
-        push @failures, "Stratum $stratum exceeds max $MAX_STRATUM" if $stratum > $MAX_STRATUM;
-    } else {
-        push @failures, "Could not determine stratum";
-    }
-
-    if ($ntp_status =~ /offset\s+([-\d.]+)\s*ms/i || $ntp_status =~ /offset\s+([-\d.]+)/i) {
-        my $offset = abs($1);
-        $offset *= 1000 if $offset < 10 && $ntp_status !~ /ms/i;
-        log_out(sprintf("  Offset   : %.2f ms\n", $offset));
-        push @failures, sprintf("Offset %.2fms exceeds max ${MAX_OFFSET_MS}ms", $offset)
-            if $offset > $MAX_OFFSET_MS;
-    }
-
-    my @active_sources;
-    while ($ntp_assoc =~ /address\s+([\d.]+)/gi) {
-        push @active_sources, $1;
-    }
-    if (!@active_sources && $ntp_status =~ /reference is\s+([\d.]+)/i) {
-        push @active_sources, $1;
-    }
-
-    if (@active_sources) {
-        log_out("  Sources  : " . join(", ", @active_sources) . "\n");
-        if (%approved_sources) {
-            for my $src (@active_sources) {
-                push @failures, "Unapproved NTP source: $src"
-                    unless $approved_sources{$src};
-            }
+    eval {
+        my $login = $ssh->login();
+        if ($login !~ /[>#]/) {
+            die "Authentication failed or unexpected prompt";
         }
-    } else {
-        log_out("  Sources  : (none detected)\n");
-        push @failures, "No active NTP sources found" unless grep { /UNSYNCHRONIZED/i } @failures;
+
+        $ssh->send("terminal length 0\n");
+        $ssh->waitfor('[>#]', $timeout) or die "Prompt timeout after terminal length";
+
+        $ssh->send("show ntp associations detail\n");
+        my $output = '';
+        my $chunk;
+        while (defined($chunk = $ssh->read_all(3))) {
+            $output .= $chunk;
+            last if $output =~ /[>#]\s*$/;
+        }
+
+        $ssh->send("exit\n");
+        $ssh->close();
+
+        my ($offset, $jitter, $ref_ip);
+        if ($output =~ /our\s+master,\s+stratum\s+\d+.*?ref\s+ID\s+([\d.]+)/si) {
+            $ref_ip = $1;
+        }
+        if ($output =~ /offset\s+([-\d.]+)\s+msec/i) {
+            $offset = $1;
+        }
+        if ($output =~ /jitter\s+([\d.]+)\s+msec/i) {
+            $jitter = $1;
+        }
+
+        unless (defined $offset && defined $jitter) {
+            $result{status} = 'NO_SYNC';
+            return \%result;
+        }
+
+        $result{offset} = sprintf("%.3f", $offset);
+        $result{jitter} = sprintf("%.3f", $jitter);
+        $result{ref_ip} = $ref_ip // 'unknown';
+
+        my $offset_abs = abs($offset);
+        if ($offset_abs > $offset_thresh || $jitter > $jitter_thresh) {
+            $result{status} = 'FAIL';
+        } else {
+            $result{status} = 'PASS';
+        }
+    };
+    if ($@) {
+        my $err = $@;
+        $err =~ s/\n.*//s;
+        $result{detail} = $err;
     }
 
-    if (@failures) {
-        log_out("  Result   : FAIL\n");
-        log_out("  Findings :\n");
-        log_out("    - $_\n") for @failures;
-        $fail_count++;
-    } else {
-        log_out("  Result   : PASS\n");
-        $pass_count++;
-    }
-    log_out("\n");
+    return \%result;
 }
 
-log_out("=" x 70 . "\n");
-log_out(sprintf("SUMMARY  Pass: %d  Fail: %d  Total: %d\n",
-    $pass_count, $fail_count, $pass_count + $fail_count));
-log_out("=" x 70 . "\n");
-log_out("Log: $logfile\n");
-close $LOG;
-```
+my $header = sprintf("\nNTP Drift Compliance Report — %s\n", strftime('%Y-%m-%d %H:%M:%S', localtime));
+$header .= sprintf("Thresholds: offset=+/-%dms  jitter=%dms\n", $offset_thresh, $jitter_thresh);
+$header .= sprintf("Devices: %d\n%s\n", scalar @devices, '-' x 72);
+log_print($header);
 
-This is `109_ntp_compliance_audit.pl` — distinct from the existing `ntp_check` scripts in that it enforces policy (stratum ceiling, offset threshold, approved-source allowlist) across a fleet and produces a per-device PASS/FAIL compliance report. The existing scripts check NTP state; this one audits against defined standards and flags violations.
+my @results;
+for my $host (@devices) {
+    log_print(sprintf("Checking %-30s ... ", $host));
+    my $r = check_device($host);
+    push @results, $r;
+
+    if ($r->{status} eq 'PASS') {
+        log_print(sprintf("PASS  offset=%-10s jitter=%-10s ref=%s\n",
+            "$r->{offset}ms", "$r->{jitter}ms", $r->{ref_ip}));
+    } elsif ($r->{status} eq 'FAIL') {
+        log_print(sprintf("FAIL  offset=%-10s jitter=%-10s ref=%s  *** EXCEEDS THRESHOLD\n",
+            "$r->{offset}ms", "$r->{jitter}ms", $r->{ref_ip}));
+    } elsif ($r->{status} eq 'NO_SYNC') {
+        log_print("NO_SYNC  (not synchronized to any peer)\n");
+    } else {
+        log_print(sprintf("ERROR  %s\n", $r->{detail} // 'unknown error'));
+    }
+}
+
+my @passed  = grep { $_->{status} eq 'PASS'    } @results;
+my @failed  = grep { $_->{status} eq 'FAIL'    } @results;
+my @nosync  = grep { $_->{status} eq 'NO_SYNC' } @results;
+my @errors  = grep { $_->{status} eq 'ERROR'   } @results;
+
+my $summary = sprintf("\n%s\nSUMMARY: %d PASS  %d FAIL  %d NO_SYNC  %d ERROR\n",
+    '-' x 72, scalar @passed, scalar @failed, scalar @nosync, scalar @errors);
+log_print($summary);
+
+if (@failed) {
+    log_print("\nDevices exceeding thresholds:\n");
+    for my $r (@failed) {
+        log_print(sprintf("  %-30s offset=%sms  jitter=%sms\n",
+            $r->{host}, $r->{offset}, $r->{jitter}));
+    }
+}
+
+log_print("\nLog saved to: $logfile\n");
+close $log;
+
+exit(@failed || @errors || @nosync ? 1 : 0);
+```
