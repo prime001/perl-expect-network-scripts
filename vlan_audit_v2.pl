@@ -1,155 +1,191 @@
-```perl
 #!/usr/bin/perl
+# =============================================================================
+# stp_audit.pl - Spanning Tree Protocol Topology Auditor
+# =============================================================================
+# Purpose:
+#   Connects to Cisco IOS/IOS-XE switches via SSH and audits the Spanning Tree
+#   Protocol topology. Reports root bridge placement, port roles/states, active
+#   topology changes, and change counters per VLAN. Flags anomalies that
+#   indicate instability or misconfiguration.
+#
+# Usage:
+#   Single device:  ./stp_audit.pl -h 192.168.1.1 [-u admin] [-p password]
+#   Device list:    ./stp_audit.pl -f switches.txt [-u admin] [-p password]
+#   With logging:   ./stp_audit.pl -h 192.168.1.1 -l /var/log/stp_audit.log
+#
+# Prerequisites:
+#   cpanm Net::SSH::Expect Getopt::Long
+#
+# Environment variables (override CLI args):
+#   NET_USER, NET_PASS, NET_ENABLE
+# =============================================================================
+
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use Time::localtime;
+use POSIX qw(strftime);
 
-# stp_audit.pl - Spanning Tree Protocol topology and configuration audit
-# Audits STP status, bridge priorities, port roles, and topology stability
-# Usage: perl stp_audit.pl --host 192.168.1.1 --user admin --pass pass123
-#        perl stp_audit.pl --file devices.txt --user admin --pass pass123 --logdir ./logs
-# Prerequisites: Net::SSH::Expect, SSH access to Cisco switches
-
-my ($host, $file, $user, $pass, $logfile, $logdir, $timeout, $help);
-$timeout = 30;
+my ($host, $file, $user, $pass, $enable, $logfile, $help);
+my $timeout = 20;
 
 GetOptions(
-    'host=s'    => \$host,
-    'file=s'    => \$file,
-    'user=s'    => \$user,
-    'pass=s'    => \$pass,
-    'logfile=s' => \$logfile,
-    'logdir=s'  => \$logdir,
-    'timeout=i' => \$timeout,
-    'help'      => \$help,
-) or die "Invalid command line arguments\n";
+    'h|host=s'    => \$host,
+    'f|file=s'    => \$file,
+    'u|user=s'    => \$user,
+    'p|pass=s'    => \$pass,
+    'e|enable=s'  => \$enable,
+    'l|log=s'     => \$logfile,
+    't|timeout=i' => \$timeout,
+    'help'        => \$help,
+) or usage();
 
-die "Error: Specify --host or --file\n" unless ($host || $file);
-die "Error: --user and --pass required\n" unless ($user && $pass);
+usage() if $help || (!$host && !$file);
 
-sub log_msg {
-    my ($msg, $logfh) = @_;
-    print "$msg\n";
-    print $logfh "$msg\n" if defined $logfh;
+$user   ||= $ENV{NET_USER}   || 'admin';
+$pass   ||= $ENV{NET_PASS}   || die "Password required: use -p or set NET_PASS\n";
+$enable ||= $ENV{NET_ENABLE} || $pass;
+
+my @devices;
+if ($file) {
+    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
+    while (<$fh>) { chomp; push @devices, $_ if /\S/ && !/^\s*#/ }
+    close $fh;
+} else {
+    @devices = ($host);
 }
 
-sub ssh_connect {
-    my ($host, $user, $pass, $timeout) = @_;
-    my $expect;
-    
-    eval {
-        $expect = Net::SSH::Expect->new(
-            host     => $host,
+my $log_fh;
+if ($logfile) {
+    open($log_fh, '>>', $logfile) or die "Cannot open log '$logfile': $!\n";
+}
+
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+out("=" x 60);
+out("STP Audit Report - $ts");
+out("Devices: " . scalar(@devices));
+out("=" x 60);
+
+for my $device (@devices) {
+    audit_device($device);
+}
+
+close $log_fh if $log_fh;
+
+sub audit_device {
+    my ($device) = @_;
+    out("\n[Device: $device]");
+
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host     => $device,
             user     => $user,
             password => $pass,
-            timeout  => $timeout,
             raw_pty  => 1,
+            timeout  => $timeout,
         );
-        $expect->connect() or die "SSH connection failed\n";
-        $expect->exec("terminal length 0");
     };
-    
     if ($@) {
-        warn "Connection to $host failed: $@";
-        return undef;
+        out("  ERROR: Cannot create SSH session: $@");
+        return;
     }
-    
-    return $expect;
-}
 
-sub audit_stp {
-    my ($host, $expect, $logfh) = @_;
-    
-    log_msg("\n" . "="x60, $logfh);
-    log_msg("STP Audit: $host [" . scalar(localtime()) . "]", $logfh);
-    log_msg("="x60, $logfh);
-    
-    my %commands = (
-        'STP Summary' => 'show spanning-tree summary',
-        'Root Bridge' => 'show spanning-tree root',
-        'Bridge Priorities' => 'show spanning-tree vlan 1 | include Bridge',
-        'Port States' => 'show spanning-tree interface brief',
-        'BPDU Guard' => 'show spanning-tree portfast bpdu-guard',
-        'Topology Changes' => 'show spanning-tree | include Topology',
-    );
-    
-    foreach my $label (sort keys %commands) {
-        log_msg("\n--- $label ---", $logfh);
-        
-        my @output;
-        eval {
-            @output = $expect->exec($commands{$label});
+    my $login = eval { $ssh->login() };
+    if ($@ || !defined $login) {
+        out("  ERROR: Authentication failed (check credentials)");
+        return;
+    }
+
+    $ssh->exec("terminal length 0");
+
+    my $priv = $ssh->exec("show privilege") // '';
+    if ($priv =~ /Current privilege level is (\d+)/ && $1 < 15) {
+        $ssh->send("enable");
+        $ssh->waitfor('Password:', 5);
+        $ssh->send($enable);
+        $ssh->waitfor('#', 10) or do {
+            out("  ERROR: Enable mode failed");
+            $ssh->close();
+            return;
         };
-        
-        if ($@) {
-            log_msg("ERROR executing command: $@", $logfh);
-            next;
-        }
-        
-        my $count = 0;
-        foreach my $line (@output) {
-            chomp($line);
-            next if $line =~ /^\s*$/ || $line =~ /^$/;
-            log_msg($line, $logfh);
-            $count++;
-            last if $count > 25;
-        }
     }
-    
-    log_msg("\n" . "="x60 . "\n", $logfh);
+
+    parse_stp_summary($ssh->exec("show spanning-tree summary"));
+    parse_stp_detail($ssh->exec("show spanning-tree detail"));
+
+    $ssh->close();
 }
 
-my @devices = ();
-if ($host) {
-    @devices = ($host);
-} elsif ($file) {
-    open(my $fh, '<', $file) or die "Cannot open $file: $!\n";
-    while (my $line = <$fh>) {
-        chomp($line);
-        next if $line =~ /^\s*#/ || $line =~ /^\s*$/;
-        push @devices, $line;
+sub parse_stp_summary {
+    my ($raw) = @_;
+    return unless defined $raw;
+
+    for (split /\n/, $raw) {
+        out("  Root bridge for: $1") if /Root bridge for:\s+(.+)/;
+        out("  STP-active VLANs: $1") if /(\d+) vlans? in spanning tree/i;
+        out("  WARN: Active topology change flag set") if /Topology change flag\s+set/i;
+        out("  STP mode: $1") if /^(Rapid PVST|PVST|MST|RSTP)\+?\s+is/i;
+        out("  Portfast BPDU guard: $1") if /Portfast BPDU Guard\s+is\s+(\w+)/i;
     }
-    close($fh);
 }
 
-my $success_count = 0;
-foreach my $device (@devices) {
-    my $logfh;
-    
-    if ($logdir) {
-        mkdir($logdir) unless -d $logdir;
-        my $path = "$logdir/${device}_stp_audit.log";
-        if (open($logfh, '>', $path)) {
-            print "[LOG] Writing to $path\n";
-        } else {
-            warn "Cannot write to $path: $!\n";
+sub parse_stp_detail {
+    my ($raw) = @_;
+    return unless defined $raw;
+
+    my ($current_vlan, @root_vlans, @high_tc_vlans);
+
+    for (split /\n/, $raw) {
+        $current_vlan = $1 if /VLAN(\d+)\s+is (?:executing|in)/i;
+        next unless defined $current_vlan;
+
+        if (/Bridge is the root/i) {
+            push @root_vlans, $current_vlan unless grep { $_ eq $current_vlan } @root_vlans;
         }
-    } elsif ($logfile) {
-        if (!open($logfh, '>', $logfile)) {
-            warn "Cannot write to $logfile: $!\n";
+        if (/Number of topology changes (\d+)/i && $1 > 10) {
+            out("  WARN: VLAN $current_vlan - $1 topology changes (instability risk)");
+        }
+        if (/Last topology change from (\S+)/i) {
+            out("  INFO: VLAN $current_vlan - last TC from $1");
+        }
+        if (/(\S+)\s+of \S+\s+is (?:BLK|blocking)/i) {
+            out("  INFO: VLAN $current_vlan - $1 is blocking");
+        }
+        if (/port is (?:inconsistent|broken|err-disabled)/i) {
+            out("  WARN: VLAN $current_vlan - STP inconsistent/err-disabled port detected");
         }
     }
-    
-    my $ssh = ssh_connect($device, $user, $pass, $timeout);
-    if ($ssh) {
-        eval {
-            audit_stp($device, $ssh, $logfh);
-            $success_count++;
-        };
-        
-        if ($@) {
-            log_msg("ERROR during audit: $@", $logfh);
-        }
-        
-        eval { $ssh->close(); };
+
+    if (@root_vlans) {
+        out("  Root bridge for VLANs: " . join(', ', sort { $a <=> $b } @root_vlans));
     } else {
-        log_msg("FAILED: Cannot connect to $device", $logfh);
+        out("  INFO: Not root bridge for any VLAN on this device");
     }
-    
-    close($logfh) if defined $logfh && fileno($logfh);
 }
 
-print "\nAudit completed: $success_count/" . scalar(@devices) . " successful\n";
-```
+sub out {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $log_fh "$msg\n" if $log_fh;
+}
+
+sub usage {
+    print <<'END';
+Usage: stp_audit.pl -h <host> | -f <file> [options]
+
+  -h, --host     Device IP or hostname
+  -f, --file     File containing one device per line (# = comment)
+  -u, --user     SSH username (default: admin or $NET_USER)
+  -p, --pass     SSH password (or $NET_PASS env var)
+  -e, --enable   Enable secret (default: same as -p or $NET_ENABLE)
+  -l, --log      Append results to log file
+  -t, --timeout  SSH timeout seconds (default: 20)
+  --help         Show this help
+
+Examples:
+  ./stp_audit.pl -h 10.0.0.1 -u admin -p secret
+  ./stp_audit.pl -f core_switches.txt -p secret -l stp_$(date +%Y%m%d).log
+  NET_PASS=secret ./stp_audit.pl -f switches.txt -l /var/log/stp_weekly.log
+END
+    exit 1;
+}
