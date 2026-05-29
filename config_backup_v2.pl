@@ -1,171 +1,147 @@
+```perl
 #!/usr/bin/perl
+#==============================================================================
+# acl_audit.pl - Cisco IOS/IOS-XE Access Control List Security Auditor
 #
-# config_compliance.pl - Network Device Configuration Compliance Auditor
+# PURPOSE:
+#   Audits IP access-lists on Cisco devices via SSH. Reports per-ACL rule
+#   counts, flags ACLs where every rule has zero hits (candidates for removal),
+#   and warns on permit-ip-any-any entries that may represent security gaps.
+#   Designed for quarterly security reviews and firewall cleanup campaigns.
 #
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE devices via SSH and audits the running
-#   configuration against a baseline compliance ruleset. Reports which
-#   required settings are missing and which prohibited settings are present.
-#   Useful for pre-audit checks, change-window gates, and periodic hardening
-#   verification across a fleet.
+# USAGE:
+#   Single device:  ./acl_audit.pl -h 192.168.1.1 -u admin -p secret
+#   Device list:    ./acl_audit.pl -f devices.txt  -u admin -p secret -l audit.log
 #
-# Usage:
-#   Single device:  ./config_compliance.pl -h 192.168.1.1
-#   Device list:    ./config_compliance.pl -f devices.txt
-#   With logging:   ./config_compliance.pl -h 192.168.1.1 -l compliance.log
-#   Custom creds:   ./config_compliance.pl -h 192.168.1.1 -u netops -p secret
+# PREREQUISITES:
+#   perl -MCPAN -e 'install Net::SSH::Expect'
+#   Target devices must permit SSH and 'show ip access-lists' at exec level
 #
-# Prerequisites:
-#   cpan install Net::SSH::Expect Getopt::Long
-#   SSH access to target devices (key-based preferred)
-#   Set NET_USER / NET_PASS env vars or use -u / -p flags
-#
-# Exit codes: 0 = all devices compliant, 1 = one or more failures
-#
+# OUTPUT FLAGS:
+#   [UNUSED?] = every rule in the ACL has zero hit count (review for removal)
+#   [RISKY]   = ACL contains one or more 'permit ip any any' entries
+#==============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
+use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host_arg, $file_arg, $log_file, $username, $password, $enable_pass);
-$username    = $ENV{NET_USER}   // 'admin';
-$password    = $ENV{NET_PASS}   // '';
-$enable_pass = $ENV{NET_ENABLE} // $password;
-
+my ($host, $file, $user, $pass, $logfile);
 GetOptions(
-    'h|host=s'   => \$host_arg,
-    'f|file=s'   => \$file_arg,
-    'l|log=s'    => \$log_file,
-    'u|user=s'   => \$username,
-    'p|pass=s'   => \$password,
-    'e|enable=s' => \$enable_pass,
-) or die "Usage: $0 -h <host>|-f <file> [-l logfile] [-u user] [-p pass] [-e enable]\n";
+    'h|host=s' => \$host,
+    'f|file=s' => \$file,
+    'u|user=s' => \$user,
+    'p|pass=s' => \$pass,
+    'l|log=s'  => \$logfile,
+) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOGFILE]\n";
 
-die "Specify -h <host> or -f <file>\n" unless $host_arg || $file_arg;
+die "Specify -h HOST or -f FILE\n" unless $host || $file;
+die "Specify -u USER\n"            unless $user;
+die "Specify -p PASS\n"            unless $pass;
 
-# Patterns that MUST be present in running-config
-my %REQUIRED = (
-    'aaa_new_model'               => qr/aaa new-model/,
-    'banner_motd'                 => qr/banner (motd|login)/,
-    'exec_timeout_configured'     => qr/exec-timeout [1-9]/,
-    'logging_buffered'            => qr/logging buffered/,
-    'ntp_server_configured'       => qr/ntp server\s+\S/,
-    'service_password_encryption' => qr/service password-encryption/,
-    'ssh_version_2'               => qr/ip ssh version 2/,
-    'vty_transport_ssh_only'      => qr/transport input ssh/,
-);
-
-# Patterns that MUST NOT be present in running-config
-my %PROHIBITED = (
-    'enable_password_cleartext'  => qr/^enable password\s+\S/m,
-    'ip_http_server_enabled'     => qr/^ip http server$/m,
-    'snmp_community_public'      => qr/snmp-server community public\b/i,
-    'snmp_community_private'     => qr/snmp-server community private\b/i,
-    'telnet_transport_on_vty'    => qr/transport input telnet$/m,
-    'no_service_tcp_small_svcs'  => qr/^service tcp-small-servers/m,
-);
-
-my @hosts;
-if ($host_arg) {
-    @hosts = ($host_arg);
+my @devices;
+if ($host) {
+    @devices = ($host);
 } else {
-    open my $fh, '<', $file_arg or die "Cannot open $file_arg: $!\n";
-    @hosts = grep { /\S/ && !/^\s*#/ } <$fh>;
-    chomp @hosts;
+    open my $fh, '<', $file or die "Cannot open device list '$file': $!\n";
+    @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
     close $fh;
 }
+die "No devices to process\n" unless @devices;
 
-my $log_fh;
-if ($log_file) {
-    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
-    $log_fh->autoflush(1);
+my $LOG;
+if ($logfile) {
+    open $LOG, '>>', $logfile or die "Cannot open log '$logfile': $!\n";
+    printf $LOG "# acl_audit.pl started %s\n", strftime('%Y-%m-%d %H:%M:%S', localtime);
 }
 
 sub emit {
-    my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
+    print @_;
+    print $LOG @_ if $LOG;
 }
 
 sub audit_device {
-    my ($host) = @_;
-    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-    emit("\n[$ts] Auditing: $host\n" . ('=' x 58) . "\n");
+    my ($device) = @_;
+    my $stamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+
+    emit("\n" . "=" x 64 . "\n");
+    emit(sprintf "Device: %-20s  Timestamp: %s\n", $device, $stamp);
+    emit("=" x 64 . "\n");
 
     my $ssh = Net::SSH::Expect->new(
-        host       => $host,
-        user       => $username,
-        password   => $password,
-        raw_pty    => 1,
-        timeout    => 20,
-        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=no',
+        host     => $device,
+        user     => $user,
+        password => $pass,
+        raw_pty  => 1,
+        timeout  => 20,
     );
 
     eval { $ssh->login() };
     if ($@) {
-        emit("  [ERROR] SSH login failed: $@\n");
-        return 1;
+        emit("  ERROR: SSH login failed ($device): $@\n");
+        return;
     }
 
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('[\$#>]', 5);
+    $ssh->send("terminal length 0");
+    $ssh->waitfor('#\s*$', 5);
 
-    # Enter privileged mode if at user exec level
-    $ssh->send("enable\n");
-    my $resp = $ssh->waitfor('(?:assword|#)', 8);
-    if (defined $resp && $resp =~ /assword/) {
-        $ssh->send("$enable_pass\n");
-        $ssh->waitfor('#', 8);
-    }
+    $ssh->send("show ip access-lists");
+    my $output = $ssh->waitfor('#\s*$', 30);
 
-    my $config = $ssh->exec("show running-config");
-    $ssh->send("exit\n");
+    $ssh->send("exit");
     $ssh->close();
 
-    unless ($config && length($config) > 100) {
-        emit("  [ERROR] Failed to retrieve running-config (got " . length($config // '') . " bytes)\n");
-        return 1;
+    unless ($output && $output =~ /access\s+list/i) {
+        emit("  No IP access-lists found on this device.\n");
+        return;
     }
 
-    my ($pass, $fail) = (0, 0);
-
-    emit("\n  REQUIRED SETTINGS:\n");
-    for my $rule (sort keys %REQUIRED) {
-        if ($config =~ $REQUIRED{$rule}) {
-            emit(sprintf("    [PASS] %s\n", $rule));
-            $pass++;
-        } else {
-            emit(sprintf("    [FAIL] %s  <-- MISSING\n", $rule));
-            $fail++;
+    my (%acls, $current);
+    for my $line (split /\n/, $output) {
+        if ($line =~ /^(?:Standard|Extended)\s+IP\s+access\s+list\s+(\S+)/i) {
+            $current = $1;
+            $acls{$current} = { total => 0, zerohit => 0, permit_any => 0 };
+        } elsif ($current && $line =~ /^\s+\d+\s+/) {
+            $acls{$current}{total}++;
+            my $hits = ($line =~ /\((\d+)\s+match/) ? $1 : 0;
+            $acls{$current}{zerohit}++    if $hits == 0;
+            $acls{$current}{permit_any}++ if $line =~ /permit\s+ip\s+any\s+any/i;
         }
     }
 
-    emit("\n  PROHIBITED SETTINGS:\n");
-    for my $rule (sort keys %PROHIBITED) {
-        if ($config =~ $PROHIBITED{$rule}) {
-            emit(sprintf("    [FAIL] %s  <-- FOUND\n", $rule));
-            $fail++;
-        } else {
-            emit(sprintf("    [PASS] %s\n", $rule));
-            $pass++;
-        }
+    if (!%acls) {
+        emit("  Unable to parse access-list output.\n");
+        return;
     }
 
-    my $total  = $pass + $fail;
-    my $score  = $total ? int($pass / $total * 100) : 0;
-    my $status = $fail == 0 ? 'COMPLIANT' : "NON-COMPLIANT ($fail issue(s))";
-    emit(sprintf("\n  Result: %d/%d passed (%d%%)  --  %s\n", $pass, $total, $score, $status));
-    return $fail > 0 ? 1 : 0;
+    emit(sprintf "  %-34s %6s %9s %11s  Flags\n", "ACL Name", "Rules", "ZeroHit", "PermitAny");
+    emit("  " . "-" x 64 . "\n");
+
+    my ($unused_count, $risky_count) = (0, 0);
+    for my $name (sort keys %acls) {
+        my $a = $acls{$name};
+        my @flags;
+        if ($a->{total} > 0 && $a->{zerohit} == $a->{total}) {
+            push @flags, '[UNUSED?]';
+            $unused_count++;
+        }
+        if ($a->{permit_any} > 0) {
+            push @flags, '[RISKY]';
+            $risky_count++;
+        }
+        emit(sprintf "  %-34s %6d %9d %11d  %s\n",
+            $name, $a->{total}, $a->{zerohit}, $a->{permit_any}, join(' ', @flags));
+    }
+
+    emit(sprintf "\n  SUMMARY: %d ACL(s) | %d possibly unused | %d with permit-any\n",
+        scalar keys %acls, $unused_count, $risky_count);
 }
 
-my $overall = 0;
-for my $host (@hosts) {
-    $overall |= audit_device($host);
-}
+audit_device($_) for @devices;
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-emit("\n[$ts] Audit complete. Overall status: " . ($overall ? "FAILURES DETECTED" : "ALL COMPLIANT") . "\n");
-close $log_fh if $log_fh;
-exit $overall;
+my $done = strftime('%Y-%m-%d %H:%M:%S', localtime);
+emit("\n# Audit complete $done\n");
+close $LOG if $LOG;
+```
