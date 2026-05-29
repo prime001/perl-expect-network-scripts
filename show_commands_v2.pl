@@ -1,143 +1,145 @@
-```perl
 #!/usr/bin/perl
-# =============================================================================
-# cpu_mem_check.pl - Network Device CPU & Memory Health Monitor
-# =============================================================================
-# Purpose:
-#   Connects to one or more Cisco IOS/IOS-XE devices via SSH and retrieves
-#   CPU utilization and memory usage. Useful for capacity planning, on-call
-#   triage, and scheduled health checks. Flags readings that exceed thresholds.
-#
-# Usage:
-#   Single device:  perl cpu_mem_check.pl -h 192.168.1.1 -u admin -p pass
-#   Device file:    perl cpu_mem_check.pl -f devices.txt -u admin -p pass
-#   With log:       perl cpu_mem_check.pl -h 192.168.1.1 -u admin -p pass -l report.log
-#   Thresholds:     perl cpu_mem_check.pl -h 192.168.1.1 -u admin -p pass -c 70 -m 80
-#
-# Prerequisites:
-#   cpan install Net::SSH::Expect
-#   SSH access enabled on target devices
-#   Devices file: one IP/hostname per line; blank lines and # comments ignored
-#
-# Options:
-#   -h <host>    Target device IP or hostname
-#   -f <file>    File containing list of device IPs/hostnames
-#   -u <user>    SSH username
-#   -p <pass>    SSH password
-#   -e <pass>    Enable password (optional)
-#   -l <file>    Log file path (optional, appended)
-#   -c <pct>     CPU alert threshold % (default: 80)
-#   -m <pct>     Memory alert threshold % (default: 85)
-#   -t <sec>     SSH timeout seconds (default: 30)
-# =============================================================================
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Std;
-use POSIX qw(strftime);
+use Getopt::Long;
+use Time::HiRes qw(usleep);
 
-our %opts;
-getopts('h:f:u:p:e:l:c:m:t:', \%opts);
+=head1 NAME
+route_validator.pl - Validate BGP/static routes on network devices
 
-my $user       = $opts{u} or die "Usage: $0 -h <host>|-f <file> -u <user> -p <pass> [options]\n";
-my $pass       = $opts{p} or die "SSH password required (-p)\n";
-my $enable     = $opts{e} // '';
-my $logfile    = $opts{l} // '';
-my $cpu_thresh = $opts{c} // 80;
-my $mem_thresh = $opts{m} // 85;
-my $timeout    = $opts{t} // 30;
+=head1 SYNOPSIS
+route_validator.pl --host <device> --user <username> --pass <password> [--routes <file>] [--log <logfile>]
 
-my @devices;
-if ($opts{h}) {
-    push @devices, $opts{h};
-} elsif ($opts{f}) {
-    open(my $fh, '<', $opts{f}) or die "Cannot open device file '$opts{f}': $!\n";
-    while (<$fh>) { chomp; next if /^\s*$/ || /^\s*#/; push @devices, $_; }
+=head1 DESCRIPTION
+Connects to network devices via SSH and validates that expected routes exist
+in the routing table. Useful for BGP convergence verification, failover testing,
+and route propagation audits. Reads expected routes from file or uses defaults.
+Handles connection failures, timeouts, and authentication errors gracefully.
+
+Prerequisites: Net::SSH::Expect module installed, SSH access to devices
+
+=head1 OPTIONS
+--host       Target device IP or hostname (required)
+--user       SSH username (required)
+--pass       SSH password (required)
+--routes     File containing routes to validate (one per line), optional
+--log        Optional log file for appending results
+
+=head1 EXAMPLES
+./route_validator.pl --host 10.0.1.1 --user admin --pass secret --routes routes.txt
+./route_validator.pl --host router.example.com --user netadmin --pass pass123 --log audit.log
+
+=cut
+
+my ($host, $user, $pass, $routes_file, $log_file, $help);
+
+GetOptions(
+    'host=s'   => \$host,
+    'user=s'   => \$user,
+    'pass=s'   => \$pass,
+    'routes=s' => \$routes_file,
+    'log=s'    => \$log_file,
+    'help'     => \$help,
+) or die "Error in command line arguments\n";
+
+if ($help || !$host || !$user || !$pass) {
+    print "Usage: $0 --host <device> --user <username> --pass <password> ";
+    print "[--routes <file>] [--log <logfile>]\n";
+    exit 1;
+}
+
+my @routes_to_check = ('0.0.0.0/0');
+
+if ($routes_file && -f $routes_file) {
+    @routes_to_check = ();
+    open my $fh, '<', $routes_file or die "Cannot open $routes_file: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^#/ || /^\s*$/;
+        push @routes_to_check, $_;
+    }
     close $fh;
-} else {
-    die "Specify a target host (-h) or device file (-f)\n";
 }
 
-my $log_fh;
-if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log '$logfile': $!\n";
+my $log_handle;
+if ($log_file) {
+    open $log_handle, '>>', $log_file or die "Cannot open log file: $!\n";
 }
 
-sub emit {
+sub log_msg {
     my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
+    my $timestamp = scalar localtime;
+    my $output = "[$timestamp] $msg";
+    print "$output\n";
+    print $log_handle "$output\n" if $log_handle;
 }
 
-my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-emit("=" x 62 . "\n");
-emit("CPU & Memory Health Check  |  $ts\n");
-emit("Thresholds: CPU>=${cpu_thresh}%  Memory>=${mem_thresh}%\n");
-emit("=" x 62 . "\n\n");
+log_msg("Starting route validation on $host");
 
-for my $host (@devices) {
-    emit("[$host]\n");
-
-    my $ssh = Net::SSH::Expect->new(
-        host     => $host,
-        user     => $user,
+my $ssh;
+eval {
+    $ssh = Net::SSH::Expect->new(
+        host    => $host,
+        user    => $user,
         password => $pass,
-        raw_pty  => 1,
-        timeout  => $timeout,
+        timeout => 10,
+        raw_pty => 1,
     );
+};
 
-    my $connected;
-    eval { $connected = $ssh->login() };
-    if ($@ || !defined $connected || $connected =~ /[Pp]assword/) {
-        emit("  ERROR: Cannot connect or authenticate - $@\n\n");
-        next;
-    }
-
-    if ($enable) {
-        $ssh->send("enable");
-        if ($ssh->waitfor('Password:', $timeout)) {
-            $ssh->send($enable);
-            $ssh->waitfor('[#>]', $timeout);
-        }
-    }
-
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('[#>]', $timeout);
-
-    $ssh->send("show processes cpu | include CPU utilization");
-    my $cpu_out = $ssh->waitfor('[#>]', $timeout) // '';
-
-    my ($cpu_5s, $cpu_1m, $cpu_5m) = ('?', '?', '?');
-    if ($cpu_out =~ /CPU utilization[^:]*:\s*(\d+)%\/(\d+)%;\s*one minute:\s*(\d+)%;\s*five minutes:\s*(\d+)%/) {
-        ($cpu_5s, $cpu_1m, $cpu_5m) = ($1, $3, $4);
-    } elsif ($cpu_out =~ /(\d+)%.*?(\d+)%.*?(\d+)%/) {
-        ($cpu_5s, $cpu_1m, $cpu_5m) = ($1, $2, $3);
-    }
-
-    $ssh->send("show processes memory | include Processor");
-    my $mem_out = $ssh->waitfor('[#>]', $timeout) // '';
-
-    my ($mem_used, $mem_free, $mem_pct) = ('?', '?', '?');
-    if ($mem_out =~ /Processor\s+(\d+)\s+(\d+)\s+(\d+)/i) {
-        my ($total, $used, $free) = ($1, $2, $3);
-        $mem_used = $used;
-        $mem_free = $free;
-        $mem_pct  = int(($used / $total) * 100) if $total > 0;
-    }
-
-    $ssh->send("exit");
-    eval { $ssh->close() };
-
-    my $cpu_tag = ($cpu_1m ne '?' && $cpu_1m >= $cpu_thresh) ? " *** ALERT ***" : "";
-    my $mem_tag = ($mem_pct ne '?' && $mem_pct >= $mem_thresh) ? " *** ALERT ***" : "";
-
-    emit(sprintf("  CPU  5s=%-3s%% 1m=%-3s%% 5m=%-3s%%%s\n", $cpu_5s, $cpu_1m, $cpu_5m, $cpu_tag));
-    emit(sprintf("  Mem  used=%-10s free=%-10s util=%s%%%s\n", $mem_used, $mem_free, $mem_pct, $mem_tag));
-    emit("\n");
+if ($@) {
+    log_msg("ERROR: Failed to create SSH connection: $@");
+    exit 1;
 }
 
-emit("Done. " . scalar(@devices) . " device(s) checked.\n");
-emit("Log: $logfile\n") if $logfile;
-close $log_fh if $log_fh;
-```
+eval {
+    $ssh->login();
+};
+
+if ($@) {
+    log_msg("ERROR: SSH login failed: $@");
+    exit 1;
+}
+
+log_msg("Successfully connected to $host");
+
+my $output = '';
+eval {
+    $ssh->send('terminal length 0');
+    $ssh->waitfor('>', 3) or die "Timeout waiting for prompt\n";
+    usleep(100000);
+    
+    $ssh->send('show ip route');
+    $output = $ssh->waitfor('>', 5) or die "Timeout waiting for route output\n";
+};
+
+if ($@) {
+    log_msg("ERROR: Failed to retrieve routes: $@");
+    $ssh->close();
+    exit 1;
+}
+
+$ssh->close();
+
+my %route_status = ();
+foreach my $route (@routes_to_check) {
+    if ($output =~ /\Q$route\E/) {
+        $route_status{$route} = 'FOUND';
+        log_msg("Route found: $route");
+    } else {
+        $route_status{$route} = 'MISSING';
+        log_msg("Route missing: $route");
+    }
+}
+
+my $missing_count = grep { $_ eq 'MISSING' } values %route_status;
+if ($missing_count > 0) {
+    log_msg("WARNING: $missing_count route(s) missing from $host");
+} else {
+    log_msg("SUCCESS: All routes validated on $host");
+}
+
+close $log_handle if $log_handle;
+
+exit ($missing_count > 0 ? 1 : 0);
