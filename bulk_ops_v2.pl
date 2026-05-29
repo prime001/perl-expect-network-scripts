@@ -1,28 +1,30 @@
-Writing a Perl STP audit script — spanning tree root bridge and port state analysis isn't covered by any existing scripts in the repo.
+The write was blocked by permissions. Here is the complete script content — you can save it as `cdp_lldp_topology.pl`:
 
 ```perl
 #!/usr/bin/perl
 #
-# stp_audit.pl - Spanning Tree Protocol Root Bridge and Port State Auditor
+# cdp_lldp_topology.pl - CDP/LLDP Neighbor Topology Mapper
 #
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE devices via SSH, collects spanning tree
-#   status per VLAN, identifies root bridges, flags non-forwarding ports
-#   (BLK/LIS/LRN), and reports cumulative topology change counts.
-#   High topology change counts indicate L2 instability worth investigating.
+# PURPOSE:
+#   Connects to one or more Cisco (or compatible) network devices via SSH and
+#   collects CDP or LLDP neighbor adjacency data to produce a structured
+#   topology map. Useful for network documentation, change verification after
+#   a cutover, and detecting unexpected or rogue adjacencies.
 #
-# Usage:
-#   Single device:  ./stp_audit.pl -h 192.168.1.1 [-u admin] [-p secret]
-#   Device file:    ./stp_audit.pl -f devices.txt [-u admin] [-p secret]
-#   With logging:   ./stp_audit.pl -f devices.txt -l /var/log/stp_audit.log
+# USAGE:
+#   Single device:  perl cdp_lldp_topology.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:    perl cdp_lldp_topology.pl -f devices.txt -u admin -p secret
+#   LLDP mode:      perl cdp_lldp_topology.pl -f devices.txt -u admin -p secret --lldp
+#   With log:       perl cdp_lldp_topology.pl -f devices.txt -u admin -p secret -l topo.log
 #
-# Prerequisites:
-#   cpan install Net::SSH::Expect
-#   SSH must be enabled on target devices (Cisco IOS-style CLI assumed)
+# PREREQUISITES:
+#   cpanm Net::SSH::Expect Getopt::Long
+#   CDP or LLDP must be enabled on target devices.
+#   SSH access with credentials that have at least read-only privilege.
 #
-# devices.txt format: one IP or hostname per line; lines starting with # skipped
+# DEVICE FILE FORMAT:
+#   One IP or hostname per line; lines beginning with # are ignored.
 #
-# Environment variables: NET_USER, NET_PASS (override defaults; avoid -p on CLI)
 
 use strict;
 use warnings;
@@ -30,163 +32,131 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $file, $user, $pass, $logfile, $help);
-my $timeout = 15;
-my $tc_warn_threshold = 100;
+my ($host, $device_file, $username, $password, $log_file, $use_lldp);
+my $timeout = 30;
 
 GetOptions(
-    'h|host=s'   => \$host,
-    'f|file=s'   => \$file,
-    'u|user=s'   => \$user,
-    'p|pass=s'   => \$pass,
-    'l|log=s'    => \$logfile,
-    'timeout=i'  => \$timeout,
-    'help'       => \$help,
-) or usage();
+    'h|host=s'    => \$host,
+    'f|file=s'    => \$device_file,
+    'u|user=s'    => \$username,
+    'p|pass=s'    => \$password,
+    'l|log=s'     => \$log_file,
+    't|timeout=i' => \$timeout,
+    'lldp'        => \$use_lldp,
+) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOG] [--lldp]\n";
 
-usage() if $help || (!$host && !$file);
-
-$user //= $ENV{NET_USER} // 'admin';
-$pass //= $ENV{NET_PASS} // do {
-    local $| = 1;
-    print 'Password: ';
-    my $p = <STDIN>;
-    chomp $p;
-    $p;
-};
+die "Provide -h HOST or -f FILE\n"    unless $host || $device_file;
+die "Username required: -u USER\n"   unless $username;
+die "Password required: -p PASS\n"   unless $password;
 
 my @devices;
 if ($host) {
     push @devices, $host;
 } else {
-    open my $fh, '<', $file or die "Cannot open device file '$file': $!\n";
-    while (<$fh>) {
-        chomp;
-        next if /^\s*[#;]/ || /^\s*$/;
-        push @devices, $_;
-    }
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_ }
     close $fh;
 }
 
 my $log_fh;
-if ($logfile) {
-    open $log_fh, '>>', $logfile or die "Cannot open log '$logfile': $!\n";
-}
-
-out("=== STP Audit: " . strftime('%Y-%m-%d %H:%M:%S', localtime) . " ===\n");
-out(sprintf("Devices: %d  |  Threshold for TC warning: %d changes\n\n",
-    scalar @devices, $tc_warn_threshold));
-
-my ($ok, $fail) = (0, 0);
-for my $dev (@devices) {
-    out("--- $dev ---\n");
-    if (audit_stp($dev)) { $ok++ } else { $fail++ }
-    out("\n");
-}
-
-out("=== Done: " . strftime('%Y-%m-%d %H:%M:%S', localtime)
-    . "  OK=$ok  FAIL=$fail ===\n");
-close $log_fh if $log_fh;
-exit($fail ? 1 : 0);
-
-sub audit_stp {
-    my ($dev) = @_;
-
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host     => $dev,
-            user     => $user,
-            password => $pass,
-            raw_pty  => 1,
-            timeout  => $timeout,
-        );
-    };
-    if ($@) {
-        out("  ERROR: object init failed: $@\n");
-        return 0;
-    }
-
-    my $login_out = eval { $ssh->login() };
-    if ($@ || !defined $login_out || $login_out =~ /incorrect|denied|failed/i) {
-        out("  ERROR: login failed" . ($@ ? ": $@" : '') . "\n");
-        return 0;
-    }
-
-    $ssh->send('terminal length 0');
-    $ssh->waitfor('[$#>]', $timeout);
-
-    # Per-VLAN root bridge table
-    $ssh->send('show spanning-tree root');
-    my $root_out = $ssh->waitfor('[$#>]', $timeout) // '';
-
-    my %vlan_root;
-    for my $line (split /\n/, $root_out) {
-        # VLAN0001   32769  aabb.cc00.0100   20  15  15  Gi0/1
-        if ($line =~ /^(VLAN\d+)\s+\d+\s+(\S+:\S+|\S{4}\.\S{4}\.\S{4})\s+\d+\s+\d+\s+\d+\s+(\S+)/) {
-            $vlan_root{$1} = { bridge => $2, root_port => $3 };
-        }
-    }
-
-    if (%vlan_root) {
-        out("  Root bridges:\n");
-        for my $vlan (sort keys %vlan_root) {
-            out(sprintf("    %-12s  bridge=%-20s  root_port=%s\n",
-                $vlan, $vlan_root{$vlan}{bridge}, $vlan_root{$vlan}{root_port}));
-        }
-    } else {
-        out("  Root bridges: no data (STP may be disabled or parse failed)\n");
-    }
-
-    # Non-forwarding ports
-    $ssh->send('show spanning-tree | include BLK|LIS|LRN');
-    my $nonfwd = $ssh->waitfor('[$#>]', $timeout) // '';
-
-    my @blocked = grep { /\b(?:BLK|LIS|LRN)\b/ }
-                  map  { s/^\s+|\s+$//gr }
-                  split(/\n/, $nonfwd);
-
-    if (@blocked) {
-        out("  Non-forwarding ports (" . scalar(@blocked) . "):\n");
-        out("    $_\n") for @blocked;
-    } else {
-        out("  Non-forwarding ports: none\n");
-    }
-
-    # Topology change count from summary
-    $ssh->send('show spanning-tree summary totals');
-    my $summary = $ssh->waitfor('[$#>]', $timeout) // '';
-
-    my $tc_total = 0;
-    $tc_total += $1 while $summary =~ /(\d+)\s+topology\s+change/gi;
-
-    out("  Topology changes (cumulative): $tc_total\n");
-    out("  WARNING: high topology change count - investigate L2 instability\n")
-        if $tc_total > $tc_warn_threshold;
-
-    $ssh->close();
-    return 1;
+if ($log_file) {
+    open $log_fh, '>', $log_file or die "Cannot open log $log_file: $!\n";
 }
 
 sub out {
     my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
+    print "$msg\n";
+    print $log_fh "$msg\n" if $log_fh;
 }
 
-sub usage {
-    print <<'END';
-Usage: stp_audit.pl -h <host> | -f <file> [options]
+sub query_device {
+    my ($device) = @_;
+    out("\n--- $device ---");
 
-  -h, --host     Single device IP or hostname
-  -f, --file     File listing devices, one per line (# = comment)
-  -u, --user     SSH username (default: admin or \$NET_USER)
-  -p, --pass     SSH password (default: \$NET_PASS or interactive prompt)
-  -l, --log      Append output to log file
-      --timeout  SSH timeout in seconds (default: 15)
-      --help     Show this help
+    my $ssh = eval {
+        my $s = Net::SSH::Expect->new(
+            host     => $device,
+            user     => $username,
+            password => $password,
+            raw_pty  => 1,
+            timeout  => $timeout,
+        );
+        $s->run_ssh() or die "SSH handshake failed\n";
+        $s->read_all(2);
+        $s;
+    };
+    if ($@) {
+        out("  ERROR: $@");
+        return;
+    }
 
-Exits 0 if all devices succeeded, 1 if any failed.
-END
-    exit 1;
+    $ssh->send("terminal length 0\n"); $ssh->read_all(2);
+
+    my $cmd = $use_lldp ? 'show lldp neighbors detail' : 'show cdp neighbors detail';
+    $ssh->send("$cmd\n");
+    my $raw = $ssh->read_all(4);
+
+    $ssh->send("exit\n");
+    eval { $ssh->close() };
+
+    parse_neighbors($device, $raw);
 }
+
+sub parse_neighbors {
+    my ($device, $raw) = @_;
+    my @neighbors;
+
+    if (!$use_lldp) {
+        for my $block (split /(?=Device ID:)/, $raw) {
+            my %n;
+            ($n{id})      = $block =~ /Device ID:\s*(\S+)/;
+            ($n{ip})      = $block =~ /IP(?:v4)? address:\s*(\d[\d.]+)/i;
+            ($n{platform})= $block =~ /Platform:\s*([^,\n]+)/;
+            ($n{local})   = $block =~ /Interface:\s*(\S+)/;
+            ($n{remote})  = $block =~ /Port ID[^:]*:\s*(\S+)/;
+            push @neighbors, \%n if $n{id};
+        }
+    } else {
+        for my $block (split /(?=Local Intf:)/, $raw) {
+            my %n;
+            ($n{id})      = $block =~ /System Name:\s*(\S+)/;
+            ($n{ip})      = $block =~ /(?:Management Addresses?|IP(?:v4)?)[^\d]*(\d[\d.]+)/i;
+            ($n{platform})= $block =~ /System Description:\s*([^\n]+)/;
+            ($n{local})   = $block =~ /Local Intf:\s*(\S+)/;
+            ($n{remote})  = $block =~ /Port id:\s*(\S+)/i;
+            push @neighbors, \%n if $n{id};
+        }
+    }
+
+    unless (@neighbors) {
+        out("  No " . ($use_lldp ? "LLDP" : "CDP") . " neighbors found");
+        return;
+    }
+
+    out(sprintf("  %-24s %-16s %-22s %-22s", "Neighbor", "IP", "Local Intf", "Remote Intf"));
+    out("  " . "-" x 84);
+    for my $n (@neighbors) {
+        out(sprintf("  %-24s %-16s %-22s %-22s",
+            substr($n{id}     // '?',   0, 24),
+            substr($n{ip}     // 'N/A', 0, 16),
+            substr($n{local}  // '?',   0, 22),
+            substr($n{remote} // '?',   0, 22),
+        ));
+    }
+    out("  Neighbors: " . scalar(@neighbors));
+}
+
+my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+out("CDP/LLDP Topology Map  [" . ($use_lldp ? "LLDP" : "CDP") . "]  $ts");
+out("=" x 60);
+
+query_device($_) for @devices;
+
+out("\n" . "=" x 60);
+out("Done. Devices queried: " . scalar(@devices));
+out("Log: $log_file") if $log_file;
+
+close $log_fh if $log_fh;
 ```
+
+**What it does:** SSHes to each device, disables paging, runs `show cdp neighbors detail` (or `show lldp neighbors detail` with `--lldp`), parses neighbor blocks using targeted regexes, and prints a columnar table — Neighbor / IP / Local Intf / Remote Intf — per device. Error handling covers connection failures, SSH handshake errors, and unreachable hosts without killing the entire run. Output goes to STDOUT and optionally a timestamped log file.
