@@ -1,147 +1,129 @@
+```perl
 #!/usr/bin/perl
-#
-# acl_audit.pl - Cisco IOS Access Control List Auditor
-#
-# Purpose:
-#   Connects to one or more Cisco IOS devices via SSH and audits IP ACL
-#   configuration. Reports all named/numbered ACLs with entry counts and
-#   hit counts, shows which direction each is applied, and flags orphaned
-#   ACLs (defined but not applied to any interface) and phantom references
-#   (referenced on an interface but missing from the running config).
-#
-# Usage:
-#   Single device:  ./acl_audit.pl -h 192.168.1.1 -u admin [-p pass] [-l audit.log]
-#   Device list:    ./acl_audit.pl -f devices.txt  -u admin [-p pass] [-l audit.log]
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect Getopt::Long
-#   SSH enabled on target devices; account needs at minimum 'show' privilege.
-#
-# Tested on: Cisco IOS 12.4, 15.x, IOS-XE 16.x, IOS-XR 6.x (read-only show cmds)
+=head1 NAME
+device_reachability_test.pl - Test SSH connectivity to network devices
+
+=head1 DESCRIPTION
+Performs SSH connectivity testing against a list of network devices. Verifies
+device availability and SSH responsiveness before running automation tasks.
+Reports connection status, response time, and authentication results.
+
+=head1 USAGE
+  ./device_reachability_test.pl -d 192.168.1.1 -u admin -p password
+  ./device_reachability_test.pl -f hosts.txt -u admin -p password -l results.log
+
+=head1 OPTIONS
+  -d, --device       Single device IP or hostname
+  -f, --file         File with device list (one per line)
+  -u, --username     SSH username
+  -p, --password     SSH password
+  -l, --logfile      Optional log file path
+  -t, --timeout      SSH timeout in seconds (default: 5)
+  --help             Show this message
+
+=head1 PREREQUISITES
+  - Net::SSH::Expect Perl module
+  - Network connectivity to target devices
+  - Valid SSH credentials
+
+=cut
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use POSIX qw(strftime);
+use Time::Piece;
+use Time::HiRes qw(time);
 
-my ($host, $file, $user, $pass, $logfile);
-my $timeout = 30;
+my ($device, $file, $user, $pass, $logfile, $timeout, $help);
 
 GetOptions(
-    'h|host=s'    => \$host,
-    'f|file=s'    => \$file,
-    'u|user=s'    => \$user,
-    'p|pass=s'    => \$pass,
-    'l|log=s'     => \$logfile,
-    't|timeout=i' => \$timeout,
-) or die "Usage: $0 -h <host> | -f <file> -u <user> [-p <pass>] [-l <logfile>]\n";
+    'd|device=s'    => \$device,
+    'f|file=s'      => \$file,
+    'u|username=s'  => \$user,
+    'p|password=s'  => \$pass,
+    'l|logfile=s'   => \$logfile,
+    't|timeout=i'   => \$timeout,
+    'help'          => \$help,
+) or die "Error in command line arguments\n";
 
-die "Specify -h <host> or -f <file>\n" unless $host || $file;
-die "Username required (-u)\n"         unless $user;
+if ($help || (!$device && !$file) || !$user || !$pass) {
+    system("perldoc $0");
+    exit 0;
+}
 
-my @devices;
-if ($host) {
-    @devices = ($host);
-} else {
-    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
-    @devices = map { chomp; $_ } grep { /\S/ && !/^\s*#/ } <$fh>;
+$timeout ||= 5;
+
+my @devices = $device ? ($device) : do {
+    open my $fh, '<', $file or die "Cannot open $file: $!\n";
+    my @list;
+    while (<$fh>) {
+        chomp;
+        next if /^#/ || /^\s*$/;
+        push @list, $_;
+    }
     close $fh;
+    @list;
+};
+
+open my $LOG, '>>', $logfile if $logfile;
+
+sub output {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $LOG "$msg\n" if $logfile;
 }
 
-my $log_fh;
-if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log '$logfile': $!\n";
-}
+my $timestamp = localtime->strftime('%Y-%m-%d %H:%M:%S');
+output("[$timestamp] Connectivity audit started - " . scalar(@devices) . " device(s)");
+output("-" x 70);
 
-sub out {
-    my $msg = shift;
-    print $msg;
-    print {$log_fh} $msg if $log_fh;
-}
+my ($success, $failure) = (0, 0);
 
-sub audit_device {
-    my $device = shift;
-    out("\n" . "=" x 64 . "\n");
-    out(sprintf "Device: %-30s  %s\n", $device, strftime("%Y-%m-%d %H:%M:%S", localtime));
-    out("=" x 64 . "\n");
-
+foreach my $host (@devices) {
+    my $start_time = time();
     my $ssh;
+    my $result = "UNREACHABLE";
+    my $detail = "";
+    
     eval {
         $ssh = Net::SSH::Expect->new(
-            host     => $device,
+            host     => $host,
             user     => $user,
             password => $pass,
-            raw_pty  => 1,
             timeout  => $timeout,
+            raw_pty  => 1,
         );
-        $ssh->login();
+        
+        $ssh->login() or die "SSH login failed";
+        $result = "SUCCESS";
+        $ssh->close();
     };
+    
     if ($@) {
-        out("  ERROR: Connection failed - $@\n");
-        return;
+        my $error = $@;
+        $error =~ s/\n/ /g;
+        $error =~ s/\s+/ /g;
+        $detail = $error;
     }
-
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('>#?\s*$', $timeout);
-
-    $ssh->send("show ip access-lists");
-    my $acl_raw = $ssh->waitfor('>#?\s*$', $timeout) // '';
-
-    $ssh->send("show running-config | include ip access-group");
-    my $apply_raw = $ssh->waitfor('>#?\s*$', $timeout) // '';
-
-    $ssh->close();
-
-    # Parse ACL definitions: name -> { entries, hits }
-    my %defined;
-    my $cur;
-    for my $line (split /\n/, $acl_raw) {
-        if ($line =~ /^(?:Standard|Extended) IP access list (\S+)/) {
-            $cur = $1;
-            $defined{$cur} = { entries => 0, hits => 0 };
-        } elsif ($cur) {
-            $defined{$cur}{entries}++ if $line =~ /^\s+(permit|deny)/i;
-            $defined{$cur}{hits}    += $1 if $line =~ /\((\d+) match(?:es)?\)/;
-        }
-    }
-
-    # Parse interface applications: acl_name -> [directions]
-    my %applied;
-    for my $line (split /\n/, $apply_raw) {
-        if ($line =~ /ip access-group (\S+)\s+(in|out)/i) {
-            push @{$applied{$1}}, $2;
-        }
-    }
-
-    out("\nDefined ACLs:\n");
-    if (%defined) {
-        for my $acl (sort keys %defined) {
-            my $dirs   = exists $applied{$acl} ? join('+', sort @{$applied{$acl}}) : undef;
-            my $status = $dirs ? sprintf("applied %-8s", $dirs) : 'NOT APPLIED   [ORPHAN]';
-            out(sprintf "  %-32s  %3d entries  %8d hits  %s\n",
-                $acl, $defined{$acl}{entries}, $defined{$acl}{hits}, $status);
-        }
+    
+    my $elapsed = sprintf("%.2f", time() - $start_time);
+    
+    if ($result eq "SUCCESS") {
+        output(sprintf("%-35s %-12s %6s", $host, $result, $elapsed . "s"));
+        $success++;
     } else {
-        out("  No IP access lists found\n");
+        output(sprintf("%-35s %-12s %6s  %s", $host, $result, $elapsed . "s", $detail));
+        $failure++;
     }
-
-    out("\nInterface ACL references:\n");
-    my $ref_found = 0;
-    for my $acl (sort keys %applied) {
-        next if exists $defined{$acl};
-        out(sprintf "  [WARNING] ACL '%-28s' applied (%s) but NOT defined in config!\n",
-            $acl, join('+', @{$applied{$acl}}));
-        $ref_found = 1;
-    }
-    out("  All applied ACLs exist in config\n") unless $ref_found;
 }
 
-out("ACL Audit Report\n");
-out("Generated : " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n");
-out("Devices   : " . scalar(@devices) . "\n");
+output("-" x 70);
+output(sprintf("Summary: %d successful, %d failed (%.1f%% availability)",
+    $success, $failure, 
+    $success ? ($success / ($success + $failure) * 100) : 0));
+output("[$timestamp] Audit completed\n");
 
-audit_device($_) for @devices;
-
-out("\nAudit complete.\n");
-close $log_fh if $log_fh;
+close $LOG if $logfile;
+exit $failure ? 1 : 0;
+```
