@@ -1,181 +1,164 @@
-```perl
 #!/usr/bin/perl
-#
-# bgp_prefix_audit.pl - BGP Prefix Limit Compliance Auditor
-#
-# Purpose:
-#   Audits BGP neighbors for prefix count vs configured max-prefix limits.
-#   Flags neighbors approaching or exceeding thresholds. Distinct from
-#   bgp_peers.pl (session state) -- this script focuses on prefix volume
-#   analysis and limit compliance, useful for capacity planning and
-#   preventing unexpected session teardowns.
-#
-# Usage:
-#   ./bgp_prefix_audit.pl <device_ip> [options]
-#   ./bgp_prefix_audit.pl --file devices.txt [options]
-#
-# Options:
-#   --user <username>   SSH username (default: $USER or 'admin')
-#   --pass <password>   SSH password (prompted if omitted)
-#   --warn <pct>        Warn threshold as % of prefix limit (default: 75)
-#   --crit <pct>        Critical threshold as % of prefix limit (default: 90)
-#   --log <file>        Append results to log file
-#   --timeout <sec>     SSH command timeout (default: 30)
-#   --help              Show this help
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#   Device must permit: show bgp summary, show bgp neighbors
-#
-# Tested against: Cisco IOS 15.x, IOS-XE 16.x/17.x
-#
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use Term::ReadKey;
 use POSIX qw(strftime);
 
-my ($help, $device_file, $log_file);
-my $username = $ENV{USER} || 'admin';
-my $password = '';
-my $warn_pct = 75;
-my $crit_pct = 90;
-my $timeout  = 30;
+# =============================================================================
+# bgp_route_audit.pl - BGP Advertised/Received Route Prefix Auditor
+#
+# Purpose:
+#   Connects to a Cisco IOS/IOS-XE router and audits prefix counts for each
+#   BGP neighbor - both advertised-routes and received-routes. Flags peers
+#   with zero advertised prefixes (common misconfiguration / policy issue)
+#   and peers where received count dropped significantly vs a threshold.
+#
+# Usage:
+#   ./bgp_route_audit.pl --host <ip> --user <user> --pass <pass> [options]
+#   ./bgp_route_audit.pl --file devices.txt --user <user> --pass <pass>
+#
+# Options:
+#   --host <ip>         Single device IP or hostname
+#   --file <file>       File with one device IP per line
+#   --user <user>       SSH username (default: admin)
+#   --pass <pass>       SSH password
+#   --enable <pass>     Enable password (if needed)
+#   --min-prefixes <n>  Alert if advertised prefix count below this (default: 1)
+#   --log <file>        Write output to log file in addition to STDOUT
+#   --timeout <sec>     SSH command timeout in seconds (default: 30)
+#
+# Prerequisites:
+#   cpan Net::SSH::Expect
+#   Device must have 'soft-reconfiguration inbound' or 'route-refresh' for
+#   received-routes to be populated.
+#
+# =============================================================================
 
-GetOptions(
-    'help'       => \$help,
-    'file=s'     => \$device_file,
-    'user=s'     => \$username,
-    'pass=s'     => \$password,
-    'warn=i'     => \$warn_pct,
-    'crit=i'     => \$crit_pct,
-    'log=s'      => \$log_file,
-    'timeout=i'  => \$timeout,
-) or die "Invalid options. Use --help.\n";
+my %opt = (
+    user          => 'admin',
+    timeout       => 30,
+    'min-prefixes' => 1,
+);
 
-if ($help) {
-    open(my $fh, '<', $0) or die;
-    while (<$fh>) { last unless /^#/; print substr($_, 2) }
-    close $fh;
-    exit 0;
-}
+GetOptions(\%opt,
+    'host=s', 'file=s', 'user=s', 'pass=s', 'enable=s',
+    'min-prefixes=i', 'log=s', 'timeout=i',
+) or die "Invalid options. Use --help for usage.\n";
+
+die "Provide --host or --file\n" unless $opt{host} || $opt{file};
+die "Provide --pass\n"           unless $opt{pass};
 
 my @devices;
-if ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+if ($opt{host}) {
+    push @devices, $opt{host};
+} else {
+    open my $fh, '<', $opt{file} or die "Cannot open $opt{file}: $!\n";
     @devices = grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
     close $fh;
-} elsif (@ARGV) {
-    @devices = @ARGV;
-} else {
-    die "Usage: $0 <device_ip> [options] or $0 --file devices.txt\n";
-}
-
-unless ($password) {
-    print "SSH password for $username: ";
-    ReadMode('noecho');
-    chomp($password = <STDIN>);
-    ReadMode('restore');
-    print "\n";
 }
 
 my $log_fh;
-if ($log_file) {
-    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
+if ($opt{log}) {
+    open $log_fh, '>>', $opt{log} or die "Cannot open log $opt{log}: $!\n";
 }
 
-sub log_output {
-    my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
+sub emit {
+    print @_;
+    print $log_fh @_ if $log_fh;
 }
 
 sub audit_device {
     my ($host) = @_;
-    my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-
-    log_output("\n=== BGP Prefix Audit: $host @ $timestamp ===\n");
+    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    emit "\n=== $host  [$ts] ===\n";
 
     my $ssh = Net::SSH::Expect->new(
-        host     => $host,
-        user     => $username,
-        password => $password,
-        timeout  => $timeout,
-        raw_pty  => 1,
+        host        => $host,
+        user        => $opt{user},
+        password    => $opt{pass},
+        raw_pty     => 1,
+        timeout     => $opt{timeout},
     );
 
-    eval {
-        $ssh->login();
-        $ssh->exec("terminal length 0");
-
-        my $summary = $ssh->exec("show bgp summary");
-        unless ($summary && $summary =~ /Neighbor\s+V\s+AS/i) {
-            log_output("  [ERROR] BGP not configured or no summary available\n");
-            return;
-        }
-
-        my %neighbors;
-        while ($summary =~ /^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\d+)\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\d+)/mg) {
-            $neighbors{$1} = { asn => $2, prefixes_received => $3, max_prefix => 0 };
-        }
-
-        if (!%neighbors) {
-            log_output("  No active BGP neighbors found\n");
-            return;
-        }
-
-        foreach my $peer (sort keys %neighbors) {
-            my $detail = $ssh->exec("show bgp neighbors $peer");
-
-            if ($detail =~ /Maximum prefix:\s*(\d+)/i) {
-                $neighbors{$peer}{max_prefix} = $1;
-            }
-        }
-
-        my ($ok, $warn, $crit) = (0, 0, 0);
-        log_output(sprintf("  %-18s %-8s %-12s %-12s %-8s %s\n",
-            "Neighbor", "ASN", "Prefixes", "Max-Prefix", "Usage%", "Status"));
-        log_output("  " . "-" x 70 . "\n");
-
-        foreach my $peer (sort keys %neighbors) {
-            my $rcvd = $neighbors{$peer}{prefixes_received};
-            my $max  = $neighbors{$peer}{max_prefix};
-            my $asn  = $neighbors{$peer}{asn};
-            my ($pct_str, $status);
-
-            if ($max > 0) {
-                my $pct = int(($rcvd / $max) * 100);
-                $pct_str = "$pct%";
-                if ($pct >= $crit_pct)       { $status = "CRITICAL"; $crit++ }
-                elsif ($pct >= $warn_pct)    { $status = "WARNING";  $warn++ }
-                else                         { $status = "OK";       $ok++   }
-            } else {
-                $pct_str = "N/A";
-                $status  = "NO-LIMIT";
-                $ok++;
-            }
-
-            log_output(sprintf("  %-18s %-8s %-12s %-12s %-8s %s\n",
-                $peer, $asn, $rcvd, ($max || "none"), $pct_str, $status));
-        }
-
-        log_output("\n  Summary: " . scalar(keys %neighbors) .
-            " neighbors | OK=$ok WARN=$warn CRIT=$crit\n");
-    };
-
+    eval { $ssh->login() };
     if ($@) {
-        my $err = $@;
-        $err =~ s/\n/ /g;
-        log_output("  [ERROR] $host: $err\n");
+        emit "  ERROR: SSH login failed - $@\n";
+        return;
     }
 
-    $ssh->close() if $ssh;
+    $ssh->send('terminal length 0');
+    $ssh->waitfor('>\s*$|\#\s*$', 5);
+
+    if ($opt{enable}) {
+        $ssh->send('enable');
+        $ssh->waitfor('Password:\s*$', 5);
+        $ssh->send($opt{enable});
+        $ssh->waitfor('\#\s*$', 5);
+    }
+
+    # Pull BGP summary to get peer list
+    $ssh->send('show ip bgp summary');
+    my $summary = $ssh->waitfor('\#\s*$', $opt{timeout});
+    unless ($summary) {
+        emit "  ERROR: Timeout waiting for BGP summary\n";
+        $ssh->close();
+        return;
+    }
+
+    # Parse neighbor IPs from BGP summary table (lines starting with an IP)
+    my @peers = ($summary =~ /^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+\d+/mg);
+    if (!@peers) {
+        emit "  No BGP peers found (BGP may not be running)\n";
+        $ssh->close();
+        return;
+    }
+
+    emit "  Found " . scalar(@peers) . " BGP peer(s)\n\n";
+    emit sprintf("  %-18s %12s %12s  %s\n", 'Peer', 'Advertised', 'Received', 'Status');
+    emit "  " . "-"x60 . "\n";
+
+    my @alerts;
+    for my $peer (@peers) {
+        my ($adv_count, $rcv_count) = (0, 0);
+
+        $ssh->send("show ip bgp neighbors $peer advertised-routes");
+        my $adv = $ssh->waitfor('\#\s*$', $opt{timeout}) // '';
+        if ($adv =~ /Total number of prefixes (\d+)/i) {
+            $adv_count = $1;
+        } elsif ($adv =~ /(\d+)\s+network entries/i) {
+            $adv_count = $1;
+        }
+
+        $ssh->send("show ip bgp neighbors $peer received-routes");
+        my $rcv = $ssh->waitfor('\#\s*$', $opt{timeout}) // '';
+        if ($rcv =~ /Total number of prefixes (\d+)/i) {
+            $rcv_count = $1;
+        } elsif ($rcv =~ /(\d+)\s+network entries/i) {
+            $rcv_count = $1;
+        }
+
+        my $status = 'OK';
+        if ($adv_count < $opt{'min-prefixes'}) {
+            $status = "ALERT:adv<$opt{'min-prefixes'}";
+            push @alerts, "$peer advertised only $adv_count prefix(es) (threshold: $opt{'min-prefixes'})";
+        }
+
+        emit sprintf("  %-18s %12d %12d  %s\n", $peer, $adv_count, $rcv_count, $status);
+    }
+
+    if (@alerts) {
+        emit "\n  ALERTS:\n";
+        emit "    - $_\n" for @alerts;
+    }
+
+    $ssh->send('exit');
+    $ssh->close();
 }
 
-audit_device($_) for @devices;
+for my $dev (@devices) {
+    audit_device($dev);
+}
 
-log_output("\nAudit complete.\n");
+emit "\nDone. Audited " . scalar(@devices) . " device(s).\n";
 close $log_fh if $log_fh;
-```
