@@ -1,191 +1,160 @@
 #!/usr/bin/perl
-# =============================================================================
-# stp_audit.pl - Spanning Tree Protocol Topology Auditor
-# =============================================================================
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE switches via SSH and audits the Spanning Tree
-#   Protocol topology. Reports root bridge placement, port roles/states, active
-#   topology changes, and change counters per VLAN. Flags anomalies that
-#   indicate instability or misconfiguration.
-#
-# Usage:
-#   Single device:  ./stp_audit.pl -h 192.168.1.1 [-u admin] [-p password]
-#   Device list:    ./stp_audit.pl -f switches.txt [-u admin] [-p password]
-#   With logging:   ./stp_audit.pl -h 192.168.1.1 -l /var/log/stp_audit.log
-#
-# Prerequisites:
-#   cpanm Net::SSH::Expect Getopt::Long
-#
-# Environment variables (override CLI args):
-#   NET_USER, NET_PASS, NET_ENABLE
-# =============================================================================
-
 use strict;
 use warnings;
-use Net::SSH::Expect;
+use Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $file, $user, $pass, $enable, $logfile, $help);
-my $timeout = 20;
+# =============================================================================
+# vlan_trunk_audit.pl - VLAN Trunk Port Consistency Auditor
+#
+# Purpose:
+#   Audits trunk port VLAN membership on Cisco IOS/IOS-XE switches.
+#   Identifies VLANs that are allowed on trunks but not actively forwarding
+#   (pruned, STP blocking, or missing from VLAN database). Useful for catching
+#   misconfigured trunk pruning lists and orphaned VLANs before they cause
+#   black-hole routing issues.
+#
+# Usage:
+#   ./vlan_trunk_audit.pl -h <host> -u <user> -p <pass> [-e <enable_pass>]
+#                         [-f <device_file>] [-o <logfile>] [-t <timeout>]
+#
+# Prerequisites:
+#   cpan install Expect
+#   SSH must be enabled on target device
+#   User must have privilege level 1+ (enable needed for detailed trunk data)
+#
+# Output:
+#   Per-trunk summary: allowed VLANs, active VLANs, inactive (gap) VLANs
+#   Exit code 0 = clean, 1 = mismatches found, 2 = connection error
+# =============================================================================
+
+my ($host, $username, $password, $enable_pass, $device_file, $logfile);
+my $timeout = 30;
 
 GetOptions(
     'h|host=s'    => \$host,
-    'f|file=s'    => \$file,
-    'u|user=s'    => \$user,
-    'p|pass=s'    => \$pass,
-    'e|enable=s'  => \$enable,
-    'l|log=s'     => \$logfile,
+    'u|user=s'    => \$username,
+    'p|pass=s'    => \$password,
+    'e|enable=s'  => \$enable_pass,
+    'f|file=s'    => \$device_file,
+    'o|output=s'  => \$logfile,
     't|timeout=i' => \$timeout,
-    'help'        => \$help,
-) or usage();
-
-usage() if $help || (!$host && !$file);
-
-$user   ||= $ENV{NET_USER}   || 'admin';
-$pass   ||= $ENV{NET_PASS}   || die "Password required: use -p or set NET_PASS\n";
-$enable ||= $ENV{NET_ENABLE} || $pass;
+) or die "Usage: $0 -h <host> -u <user> -p <pass> [-e <enable>] [-f <file>] [-o <log>]\n";
 
 my @devices;
-if ($file) {
-    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
-    while (<$fh>) { chomp; push @devices, $_ if /\S/ && !/^\s*#/ }
+if ($device_file) {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+    while (<$fh>) { chomp; push @devices, $_ if /\S/ && !/^#/; }
     close $fh;
+} elsif ($host) {
+    push @devices, $host;
 } else {
-    @devices = ($host);
+    die "Specify -h <host> or -f <device_file>\n";
 }
+
+die "Username required (-u)\n" unless $username;
+die "Password required (-p)\n" unless $password;
 
 my $log_fh;
 if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log '$logfile': $!\n";
+    open($log_fh, '>>', $logfile) or warn "Cannot open log $logfile: $!\n";
 }
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-out("=" x 60);
-out("STP Audit Report - $ts");
-out("Devices: " . scalar(@devices));
-out("=" x 60);
+sub log_out {
+    my $msg = shift;
+    print $msg;
+    print $log_fh $msg if $log_fh;
+}
+
+sub expand_vlan_range {
+    my @vlans;
+    for my $token (split /,/, shift) {
+        if ($token =~ /^(\d+)-(\d+)$/) { push @vlans, $1..$2; }
+        elsif ($token =~ /^\d+$/)       { push @vlans, $token; }
+    }
+    return @vlans;
+}
+
+my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+my $exit_code = 0;
 
 for my $device (@devices) {
-    audit_device($device);
+    log_out("\n=== $device  [$timestamp] ===\n");
+
+    my $exp = Expect->new();
+    $exp->raw_pty(1);
+    $exp->log_stdout(0);
+
+    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${username}\@${device}")) {
+        log_out("ERROR: Cannot spawn SSH to $device: $!\n");
+        $exit_code = 2;
+        next;
+    }
+
+    my $logged_in = 0;
+    $exp->expect($timeout,
+        [ qr/[Pp]assword:/,     sub { $exp->send("$password\n"); exp_continue; } ],
+        [ qr/[>#]/,             sub { $logged_in = 1; } ],
+        [ qr/Connection refused|No route|timed out/, sub { log_out("ERROR: Connection failed to $device\n"); } ],
+        [ timeout => sub { log_out("ERROR: Timeout connecting to $device\n"); } ],
+    );
+
+    unless ($logged_in) { $exit_code = 2; next; }
+
+    if ($enable_pass) {
+        $exp->send("enable\n");
+        $exp->expect($timeout, [ qr/[Pp]assword:/, sub { $exp->send("$enable_pass\n"); exp_continue; } ],
+                               [ qr/#/, sub {} ]);
+    }
+
+    $exp->send("terminal length 0\n");
+    $exp->expect($timeout, qr/[>#]/);
+
+    $exp->send("show interfaces trunk\n");
+    my $trunk_output = '';
+    $exp->expect($timeout,
+        [ qr/[>#]/, sub { $trunk_output = $exp->before(); } ],
+        [ timeout => sub { log_out("ERROR: Timeout on show interfaces trunk\n"); } ],
+    );
+
+    $exp->send("exit\n");
+    $exp->soft_close();
+
+    my (%allowed, %active);
+    my $section = '';
+    for my $line (split /\n/, $trunk_output) {
+        $section = 'allowed'  if $line =~ /VLANs allowed on trunk/i;
+        $section = 'active'   if $line =~ /VLANs allowed and active/i;
+        $section = ''         if $line =~ /VLANs in spanning/i;
+
+        next unless $line =~ /^(\S+)\s+([\d,\-]+)\s*$/;
+        my ($intf, $vlan_str) = ($1, $2);
+        if ($section eq 'allowed') { $allowed{$intf} = $vlan_str; }
+        elsif ($section eq 'active') { $active{$intf} = $vlan_str; }
+    }
+
+    if (!%allowed) {
+        log_out("  No trunk ports found (or parse error)\n");
+        next;
+    }
+
+    for my $intf (sort keys %allowed) {
+        my %allowed_set  = map { $_ => 1 } expand_vlan_range($allowed{$intf} // '');
+        my %active_set   = map { $_ => 1 } expand_vlan_range($active{$intf}  // '');
+        my @inactive = sort { $a <=> $b } grep { !$active_set{$_} } keys %allowed_set;
+
+        my $status = @inactive ? 'MISMATCH' : 'OK';
+        $exit_code = 1 if @inactive && $exit_code == 0;
+        log_out(sprintf("  %-20s  allowed=%-4d  active=%-4d  status=%s\n",
+            $intf, scalar keys %allowed_set, scalar keys %active_set, $status));
+        if (@inactive) {
+            my $inactive_str = join(',', @inactive[0..($#inactive > 9 ? 9 : $#inactive)]);
+            $inactive_str .= '...' if @inactive > 10;
+            log_out("    Inactive VLANs: $inactive_str\n");
+        }
+    }
 }
 
 close $log_fh if $log_fh;
-
-sub audit_device {
-    my ($device) = @_;
-    out("\n[Device: $device]");
-
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host     => $device,
-            user     => $user,
-            password => $pass,
-            raw_pty  => 1,
-            timeout  => $timeout,
-        );
-    };
-    if ($@) {
-        out("  ERROR: Cannot create SSH session: $@");
-        return;
-    }
-
-    my $login = eval { $ssh->login() };
-    if ($@ || !defined $login) {
-        out("  ERROR: Authentication failed (check credentials)");
-        return;
-    }
-
-    $ssh->exec("terminal length 0");
-
-    my $priv = $ssh->exec("show privilege") // '';
-    if ($priv =~ /Current privilege level is (\d+)/ && $1 < 15) {
-        $ssh->send("enable");
-        $ssh->waitfor('Password:', 5);
-        $ssh->send($enable);
-        $ssh->waitfor('#', 10) or do {
-            out("  ERROR: Enable mode failed");
-            $ssh->close();
-            return;
-        };
-    }
-
-    parse_stp_summary($ssh->exec("show spanning-tree summary"));
-    parse_stp_detail($ssh->exec("show spanning-tree detail"));
-
-    $ssh->close();
-}
-
-sub parse_stp_summary {
-    my ($raw) = @_;
-    return unless defined $raw;
-
-    for (split /\n/, $raw) {
-        out("  Root bridge for: $1") if /Root bridge for:\s+(.+)/;
-        out("  STP-active VLANs: $1") if /(\d+) vlans? in spanning tree/i;
-        out("  WARN: Active topology change flag set") if /Topology change flag\s+set/i;
-        out("  STP mode: $1") if /^(Rapid PVST|PVST|MST|RSTP)\+?\s+is/i;
-        out("  Portfast BPDU guard: $1") if /Portfast BPDU Guard\s+is\s+(\w+)/i;
-    }
-}
-
-sub parse_stp_detail {
-    my ($raw) = @_;
-    return unless defined $raw;
-
-    my ($current_vlan, @root_vlans, @high_tc_vlans);
-
-    for (split /\n/, $raw) {
-        $current_vlan = $1 if /VLAN(\d+)\s+is (?:executing|in)/i;
-        next unless defined $current_vlan;
-
-        if (/Bridge is the root/i) {
-            push @root_vlans, $current_vlan unless grep { $_ eq $current_vlan } @root_vlans;
-        }
-        if (/Number of topology changes (\d+)/i && $1 > 10) {
-            out("  WARN: VLAN $current_vlan - $1 topology changes (instability risk)");
-        }
-        if (/Last topology change from (\S+)/i) {
-            out("  INFO: VLAN $current_vlan - last TC from $1");
-        }
-        if (/(\S+)\s+of \S+\s+is (?:BLK|blocking)/i) {
-            out("  INFO: VLAN $current_vlan - $1 is blocking");
-        }
-        if (/port is (?:inconsistent|broken|err-disabled)/i) {
-            out("  WARN: VLAN $current_vlan - STP inconsistent/err-disabled port detected");
-        }
-    }
-
-    if (@root_vlans) {
-        out("  Root bridge for VLANs: " . join(', ', sort { $a <=> $b } @root_vlans));
-    } else {
-        out("  INFO: Not root bridge for any VLAN on this device");
-    }
-}
-
-sub out {
-    my ($msg) = @_;
-    print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
-}
-
-sub usage {
-    print <<'END';
-Usage: stp_audit.pl -h <host> | -f <file> [options]
-
-  -h, --host     Device IP or hostname
-  -f, --file     File containing one device per line (# = comment)
-  -u, --user     SSH username (default: admin or $NET_USER)
-  -p, --pass     SSH password (or $NET_PASS env var)
-  -e, --enable   Enable secret (default: same as -p or $NET_ENABLE)
-  -l, --log      Append results to log file
-  -t, --timeout  SSH timeout seconds (default: 20)
-  --help         Show this help
-
-Examples:
-  ./stp_audit.pl -h 10.0.0.1 -u admin -p secret
-  ./stp_audit.pl -f core_switches.txt -p secret -l stp_$(date +%Y%m%d).log
-  NET_PASS=secret ./stp_audit.pl -f switches.txt -l /var/log/stp_weekly.log
-END
-    exit 1;
-}
+exit $exit_code;
