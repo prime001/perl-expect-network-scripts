@@ -1,162 +1,168 @@
-The write was blocked by permissions. Here is the complete script content — you can save it as `cdp_lldp_topology.pl`:
-
-```perl
 #!/usr/bin/perl
+# =============================================================================
+# stp_audit.pl - Spanning Tree Protocol Audit Tool
 #
-# cdp_lldp_topology.pl - CDP/LLDP Neighbor Topology Mapper
+# Purpose:
+#   Connects to Cisco IOS/IOS-XE switches via SSH and audits spanning tree
+#   state: root bridge identity, port roles/states, topology change counters,
+#   and blocked/inconsistent ports. Useful for pre-change topology verification
+#   and troubleshooting STP instability.
 #
-# PURPOSE:
-#   Connects to one or more Cisco (or compatible) network devices via SSH and
-#   collects CDP or LLDP neighbor adjacency data to produce a structured
-#   topology map. Useful for network documentation, change verification after
-#   a cutover, and detecting unexpected or rogue adjacencies.
+# Usage:
+#   ./stp_audit.pl -h <host> [-u <user>] [-p <pass>] [-v <vlan_id>] [-l <log>]
+#   ./stp_audit.pl -f <device_file> [-u <user>] [-p <pass>] [-l <log>]
 #
-# USAGE:
-#   Single device:  perl cdp_lldp_topology.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:    perl cdp_lldp_topology.pl -f devices.txt -u admin -p secret
-#   LLDP mode:      perl cdp_lldp_topology.pl -f devices.txt -u admin -p secret --lldp
-#   With log:       perl cdp_lldp_topology.pl -f devices.txt -u admin -p secret -l topo.log
+# Device file format (one entry per line, # = comment):
+#   192.168.1.1
+#   192.168.1.2  altuser  altpass
 #
-# PREREQUISITES:
-#   cpanm Net::SSH::Expect Getopt::Long
-#   CDP or LLDP must be enabled on target devices.
-#   SSH access with credentials that have at least read-only privilege.
+# Prerequisites:
+#   cpan Net::SSH::Expect Getopt::Long
+#   SSH access with 'show spanning-tree' privilege on target devices
 #
-# DEVICE FILE FORMAT:
-#   One IP or hostname per line; lines beginning with # are ignored.
+# Environment variables (fallback if -u/-p not given):
+#   NET_USER, NET_PASS
 #
+# Examples:
+#   ./stp_audit.pl -h 10.0.0.1 -u admin -p secret
+#   ./stp_audit.pl -h 10.0.0.1 -u admin -p secret -v 100
+#   ./stp_audit.pl -f switches.txt -l /var/log/stp_audit.log
+# =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case);
 use POSIX qw(strftime);
 
-my ($host, $device_file, $username, $password, $log_file, $use_lldp);
-my $timeout = 30;
+my ($host, $user, $pass, $vlan, $logfile, $device_file, $timeout);
+$timeout = 30;
 
 GetOptions(
     'h|host=s'    => \$host,
+    'u|user=s'    => \$user,
+    'p|pass=s'    => \$pass,
+    'v|vlan=s'    => \$vlan,
+    'l|log=s'     => \$logfile,
     'f|file=s'    => \$device_file,
-    'u|user=s'    => \$username,
-    'p|pass=s'    => \$password,
-    'l|log=s'     => \$log_file,
     't|timeout=i' => \$timeout,
-    'lldp'        => \$use_lldp,
-) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOG] [--lldp]\n";
+) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-v vlan] [-l log]\n";
 
-die "Provide -h HOST or -f FILE\n"    unless $host || $device_file;
-die "Username required: -u USER\n"   unless $username;
-die "Password required: -p PASS\n"   unless $password;
+$user //= $ENV{NET_USER} // 'admin';
+$pass //= $ENV{NET_PASS} // die "Password required: use -p or set NET_PASS\n";
 
 my @devices;
-if ($host) {
-    push @devices, $host;
-} else {
+if ($device_file) {
     open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_ }
+    while (<$fh>) {
+        chomp; s/#.*//; s/^\s+|\s+$//g;
+        next unless length;
+        my @f = split /\s+/;
+        push @devices, { host => $f[0], user => $f[1] // $user, pass => $f[2] // $pass };
+    }
     close $fh;
+} elsif ($host) {
+    push @devices, { host => $host, user => $user, pass => $pass };
+} else {
+    die "Must specify -h <host> or -f <device_file>\n";
 }
 
 my $log_fh;
-if ($log_file) {
-    open $log_fh, '>', $log_file or die "Cannot open log $log_file: $!\n";
+if ($logfile) {
+    open $log_fh, '>>', $logfile or die "Cannot open log $logfile: $!\n";
 }
 
 sub out {
-    my ($msg) = @_;
-    print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
+    my $msg = shift;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
 
-sub query_device {
-    my ($device) = @_;
-    out("\n--- $device ---");
+sub audit_stp {
+    my ($dev) = @_;
+    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
 
-    my $ssh = eval {
-        my $s = Net::SSH::Expect->new(
-            host     => $device,
-            user     => $username,
-            password => $password,
-            raw_pty  => 1,
-            timeout  => $timeout,
-        );
-        $s->run_ssh() or die "SSH handshake failed\n";
-        $s->read_all(2);
-        $s;
+    out("\n" . "=" x 62 . "\n");
+    out("Host : $dev->{host}    Time : $ts\n");
+    out("=" x 62 . "\n");
+
+    my $ssh = Net::SSH::Expect->new(
+        host     => $dev->{host},
+        user     => $dev->{user},
+        password => $dev->{pass},
+        raw_pty  => 1,
+        timeout  => $timeout,
+    );
+
+    eval {
+        my $banner = $ssh->login();
+        die "Login failed (got: $banner)\n" unless $banner =~ /[>#]/;
+
+        $ssh->send("terminal length 0");
+        $ssh->waitfor('\s*[>#]', $timeout) or die "Timeout after 'terminal length 0'\n";
+
+        my $cmd = $vlan ? "show spanning-tree vlan $vlan" : "show spanning-tree summary totals";
+        $ssh->send($cmd);
+        my $out = $ssh->waitfor('\s*[>#]', $timeout) or die "Timeout on '$cmd'\n";
+
+        out("Command: $cmd\n\n");
+
+        my $is_root = 0;
+        my @blocked_ports;
+
+        for my $line (split /\n/, $out) {
+            if ($line =~ /This bridge is the root/i) {
+                $is_root = 1;
+                out("  [ROOT]  This switch is the root bridge\n");
+            }
+            if ($line =~ /Root\s+ID.*Priority\s+(\d+)/i || $line =~ /Root priority\s+(\d+)/i) {
+                out("  Root Priority   : $1\n");
+            }
+            if (!$is_root && $line =~ /Address\s+([\da-fA-F.]+)/i) {
+                out("  Root MAC        : $1\n");
+            }
+            if ($line =~ /Number of topology changes\s+(\d+)/i) {
+                my $tc = $1;
+                out("  Topology Changes: $tc");
+                out($tc > 50 ? "  <-- WARNING: possible instability\n" : "\n");
+            }
+            if ($line =~ /\b(?:BLK|BLOCKING|BKN|inconsistent)\b/i) {
+                (my $trimmed = $line) =~ s/^\s+//;
+                push @blocked_ports, $trimmed;
+            }
+        }
+
+        if (@blocked_ports) {
+            out("\n  Blocked/Inconsistent Ports (" . scalar(@blocked_ports) . "):\n");
+            out("    $_\n") for @blocked_ports;
+        } else {
+            out("  Blocked Ports   : none detected\n");
+        }
+
+        if ($vlan) {
+            $ssh->send("show spanning-tree vlan $vlan detail");
+            my $detail = $ssh->waitfor('\s*[>#]', $timeout) or die "Timeout on stp detail\n";
+            for my $line (split /\n/, $detail) {
+                out("  ALERT: $line\n") if $line =~ /(dispute|loop|inconsisten)/i;
+            }
+        }
+
+        $ssh->send("exit");
     };
+
     if ($@) {
-        out("  ERROR: $@");
-        return;
+        (my $err = $@) =~ s/\s+$//;
+        out("  ERROR: $err\n");
+        return 0;
     }
-
-    $ssh->send("terminal length 0\n"); $ssh->read_all(2);
-
-    my $cmd = $use_lldp ? 'show lldp neighbors detail' : 'show cdp neighbors detail';
-    $ssh->send("$cmd\n");
-    my $raw = $ssh->read_all(4);
-
-    $ssh->send("exit\n");
-    eval { $ssh->close() };
-
-    parse_neighbors($device, $raw);
+    return 1;
 }
 
-sub parse_neighbors {
-    my ($device, $raw) = @_;
-    my @neighbors;
-
-    if (!$use_lldp) {
-        for my $block (split /(?=Device ID:)/, $raw) {
-            my %n;
-            ($n{id})      = $block =~ /Device ID:\s*(\S+)/;
-            ($n{ip})      = $block =~ /IP(?:v4)? address:\s*(\d[\d.]+)/i;
-            ($n{platform})= $block =~ /Platform:\s*([^,\n]+)/;
-            ($n{local})   = $block =~ /Interface:\s*(\S+)/;
-            ($n{remote})  = $block =~ /Port ID[^:]*:\s*(\S+)/;
-            push @neighbors, \%n if $n{id};
-        }
-    } else {
-        for my $block (split /(?=Local Intf:)/, $raw) {
-            my %n;
-            ($n{id})      = $block =~ /System Name:\s*(\S+)/;
-            ($n{ip})      = $block =~ /(?:Management Addresses?|IP(?:v4)?)[^\d]*(\d[\d.]+)/i;
-            ($n{platform})= $block =~ /System Description:\s*([^\n]+)/;
-            ($n{local})   = $block =~ /Local Intf:\s*(\S+)/;
-            ($n{remote})  = $block =~ /Port id:\s*(\S+)/i;
-            push @neighbors, \%n if $n{id};
-        }
-    }
-
-    unless (@neighbors) {
-        out("  No " . ($use_lldp ? "LLDP" : "CDP") . " neighbors found");
-        return;
-    }
-
-    out(sprintf("  %-24s %-16s %-22s %-22s", "Neighbor", "IP", "Local Intf", "Remote Intf"));
-    out("  " . "-" x 84);
-    for my $n (@neighbors) {
-        out(sprintf("  %-24s %-16s %-22s %-22s",
-            substr($n{id}     // '?',   0, 24),
-            substr($n{ip}     // 'N/A', 0, 16),
-            substr($n{local}  // '?',   0, 22),
-            substr($n{remote} // '?',   0, 22),
-        ));
-    }
-    out("  Neighbors: " . scalar(@neighbors));
+my ($ok, $fail) = (0, 0);
+for my $dev (@devices) {
+    audit_stp($dev) ? $ok++ : $fail++;
 }
 
-my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-out("CDP/LLDP Topology Map  [" . ($use_lldp ? "LLDP" : "CDP") . "]  $ts");
-out("=" x 60);
-
-query_device($_) for @devices;
-
-out("\n" . "=" x 60);
-out("Done. Devices queried: " . scalar(@devices));
-out("Log: $log_file") if $log_file;
-
+out("\n--- Summary: $ok OK, $fail failed ---\n");
 close $log_fh if $log_fh;
-```
-
-**What it does:** SSHes to each device, disables paging, runs `show cdp neighbors detail` (or `show lldp neighbors detail` with `--lldp`), parses neighbor blocks using targeted regexes, and prints a columnar table — Neighbor / IP / Local Intf / Remote Intf — per device. Error handling covers connection failures, SSH handshake errors, and unreachable hosts without killing the entire run. Output goes to STDOUT and optionally a timestamped log file.
+exit($fail ? 1 : 0);
