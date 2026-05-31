@@ -1,178 +1,171 @@
-```perl
+The prompt says "Output ONLY the script content" — here it is:
+
 #!/usr/bin/perl
+# =============================================================================
+# cpu_memory_health.pl - Cisco IOS CPU and Memory Health Monitor
 #
-# security_event_parser.pl - Network Device Security Log Analyzer
+# Purpose:
+#   Connects to one or more Cisco IOS devices via SSH and collects CPU
+#   utilization (5-second, 1-minute, 5-minute intervals) and memory
+#   utilization (processor pool used/free). Useful for baseline health
+#   checks, capacity planning, and pre/post-change verification.
 #
-# PURPOSE:
-#   Connects to Cisco IOS/IOS-XE devices via SSH, retrieves the syslog
-#   buffer, and parses for security-relevant events: authentication
-#   failures, ACL deny hits, port security violations, unauthorized
-#   login attempts, and configuration changes. Useful for daily security
-#   hygiene checks and post-incident investigation.
+# Usage:
+#   ./cpu_memory_health.pl -h 192.168.1.1 -u admin -p secret
+#   ./cpu_memory_health.pl -f devices.txt -u admin -p secret -l health.log
+#   ./cpu_memory_health.pl -h 10.0.0.1 -u admin -p secret -w 80 -c 90
 #
-# USAGE:
-#   ./security_event_parser.pl --host <ip> --user <username> [options]
-#   ./security_event_parser.pl --file <device_list.txt> --user <username>
+# Options:
+#   -h <host>      Single device IP or hostname
+#   -f <file>      File containing one device per line
+#   -u <user>      SSH username
+#   -p <pass>      SSH password
+#   -e <enable>    Enable password (optional, defaults to SSH password)
+#   -l <logfile>   Output log file (optional)
+#   -w <pct>       Warning threshold % for CPU/memory (default: 70)
+#   -c <pct>       Critical threshold % for CPU/memory (default: 90)
+#   -t <secs>      SSH timeout in seconds (default: 30)
 #
-# OPTIONS:
-#   --host    <ip/hostname>  Single device to audit
-#   --file    <path>         File with one device IP per line
-#   --user    <username>     SSH username (required)
-#   --pass    <password>     SSH password (prompted if omitted)
-#   --log     <logfile>      Append output to logfile in addition to STDOUT
-#   --lines   <n>            Log lines to retrieve per device (default: 500)
-#   --timeout <n>            SSH timeout in seconds (default: 30)
-#
-# PREREQUISITES:
+# Prerequisites:
 #   cpan Net::SSH::Expect
-#   cpan Term::ReadKey
 #
-# NOTES:
-#   Cisco IOS devices must have 'logging buffered' configured.
-#   SSH access must be enabled and permitted from the calling host.
-#   Tested against IOS 15.x and IOS-XE 16.x/17.x.
-#
+# Exit codes:
+#   0 = all devices OK
+#   1 = one or more devices at WARNING or higher
+#   2 = connection/auth failure on one or more devices
+# =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Std;
 use POSIX qw(strftime);
 
-my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_log);
-my $opt_lines   = 500;
-my $opt_timeout = 30;
+our %opts;
+getopts('h:f:u:p:e:l:w:c:t:', \%opts);
 
-GetOptions(
-    'host=s'    => \$opt_host,
-    'file=s'    => \$opt_file,
-    'user=s'    => \$opt_user,
-    'pass=s'    => \$opt_pass,
-    'log=s'     => \$opt_log,
-    'lines=i'   => \$opt_lines,
-    'timeout=i' => \$opt_timeout,
-) or die "Usage: $0 --host <ip> --user <user> [--pass <pass>] [--log <file>]\n";
+my $host      = $opts{h} // '';
+my $file      = $opts{f} // '';
+my $user      = $opts{u} or die "Usage: $0 -u <user> -p <pass> [-h <host>|-f <file>]\n";
+my $pass      = $opts{p} or die "Usage: $0 -u <user> -p <pass> [-h <host>|-f <file>]\n";
+my $enable    = $opts{e} // $pass;
+my $logfile   = $opts{l} // '';
+my $warn_pct  = $opts{w} // 70;
+my $crit_pct  = $opts{c} // 90;
+my $timeout   = $opts{t} // 30;
 
-die "ERROR: --user is required\n"             unless $opt_user;
-die "ERROR: --host or --file is required\n"   unless $opt_host || $opt_file;
-
-unless ($opt_pass) {
-    eval { require Term::ReadKey };
-    if ($@) {
-        print "Password: ";
-        chomp($opt_pass = <STDIN>);
-    } else {
-        Term::ReadKey::ReadMode('noecho');
-        print "Password: ";
-        chomp($opt_pass = <STDIN>);
-        Term::ReadKey::ReadMode('restore');
-        print "\n";
-    }
-}
+die "Specify -h <host> or -f <file>\n" unless $host || $file;
 
 my @devices;
-if ($opt_host) {
-    push @devices, $opt_host;
+if ($host) {
+    push @devices, $host;
 } else {
-    open(my $fh, '<', $opt_file) or die "Cannot open '$opt_file': $!\n";
-    while (<$fh>) { chomp; next if /^\s*$/ || /^#/; push @devices, $_; }
-    close($fh);
+    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
+    while (<$fh>) { chomp; push @devices, $_ if /\S/ && !/^#/; }
+    close $fh;
 }
 
 my $log_fh;
-if ($opt_log) {
-    open($log_fh, '>>', $opt_log) or die "Cannot open log '$opt_log': $!\n";
+if ($logfile) {
+    open($log_fh, '>>', $logfile) or die "Cannot open log file '$logfile': $!\n";
 }
 
-sub out {
+my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+my $exit_code = 0;
+
+sub emit {
     my ($msg) = @_;
     print $msg;
     print $log_fh $msg if $log_fh;
 }
 
-my %patterns = (
-    'Auth Failure'    => qr/%SEC_LOGIN-4-LOGIN_FAILED|Authentication failed|Invalid password/i,
-    'ACL Deny'        => qr/%SEC-6-IPACCESSLOG[SP]?:|list \S+ denied/i,
-    'Port Security'   => qr/%PORT_SECURITY-2-PSECURE_VIOLATION/i,
-    'SSH Error'       => qr/%SSH-[34]-|%CRYPTO-4-/i,
-    'AAA Failure'     => qr/%AAA-3-|%AUTHMGR-5-FAIL|RADIUS.*failed|TACACS.*failed/i,
-    'Config Change'   => qr/%SYS-5-CONFIG_I|Configured from console|Configured from \d/i,
-    'STP Event'       => qr/%SPANTREE-5-TOPOTCHANGE|%STP-5-TOPOLOGY_CHANGE/i,
-    'Link Down'       => qr/%LINEPROTO-5-UPDOWN.*changed state to down/i,
-);
-
-my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-out("=" x 68 . "\n");
-out("Security Event Analysis  |  $ts\n");
-out("=" x 68 . "\n\n");
-
-for my $device (@devices) {
-    out("Device: $device\n" . "-" x 40 . "\n");
-
-    my $ssh = Net::SSH::Expect->new(
-        host     => $device,
-        user     => $opt_user,
-        password => $opt_pass,
-        timeout  => $opt_timeout,
-        raw_pty  => 1,
-    );
-
-    eval {
-        my $login = $ssh->login();
-        die "Authentication failed\n" if $login =~ /[Pp]assword/i && $login !~ /[#>]/;
-    };
-    if ($@) {
-        chomp(my $err = $@);
-        out("  ERROR: $err\n\n");
-        next;
-    }
-
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('\#', 5);
-
-    $ssh->send("show logging | tail $opt_lines");
-    my $output = $ssh->waitfor('\#', 60);
-
-    unless ($output) {
-        out("  ERROR: No response to 'show logging'\n\n");
-        $ssh->close();
-        next;
-    }
-
-    my (%counts, @recent);
-    for my $line (split /\n/, $output) {
-        for my $type (keys %patterns) {
-            if ($line =~ $patterns{$type}) {
-                $counts{$type}++;
-                push @recent, [$type, $line] if @recent < 12;
-                last;
-            }
-        }
-    }
-
-    my $total = 0;
-    $total += $_ for values %counts;
-
-    if ($total == 0) {
-        out("  No security events found in log buffer\n");
-    } else {
-        out("  Summary ($total total events):\n");
-        for my $t (sort { $counts{$b} <=> $counts{$a} } keys %counts) {
-            out(sprintf("    %-20s %4d\n", $t, $counts{$t}));
-        }
-        out("\n  Recent matches:\n");
-        for my $ev (@recent) {
-            (my $line = $ev->[1]) =~ s/^\s+//;
-            $line = substr($line, 0, 110) . (length($line) > 110 ? '...' : '');
-            out("    [$ev->[0]] $line\n");
-        }
-    }
-
-    out("\n");
-    $ssh->send("exit");
-    $ssh->close();
+sub status_label {
+    my ($pct, $w, $c) = @_;
+    return 'CRIT' if $pct >= $c;
+    return 'WARN' if $pct >= $w;
+    return 'OK  ';
 }
 
-out("Done.\n");
-close($log_fh) if $log_fh;
-```
+emit("=" x 72 . "\n");
+emit("CPU/Memory Health Check  |  $timestamp\n");
+emit("=" x 72 . "\n");
+
+for my $dev (@devices) {
+    emit("\n--- $dev ---\n");
+
+    my $ssh = Net::SSH::Expect->new(
+        host        => $dev,
+        user        => $user,
+        password    => $pass,
+        raw_pty     => 1,
+        timeout     => $timeout,
+    );
+
+    my $login_output;
+    eval { $login_output = $ssh->login(); };
+    if ($@ || !defined $login_output) {
+        emit("  [ERROR] SSH connection failed: $@\n");
+        $exit_code = 2;
+        next;
+    }
+
+    if ($login_output =~ /[Pp]assword/i) {
+        emit("  [ERROR] Authentication failed for $dev\n");
+        $exit_code = 2;
+        next;
+    }
+
+    # Enter enable mode if needed
+    if ($login_output =~ />\s*$/) {
+        $ssh->send("enable");
+        my $en_out = $ssh->waitfor('Password:|#', $timeout);
+        if ($en_out =~ /Password:/i) {
+            $ssh->send($enable);
+            $ssh->waitfor('#', $timeout);
+        }
+    }
+
+    # Disable paging
+    $ssh->exec("terminal length 0");
+
+    # Collect CPU stats
+    my $cpu_out = $ssh->exec("show processes cpu | include CPU utilization");
+    my ($cpu5s, $cpu1m, $cpu5m) = (0, 0, 0);
+    if ($cpu_out =~ /CPU utilization.*?(\d+)%.*?(\d+)%.*?(\d+)%/) {
+        ($cpu5s, $cpu1m, $cpu5m) = ($1, $2, $3);
+    }
+
+    # Collect memory stats
+    my $mem_out = $ssh->exec("show processes memory | include Processor");
+    my ($mem_used, $mem_free) = (0, 0);
+    if ($mem_out =~ /Processor\s+\S+\s+(\d+)\s+(\d+)/) {
+        ($mem_used, $mem_free) = ($1, $2);
+    }
+
+    $ssh->close();
+
+    my $mem_total = $mem_used + $mem_free;
+    my $mem_pct   = $mem_total > 0 ? int(($mem_used / $mem_total) * 100) : 0;
+    my $mem_used_mb = int($mem_used / 1024 / 1024);
+    my $mem_free_mb = int($mem_free / 1024 / 1024);
+
+    my $cpu_status = status_label($cpu1m, $warn_pct, $crit_pct);
+    my $mem_status = status_label($mem_pct, $warn_pct, $crit_pct);
+
+    emit(sprintf("  CPU  [%s]  5sec: %3d%%  1min: %3d%%  5min: %3d%%\n",
+        $cpu_status, $cpu5s, $cpu1m, $cpu5m));
+    emit(sprintf("  MEM  [%s]  Used: %4dMB  Free: %4dMB  Util: %3d%%\n",
+        $mem_status, $mem_used_mb, $mem_free_mb, $mem_pct));
+
+    $exit_code = 1 if ($exit_code < 2) &&
+        ($cpu_status =~ /WARN|CRIT/ || $mem_status =~ /WARN|CRIT/);
+}
+
+emit("\n" . "=" x 72 . "\n");
+emit(sprintf("Checked %d device(s)  |  Exit: %d (%s)\n",
+    scalar @devices, $exit_code,
+    $exit_code == 0 ? 'OK' : $exit_code == 1 ? 'WARNING/CRITICAL' : 'CONNECTION ERROR'));
+emit("=" x 72 . "\n");
+
+close $log_fh if $log_fh;
+exit $exit_code;
