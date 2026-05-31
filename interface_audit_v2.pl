@@ -1,172 +1,222 @@
 #!/usr/bin/perl
 # =============================================================================
-# stp_audit.pl — Spanning Tree Protocol Topology Auditor
-# =============================================================================
+# acl_audit.pl - Network ACL Audit Tool
+#
 # Purpose:
-#   SSHes into Cisco IOS/IOS-XE switches and audits STP state across all
-#   active VLANs. Reports root bridge placement, blocking/discarding ports,
-#   and topology change counts. Flags conditions that commonly precede
-#   bridging loops or unplanned outages.
+#   Connects to Cisco IOS/IOS-XE devices via SSH and audits access control
+#   lists (ACLs). Collects ACL definitions, hit counts, and flags ACEs with
+#   zero hits (potentially dead rules), implicit deny stats, and ACLs applied
+#   to interfaces. Useful for security reviews and firewall rule cleanup.
 #
 # Usage:
-#   ./stp_audit.pl 10.0.0.1
-#   ./stp_audit.pl --file switches.txt --user admin --logdir /tmp/stp
-#   NET_USER=admin NET_PASS=secret ./stp_audit.pl core-sw-01
+#   Single device:   ./acl_audit.pl -h 192.168.1.1 -u admin [-p pass] [-l logfile]
+#   Device file:     ./acl_audit.pl -f devices.txt -u admin [-p pass] [-l logfile]
+#   With enable:     ./acl_audit.pl -h 192.168.1.1 -u admin -e enablepass
 #
 # Prerequisites:
-#   Expect    (cpan install Expect)
-#   OpenSSH   client in PATH
+#   cpan Net::SSH::Expect
 #
-# Options:
-#   <host>         Single device IP or hostname (positional)
-#   --file FILE    Newline-delimited device list (lines starting with # ignored)
-#   --user USER    SSH username (env NET_USER or interactive prompt)
-#   --pass PASS    SSH password (env NET_PASS or interactive prompt)
-#   --logdir DIR   Write raw show output per device into this directory
-#   --timeout N    Expect timeout in seconds (default 30)
+# devices.txt format: one IP or hostname per line, lines starting with # ignored
 # =============================================================================
 
 use strict;
 use warnings;
-use Expect;
+use Net::SSH::Expect;
 use Getopt::Long;
-use POSIX       qw(strftime);
+use POSIX qw(strftime);
 
-my ($file, $logdir, $user, $pass, $help);
+my ($host, $file, $user, $pass, $enable_pass, $logfile, $help);
 my $timeout = 30;
 
 GetOptions(
-    'file=s'    => \$file,
-    'logdir=s'  => \$logdir,
-    'user=s'    => \$user,
-    'pass=s'    => \$pass,
-    'timeout=i' => \$timeout,
-    'help|h'    => \$help,
-) or die "Option error. Run with --help for usage.\n";
+    'h=s' => \$host,
+    'f=s' => \$file,
+    'u=s' => \$user,
+    'p=s' => \$pass,
+    'e=s' => \$enable_pass,
+    'l=s' => \$logfile,
+    't=i' => \$timeout,
+    'help' => \$help,
+) or die "Usage: $0 -h HOST | -f FILE -u USER [-p PASS] [-e ENABLE] [-l LOGFILE]\n";
 
-if ($help) {
-    print "Usage: $0 [HOST] [--file F] [--user U] [--pass P] [--logdir D] [--timeout N]\n";
+if ($help || !$user || (!$host && !$file)) {
+    print "Usage: $0 -h HOST | -f FILE -u USER [-p PASS] [-e ENABLE] [-l LOGFILE] [-t TIMEOUT]\n";
     exit 0;
 }
 
-my $host = shift @ARGV;
-die "Error: specify a host argument or --file\n" unless $host || $file;
-
-$user //= $ENV{NET_USER} // do {
-    local $| = 1; print "Username: "; chomp(my $u = <STDIN>); $u
-};
-$pass //= $ENV{NET_PASS} // do {
-    local $| = 1; print "Password: ";
-    system('stty -echo 2>/dev/null'); chomp(my $p = <STDIN>);
-    system('stty echo 2>/dev/null');  print "\n"; $p
-};
-
-my @targets = $file
-    ? do { open my $fh, '<', $file or die "Cannot open $file: $!\n";
-           map  { chomp; $_ }
-           grep { /\S/ && !/^\s*#/ } <$fh> }
-    : ($host);
-
-my $stamp    = strftime('%Y%m%d_%H%M%S', localtime);
-my $any_warn = 0;
-
-for my $dev (@targets) {
-    printf "\n%s\n  Device: %-38s  %s\n%s\n",
-        '=' x 60, $dev, strftime('%H:%M:%S', localtime), '=' x 60;
-
-    my ($raw, $err) = ssh_cmd($dev, $user, $pass, $timeout,
-        'terminal length 0',
-        'show spanning-tree',
-    );
-
-    if ($err) {
-        print "  ERROR: $err\n";
-        $any_warn = 1;
-        next;
-    }
-
-    if ($logdir && -d $logdir) {
-        (my $safe = $dev) =~ s/[^\w.-]/_/g;
-        my $lf = "$logdir/stp_${safe}_${stamp}.log";
-        if (open my $lfh, '>', $lf) { print $lfh $raw; close $lfh; print "  Log: $lf\n" }
-        else                        { warn "  Cannot write log $lf: $!\n" }
-    }
-
-    my @issues = parse_and_report($raw);
-    $any_warn = 1 if @issues;
+# Prompt for password if not provided
+unless ($pass) {
+    print "Password: ";
+    system('stty', '-echo');
+    chomp($pass = <STDIN>);
+    system('stty', 'echo');
+    print "\n";
 }
 
-exit $any_warn ? 1 : 0;
-
-# ─── Subroutines ─────────────────────────────────────────────────────────────
-
-sub ssh_cmd {
-    my ($host, $user, $pass, $timeout, @cmds) = @_;
-
-    my $exp = Expect->new();
-    $exp->log_stdout(0);
-    $exp->raw_pty(1);
-
-    $exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${user}\@${host}")
-        or return (undef, "spawn failed: $!");
-
-    my $ok = $exp->expect($timeout,
-        [ qr/[Pp]assword[^:]*:/,               sub { $exp->send("$pass\n"); exp_continue } ],
-        [ qr/yes\/no\)?[^\n]*/i,               sub { $exp->send("yes\n");   exp_continue } ],
-        [ qr/[>#]/,                             sub { 1 } ],
-        [ qr/(?:refused|unreachable|timed out)/i, sub { 0 } ],
-        [ 'timeout',                            sub { 0 } ],
-    );
-    return (undef, "login failed or host unreachable") unless $ok;
-
-    my $output = '';
-    for my $cmd (@cmds) {
-        $exp->send("$cmd\n");
-        $exp->expect($timeout, qr/[>#]/) or return (undef, "timeout waiting for prompt after: $cmd");
-        $output .= $exp->before() // '';
+my @devices;
+if ($host) {
+    push @devices, $host;
+} elsif ($file) {
+    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        push @devices, $_;
     }
-    $exp->send("exit\n");
-    $exp->soft_close();
-    return ($output, undef);
+    close $fh;
 }
 
-sub parse_and_report {
-    my ($raw)  = @_;
-    my (%vlans, $cur, @issues);
+my $log_fh;
+if ($logfile) {
+    open($log_fh, '>', $logfile) or die "Cannot open log file '$logfile': $!\n";
+}
 
-    for my $line (split /\n/, $raw) {
-        if ($line =~ /^(?:VLAN|MST)(\d+)\s*$/) {
-            $cur = $1;
-            $vlans{$cur} = { is_root => 0, blocking => 0, topo_chg => 0 };
-        }
-        next unless defined $cur;
-        my $v = $vlans{$cur};
-        $v->{is_root}  = 1  if $line =~ /This bridge is the root/;
-        $v->{topo_chg} = $1 if $line =~ /topology changes?\s+(\d+)/i;
-        $v->{blocking}++    if $line =~ /\b(?:BLK|DISC|discarding)\b/;
+my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+output("=" x 70);
+output("ACL Audit Report - $timestamp");
+output("=" x 70);
+
+for my $device (@devices) {
+    audit_device($device);
+}
+
+close $log_fh if $log_fh;
+exit 0;
+
+sub audit_device {
+    my ($dev) = @_;
+    output("\n--- Device: $dev ---");
+
+    my $ssh;
+    eval {
+        $ssh = Net::SSH::Expect->new(
+            host        => $dev,
+            user        => $user,
+            password    => $pass,
+            raw_pty     => 1,
+            timeout     => $timeout,
+        );
+        $ssh->login();
+    };
+    if ($@) {
+        output("  ERROR: Connection failed to $dev: $@");
+        return;
     }
 
-    unless (%vlans) {
-        print "  No STP VLAN instances found (STP disabled or unrecognised format)\n";
-        return ();
-    }
+    # Detect prompt and disable paging
+    my $prompt = '[\$#>]\s*$';
+    $ssh->send('terminal length 0');
+    $ssh->waitfor($prompt, 5);
 
-    my $total = scalar keys %vlans;
-    my $root  = grep { $vlans{$_}{is_root} } keys %vlans;
-    printf "  VLANs tracked : %d    Root bridge for: %d\n", $total, $root;
-
-    for my $vid (sort { $a <=> $b } keys %vlans) {
-        my $v = $vlans{$vid};
-        if ($v->{blocking}) {
-            printf "  [WARN] VLAN %-5s  %d blocking/discarding port(s)\n", $vid, $v->{blocking};
-            push @issues, "VLAN $vid: blocking ports";
-        }
-        if ($v->{topo_chg} > 50) {
-            printf "  [WARN] VLAN %-5s  high topology change count: %d\n", $vid, $v->{topo_chg};
-            push @issues, "VLAN $vid: excessive topo changes ($v->{topo_chg})";
+    # Enter enable mode if needed
+    if ($enable_pass) {
+        $ssh->send('enable');
+        my $result = $ssh->waitfor('(?:assword|#)', 5);
+        if ($result =~ /assword/) {
+            $ssh->send($enable_pass);
+            $ssh->waitfor($prompt, 5);
         }
     }
 
-    print "  Status: OK — no STP anomalies detected\n" unless @issues;
-    return @issues;
+    # Verify we have privileged access
+    $ssh->send('show privilege');
+    my $priv_out = $ssh->waitfor($prompt, 10);
+    unless ($priv_out =~ /level\s+1[0-5]/i) {
+        output("  WARN: May not have privileged access - ACL details may be incomplete");
+    }
+
+    # Get ACL hit counts
+    $ssh->send('show ip access-lists');
+    my $acl_out = $ssh->waitfor($prompt, 30);
+
+    # Get interface ACL bindings
+    $ssh->send('show ip interface | include (Internet|line proto|Inbound|Outbound)');
+    my $intf_out = $ssh->waitfor($prompt, 30);
+
+    $ssh->send('exit');
+
+    parse_acls($dev, $acl_out, $intf_out);
+}
+
+sub parse_acls {
+    my ($dev, $acl_raw, $intf_raw) = @_;
+
+    my %acls;
+    my $current_acl = '';
+
+    for my $line (split /\r?\n/, $acl_raw) {
+        $line =~ s/\r//g;
+
+        if ($line =~ /^(?:Standard|Extended)\s+IP\s+access\s+list\s+(\S+)/i) {
+            $current_acl = $1;
+            $acls{$current_acl}{type}  = ($line =~ /Extended/i) ? 'extended' : 'standard';
+            $acls{$current_acl}{aces}  = 0;
+            $acls{$current_acl}{hits}  = 0;
+            $acls{$current_acl}{zero_hit_aces} = 0;
+        } elsif ($current_acl && $line =~ /^\s+\d+\s+/) {
+            $acls{$current_acl}{aces}++;
+            my ($hits) = $line =~ /\((\d+)\s+match(?:es)?\)/;
+            $hits //= 0;
+            $acls{$current_acl}{hits} += $hits;
+            $acls{$current_acl}{zero_hit_aces}++ if $hits == 0;
+        }
+    }
+
+    # Parse interface bindings
+    my %bound_acls;
+    my $current_intf = '';
+    for my $line (split /\r?\n/, $intf_raw) {
+        $line =~ s/\r//g;
+        if ($line =~ /^(\S+)\s+is\s+/) {
+            $current_intf = $1;
+        } elsif ($line =~ /(?:Inbound|Outbound)\s+access\s+list\s+is\s+(\S+)/i) {
+            my $acl_name = $1;
+            next if $acl_name eq 'not set';
+            push @{$bound_acls{$acl_name}}, $current_intf;
+        }
+    }
+
+    if (!%acls) {
+        output("  No IP access lists found on $dev");
+        return;
+    }
+
+    output(sprintf("  %-30s %-10s %-6s %-10s %-10s %s",
+        'ACL Name', 'Type', 'ACEs', 'Total Hits', 'Zero-Hit', 'Applied To'));
+    output("  " . "-" x 90);
+
+    my $total_acls     = 0;
+    my $unused_acls    = 0;
+    my $unbound_acls   = 0;
+
+    for my $name (sort keys %acls) {
+        $total_acls++;
+        my $a       = $acls{$name};
+        my $applied = join(', ', @{$bound_acls{$name} // []}) || 'NOT BOUND';
+        my $flag    = '';
+        $flag .= ' [UNUSED]'   if $a->{hits} == 0 && $a->{aces} > 0;
+        $flag .= ' [UNBOUND]'  if $applied eq 'NOT BOUND';
+
+        $unused_acls++  if $a->{hits} == 0 && $a->{aces} > 0;
+        $unbound_acls++ if $applied eq 'NOT BOUND';
+
+        output(sprintf("  %-30s %-10s %-6d %-10d %-10d %s%s",
+            $name,
+            $a->{type},
+            $a->{aces},
+            $a->{hits},
+            $a->{zero_hit_aces},
+            $applied,
+            $flag,
+        ));
+    }
+
+    output("  " . "-" x 90);
+    output("  Summary: $total_acls ACLs | $unused_acls with zero hits | $unbound_acls not bound to any interface");
+}
+
+sub output {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $log_fh "$msg\n" if $log_fh;
 }
