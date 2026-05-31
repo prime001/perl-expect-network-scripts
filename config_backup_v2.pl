@@ -1,26 +1,26 @@
 ```perl
 #!/usr/bin/perl
-#==============================================================================
-# acl_audit.pl - Cisco IOS/IOS-XE Access Control List Security Auditor
+# =============================================================================
+# config_drift.pl — Configuration Drift Detector for Cisco IOS/IOS-XE
+# =============================================================================
+# Purpose:
+#   Compares the current running-config on one or more devices against a
+#   previously saved baseline, flagging unauthorized or untracked changes.
+#   Useful for change-control audits and post-maintenance verification.
 #
-# PURPOSE:
-#   Audits IP access-lists on Cisco devices via SSH. Reports per-ACL rule
-#   counts, flags ACLs where every rule has zero hits (candidates for removal),
-#   and warns on permit-ip-any-any entries that may represent security gaps.
-#   Designed for quarterly security reviews and firewall cleanup campaigns.
+# Usage:
+#   Single device:   ./config_drift.pl --host 10.0.0.1 --baseline /backups/r1.cfg
+#   Multiple hosts:  ./config_drift.pl --file devices.txt --baseline-dir /backups/
+#   With log:        ./config_drift.pl --host 10.0.0.1 --baseline r1.cfg --log drift.log
 #
-# USAGE:
-#   Single device:  ./acl_audit.pl -h 192.168.1.1 -u admin -p secret
-#   Device list:    ./acl_audit.pl -f devices.txt  -u admin -p secret -l audit.log
+# devices.txt format: one entry per line — IP/hostname, optionally followed by
+#   a baseline path override:  10.0.0.1 /backups/r1.cfg
 #
-# PREREQUISITES:
-#   perl -MCPAN -e 'install Net::SSH::Expect'
-#   Target devices must permit SSH and 'show ip access-lists' at exec level
-#
-# OUTPUT FLAGS:
-#   [UNUSED?] = every rule in the ACL has zero hit count (review for removal)
-#   [RISKY]   = ACL contains one or more 'permit ip any any' entries
-#==============================================================================
+# Prerequisites:
+#   cpan install Net::SSH::Expect
+#   Credentials via ENV (NET_USER / NET_PASS) or --user / --password flags.
+#   Key-based auth works automatically if SSH keys are configured.
+# =============================================================================
 
 use strict;
 use warnings;
@@ -28,120 +28,136 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $file, $user, $pass, $logfile);
+my ($opt_host, $opt_file, $opt_baseline, $opt_baseline_dir, $opt_log);
+my $opt_user    = $ENV{NET_USER} // 'admin';
+my $opt_pass    = $ENV{NET_PASS} // '';
+my $opt_timeout = 30;
+
 GetOptions(
-    'h|host=s' => \$host,
-    'f|file=s' => \$file,
-    'u|user=s' => \$user,
-    'p|pass=s' => \$pass,
-    'l|log=s'  => \$logfile,
-) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOGFILE]\n";
+    'host=s'         => \$opt_host,
+    'file=s'         => \$opt_file,
+    'baseline=s'     => \$opt_baseline,
+    'baseline-dir=s' => \$opt_baseline_dir,
+    'log=s'          => \$opt_log,
+    'user=s'         => \$opt_user,
+    'password=s'     => \$opt_pass,
+    'timeout=i'      => \$opt_timeout,
+) or die "Usage: $0 --host <ip> --baseline <file> [options]\n";
 
-die "Specify -h HOST or -f FILE\n" unless $host || $file;
-die "Specify -u USER\n"            unless $user;
-die "Specify -p PASS\n"            unless $pass;
+die "Specify --host or --file\n" unless $opt_host || $opt_file;
 
-my @devices;
-if ($host) {
-    @devices = ($host);
-} else {
-    open my $fh, '<', $file or die "Cannot open device list '$file': $!\n";
-    @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
-    close $fh;
-}
-die "No devices to process\n" unless @devices;
-
-my $LOG;
-if ($logfile) {
-    open $LOG, '>>', $logfile or die "Cannot open log '$logfile': $!\n";
-    printf $LOG "# acl_audit.pl started %s\n", strftime('%Y-%m-%d %H:%M:%S', localtime);
+my $log_fh;
+if ($opt_log) {
+    open($log_fh, '>>', $opt_log) or die "Cannot open log '$opt_log': $!\n";
 }
 
 sub emit {
-    print @_;
-    print $LOG @_ if $LOG;
+    my $msg = shift;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
 
-sub audit_device {
-    my ($device) = @_;
-    my $stamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-
-    emit("\n" . "=" x 64 . "\n");
-    emit(sprintf "Device: %-20s  Timestamp: %s\n", $device, $stamp);
-    emit("=" x 64 . "\n");
+sub fetch_running_config {
+    my ($host) = @_;
 
     my $ssh = Net::SSH::Expect->new(
-        host     => $device,
-        user     => $user,
-        password => $pass,
+        host     => $host,
+        user     => $opt_user,
+        password => $opt_pass,
         raw_pty  => 1,
-        timeout  => 20,
+        timeout  => $opt_timeout,
     );
 
     eval { $ssh->login() };
-    if ($@) {
-        emit("  ERROR: SSH login failed ($device): $@\n");
-        return;
-    }
+    die "Login failed: $@\n" if $@;
 
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('#\s*$', 5);
-
-    $ssh->send("show ip access-lists");
-    my $output = $ssh->waitfor('#\s*$', 30);
-
-    $ssh->send("exit");
+    $ssh->exec("terminal length 0");
+    my $raw = $ssh->exec("show running-config");
     $ssh->close();
 
-    unless ($output && $output =~ /access\s+list/i) {
-        emit("  No IP access-lists found on this device.\n");
-        return;
-    }
-
-    my (%acls, $current);
-    for my $line (split /\n/, $output) {
-        if ($line =~ /^(?:Standard|Extended)\s+IP\s+access\s+list\s+(\S+)/i) {
-            $current = $1;
-            $acls{$current} = { total => 0, zerohit => 0, permit_any => 0 };
-        } elsif ($current && $line =~ /^\s+\d+\s+/) {
-            $acls{$current}{total}++;
-            my $hits = ($line =~ /\((\d+)\s+match/) ? $1 : 0;
-            $acls{$current}{zerohit}++    if $hits == 0;
-            $acls{$current}{permit_any}++ if $line =~ /permit\s+ip\s+any\s+any/i;
-        }
-    }
-
-    if (!%acls) {
-        emit("  Unable to parse access-list output.\n");
-        return;
-    }
-
-    emit(sprintf "  %-34s %6s %9s %11s  Flags\n", "ACL Name", "Rules", "ZeroHit", "PermitAny");
-    emit("  " . "-" x 64 . "\n");
-
-    my ($unused_count, $risky_count) = (0, 0);
-    for my $name (sort keys %acls) {
-        my $a = $acls{$name};
-        my @flags;
-        if ($a->{total} > 0 && $a->{zerohit} == $a->{total}) {
-            push @flags, '[UNUSED?]';
-            $unused_count++;
-        }
-        if ($a->{permit_any} > 0) {
-            push @flags, '[RISKY]';
-            $risky_count++;
-        }
-        emit(sprintf "  %-34s %6d %9d %11d  %s\n",
-            $name, $a->{total}, $a->{zerohit}, $a->{permit_any}, join(' ', @flags));
-    }
-
-    emit(sprintf "\n  SUMMARY: %d ACL(s) | %d possibly unused | %d with permit-any\n",
-        scalar keys %acls, $unused_count, $risky_count);
+    # Drop prompt lines and blank lines; keep config body
+    my @lines = grep { $_ !~ /^[\w\-]+[>#]/ && $_ =~ /\S/ } split(/\n/, $raw);
+    return \@lines;
 }
 
-audit_device($_) for @devices;
+sub diff_configs {
+    my ($host, $current_lines, $baseline_path) = @_;
 
-my $done = strftime('%Y-%m-%d %H:%M:%S', localtime);
-emit("\n# Audit complete $done\n");
-close $LOG if $LOG;
+    unless (-f $baseline_path) {
+        emit("  [SKIP]  No baseline at $baseline_path\n");
+        return 0;
+    }
+
+    open(my $fh, '<', $baseline_path) or die "Cannot read baseline '$baseline_path': $!\n";
+    my @baseline = grep { /\S/ } <$fh>;
+    close($fh);
+    chomp @baseline;
+
+    # Noise patterns: cert blocks, timestamps, counters — not meaningful for drift
+    my $noise = qr/^(?:Building config|Current config|Last config|
+                       ntp\s+clock-period|\s*[0-9A-F]{2}(?:\s+[0-9A-F]{2})+|\s*quit)/x;
+
+    my %base_set; $base_set{$_}++ for @baseline;
+    my %curr_set; $curr_set{$_}++ for @$current_lines;
+
+    my @added   = grep { !$base_set{$_} && !/$noise/ } @$current_lines;
+    my @removed = grep { !$curr_set{$_} && !/$noise/ } @baseline;
+
+    if (@added || @removed) {
+        emit("  [DRIFT] $host — " . scalar(@added) . " added, " . scalar(@removed) . " removed\n");
+        emit("    + $_\n") for @added;
+        emit("    - $_\n") for @removed;
+        return 1;
+    }
+
+    emit("  [OK]    $host matches baseline\n");
+    return 0;
+}
+
+sub check_device {
+    my ($host, $bl_override) = @_;
+
+    emit("Checking $host ... ");
+
+    my $bl_path = $bl_override
+        // ($opt_baseline_dir ? "$opt_baseline_dir/${host}.cfg" : $opt_baseline);
+
+    unless ($bl_path) {
+        emit("[ERROR] no baseline path for $host\n");
+        return 0;
+    }
+
+    my $current;
+    eval { $current = fetch_running_config($host) };
+    if ($@) {
+        emit("[ERROR] $@");
+        return 0;
+    }
+
+    return diff_configs($host, $current, $bl_path);
+}
+
+# Build target list
+my @targets;
+if ($opt_host) {
+    push @targets, [ $opt_host, $opt_baseline ];
+} else {
+    open(my $fh, '<', $opt_file) or die "Cannot open device file '$opt_file': $!\n";
+    while (<$fh>) {
+        chomp; s/#.*//; s/^\s+|\s+$//g; next unless /\S/;
+        my ($dev, $bl) = split(/\s+/, $_, 2);
+        push @targets, [ $dev, $bl ];
+    }
+    close($fh);
+}
+
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+emit("=== Config Drift Check — $ts | " . scalar(@targets) . " device(s) ===\n");
+
+my $drifted = 0;
+$drifted += check_device(@$_) for @targets;
+
+emit("\n=== Result: $drifted/" . scalar(@targets) . " device(s) have configuration drift ===\n");
+close($log_fh) if $log_fh;
+exit($drifted > 0 ? 1 : 0);
 ```
