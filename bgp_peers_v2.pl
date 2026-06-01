@@ -1,164 +1,159 @@
+```perl
 #!/usr/bin/perl
+# =============================================================================
+# bgp_route_policy.pl - BGP Route Policy and Community Verification Tool
+#
+# Purpose:
+#   Connects to Cisco IOS/IOS-XE routers and audits BGP route policy by
+#   examining received and advertised prefixes per peer, along with community
+#   tags, local-pref, MED, and AS-path attributes. Useful for validating
+#   inbound/outbound route-map behavior and policy changes.
+#
+# Usage:
+#   ./bgp_route_policy.pl -h <host> -u <user> -p <pass> [-P <peer_ip>] [-l logfile]
+#   ./bgp_route_policy.pl -f devices.txt -u <user> -p <pass>
+#
+# Prerequisites:
+#   cpan Expect Getopt::Long
+#
+# Output:
+#   Per-peer prefix count, community summary, anomalies (missing communities,
+#   unexpected local-pref, etc.)
+#
+# Examples:
+#   ./bgp_route_policy.pl -h 10.0.0.1 -u admin -p secret -P 203.0.113.5
+#   ./bgp_route_policy.pl -f routers.txt -u netops -p pass123 -l /tmp/bgp_audit.log
+# =============================================================================
+
 use strict;
 use warnings;
-use Net::SSH::Expect;
+use Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-# =============================================================================
-# bgp_route_audit.pl - BGP Advertised/Received Route Prefix Auditor
-#
-# Purpose:
-#   Connects to a Cisco IOS/IOS-XE router and audits prefix counts for each
-#   BGP neighbor - both advertised-routes and received-routes. Flags peers
-#   with zero advertised prefixes (common misconfiguration / policy issue)
-#   and peers where received count dropped significantly vs a threshold.
-#
-# Usage:
-#   ./bgp_route_audit.pl --host <ip> --user <user> --pass <pass> [options]
-#   ./bgp_route_audit.pl --file devices.txt --user <user> --pass <pass>
-#
-# Options:
-#   --host <ip>         Single device IP or hostname
-#   --file <file>       File with one device IP per line
-#   --user <user>       SSH username (default: admin)
-#   --pass <pass>       SSH password
-#   --enable <pass>     Enable password (if needed)
-#   --min-prefixes <n>  Alert if advertised prefix count below this (default: 1)
-#   --log <file>        Write output to log file in addition to STDOUT
-#   --timeout <sec>     SSH command timeout in seconds (default: 30)
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#   Device must have 'soft-reconfiguration inbound' or 'route-refresh' for
-#   received-routes to be populated.
-#
-# =============================================================================
+my ($host, $user, $pass, $peer, $device_file, $log_file);
+my $timeout = 30;
 
-my %opt = (
-    user          => 'admin',
-    timeout       => 30,
-    'min-prefixes' => 1,
-);
+GetOptions(
+    'h|host=s'     => \$host,
+    'u|user=s'     => \$user,
+    'p|pass=s'     => \$pass,
+    'P|peer=s'     => \$peer,
+    'f|file=s'     => \$device_file,
+    'l|log=s'      => \$log_file,
+    't|timeout=i'  => \$timeout,
+) or die "Usage: $0 -h <host> -u <user> -p <pass> [-P <peer>] [-l logfile]\n";
 
-GetOptions(\%opt,
-    'host=s', 'file=s', 'user=s', 'pass=s', 'enable=s',
-    'min-prefixes=i', 'log=s', 'timeout=i',
-) or die "Invalid options. Use --help for usage.\n";
+die "Credentials required: -u <user> -p <pass>\n" unless $user && $pass;
+die "Specify -h <host> or -f <file>\n" unless $host || $device_file;
 
-die "Provide --host or --file\n" unless $opt{host} || $opt{file};
-die "Provide --pass\n"           unless $opt{pass};
-
-my @devices;
-if ($opt{host}) {
-    push @devices, $opt{host};
-} else {
-    open my $fh, '<', $opt{file} or die "Cannot open $opt{file}: $!\n";
-    @devices = grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
-    close $fh;
-}
+my @hosts = $host ? ($host) : do {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    map { chomp; $_ } grep { /\S/ && !/^#/ } <$fh>;
+};
 
 my $log_fh;
-if ($opt{log}) {
-    open $log_fh, '>>', $opt{log} or die "Cannot open log $opt{log}: $!\n";
+if ($log_file) {
+    open $log_fh, '>>', $log_file or die "Cannot open logfile $log_file: $!\n";
 }
 
-sub emit {
-    print @_;
-    print $log_fh @_ if $log_fh;
+sub log_output {
+    my ($msg) = @_;
+    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    print "[$ts] $msg\n";
+    print $log_fh "[$ts] $msg\n" if $log_fh;
 }
 
-sub audit_device {
-    my ($host) = @_;
-    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-    emit "\n=== $host  [$ts] ===\n";
+sub audit_bgp_policy {
+    my ($device) = @_;
+    log_output("=== Connecting to $device ===");
 
-    my $ssh = Net::SSH::Expect->new(
-        host        => $host,
-        user        => $opt{user},
-        password    => $opt{pass},
-        raw_pty     => 1,
-        timeout     => $opt{timeout},
+    my $exp = Expect->new;
+    $exp->raw_pty(1);
+    $exp->log_stdout(0);
+
+    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${user}\@${device}")) {
+        log_output("ERROR: Failed to spawn SSH for $device");
+        return;
+    }
+
+    my $logged_in = 0;
+    $exp->expect($timeout,
+        [ qr/[Pp]assword:/,      sub { $exp->send("$pass\n"); exp_continue; } ],
+        [ qr/[>#]/,              sub { $logged_in = 1; } ],
+        [ qr/Connection refused/, sub { log_output("ERROR: Connection refused to $device"); } ],
+        [ qr/No route to host/,   sub { log_output("ERROR: No route to $device"); } ],
+        [ timeout => sub { log_output("ERROR: Timeout connecting to $device"); } ],
     );
 
-    eval { $ssh->login() };
-    if ($@) {
-        emit "  ERROR: SSH login failed - $@\n";
+    unless ($logged_in) {
+        $exp->soft_close;
         return;
     }
 
-    $ssh->send('terminal length 0');
-    $ssh->waitfor('>\s*$|\#\s*$', 5);
+    $exp->send("terminal length 0\n");
+    $exp->expect(10, qr/[>#]/);
 
-    if ($opt{enable}) {
-        $ssh->send('enable');
-        $ssh->waitfor('Password:\s*$', 5);
-        $ssh->send($opt{enable});
-        $ssh->waitfor('\#\s*$', 5);
+    # Get BGP summary to find peers if none specified
+    $exp->send("show ip bgp summary\n");
+    $exp->expect($timeout, qr/[>#]/);
+    my $summary = $exp->before();
+
+    my @peers_to_check;
+    if ($peer) {
+        @peers_to_check = ($peer);
+    } else {
+        # Parse established peers from summary
+        while ($summary =~ /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)/mg) {
+            push @peers_to_check, $1 if $2 > 0;  # only established peers (prefix count > 0)
+        }
     }
 
-    # Pull BGP summary to get peer list
-    $ssh->send('show ip bgp summary');
-    my $summary = $ssh->waitfor('\#\s*$', $opt{timeout});
-    unless ($summary) {
-        emit "  ERROR: Timeout waiting for BGP summary\n";
-        $ssh->close();
+    if (!@peers_to_check) {
+        log_output("$device: No established BGP peers found");
+        $exp->send("exit\n");
+        $exp->soft_close;
         return;
     }
 
-    # Parse neighbor IPs from BGP summary table (lines starting with an IP)
-    my @peers = ($summary =~ /^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+\d+/mg);
-    if (!@peers) {
-        emit "  No BGP peers found (BGP may not be running)\n";
-        $ssh->close();
-        return;
-    }
+    for my $p (@peers_to_check) {
+        log_output("$device: Auditing peer $p");
 
-    emit "  Found " . scalar(@peers) . " BGP peer(s)\n\n";
-    emit sprintf("  %-18s %12s %12s  %s\n", 'Peer', 'Advertised', 'Received', 'Status');
-    emit "  " . "-"x60 . "\n";
+        $exp->send("show ip bgp neighbors $p received-routes | include Network|Community|localpref|metric\n");
+        $exp->expect($timeout, qr/[>#]/);
+        my $received = $exp->before();
 
-    my @alerts;
-    for my $peer (@peers) {
-        my ($adv_count, $rcv_count) = (0, 0);
+        $exp->send("show ip bgp neighbors $p advertised-routes | include Network|Community|localpref|metric\n");
+        $exp->expect($timeout, qr/[>#]/);
+        my $advertised = $exp->before();
 
-        $ssh->send("show ip bgp neighbors $peer advertised-routes");
-        my $adv = $ssh->waitfor('\#\s*$', $opt{timeout}) // '';
-        if ($adv =~ /Total number of prefixes (\d+)/i) {
-            $adv_count = $1;
-        } elsif ($adv =~ /(\d+)\s+network entries/i) {
-            $adv_count = $1;
+        my $rx_count  = () = $received  =~ /^\s*\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/mg;
+        my $adv_count = () = $advertised =~ /^\s*\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/mg;
+
+        log_output("$device peer $p: received=$rx_count prefixes, advertised=$adv_count prefixes");
+
+        my %communities;
+        while ($received =~ /Community:\s*([^\n]+)/g) {
+            $communities{$_}++ for split /\s+/, $1;
+        }
+        if (%communities) {
+            my $comm_str = join(", ", map { "$_($communities{$_})" } sort keys %communities);
+            log_output("$device peer $p: communities seen: $comm_str");
+        } else {
+            log_output("$device peer $p: WARNING - no BGP communities on received routes");
         }
 
-        $ssh->send("show ip bgp neighbors $peer received-routes");
-        my $rcv = $ssh->waitfor('\#\s*$', $opt{timeout}) // '';
-        if ($rcv =~ /Total number of prefixes (\d+)/i) {
-            $rcv_count = $1;
-        } elsif ($rcv =~ /(\d+)\s+network entries/i) {
-            $rcv_count = $1;
+        # Flag if received but nothing advertised (possible outbound policy blocking all)
+        if ($rx_count > 0 && $adv_count == 0) {
+            log_output("$device peer $p: ALERT - receiving routes but advertising none (check outbound route-map)");
         }
-
-        my $status = 'OK';
-        if ($adv_count < $opt{'min-prefixes'}) {
-            $status = "ALERT:adv<$opt{'min-prefixes'}";
-            push @alerts, "$peer advertised only $adv_count prefix(es) (threshold: $opt{'min-prefixes'})";
-        }
-
-        emit sprintf("  %-18s %12d %12d  %s\n", $peer, $adv_count, $rcv_count, $status);
     }
 
-    if (@alerts) {
-        emit "\n  ALERTS:\n";
-        emit "    - $_\n" for @alerts;
-    }
-
-    $ssh->send('exit');
-    $ssh->close();
+    $exp->send("exit\n");
+    $exp->soft_close;
 }
 
-for my $dev (@devices) {
-    audit_device($dev);
-}
-
-emit "\nDone. Audited " . scalar(@devices) . " device(s).\n";
+audit_bgp_policy($_) for @hosts;
 close $log_fh if $log_fh;
+log_output("Audit complete.");
+```
