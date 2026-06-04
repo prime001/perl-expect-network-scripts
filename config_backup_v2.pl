@@ -1,163 +1,167 @@
-```perl
-#!/usr/bin/perl
-# =============================================================================
-# config_drift.pl — Configuration Drift Detector for Cisco IOS/IOS-XE
-# =============================================================================
-# Purpose:
-#   Compares the current running-config on one or more devices against a
-#   previously saved baseline, flagging unauthorized or untracked changes.
-#   Useful for change-control audits and post-maintenance verification.
-#
-# Usage:
-#   Single device:   ./config_drift.pl --host 10.0.0.1 --baseline /backups/r1.cfg
-#   Multiple hosts:  ./config_drift.pl --file devices.txt --baseline-dir /backups/
-#   With log:        ./config_drift.pl --host 10.0.0.1 --baseline r1.cfg --log drift.log
-#
-# devices.txt format: one entry per line — IP/hostname, optionally followed by
-#   a baseline path override:  10.0.0.1 /backups/r1.cfg
-#
-# Prerequisites:
-#   cpan install Net::SSH::Expect
-#   Credentials via ENV (NET_USER / NET_PASS) or --user / --password flags.
-#   Key-based auth works automatically if SSH keys are configured.
-# =============================================================================
+Writing the Perl Expect script now — a running-vs-startup config diff checker (distinct from the existing config_backup scripts which save configs).
 
+#!/usr/bin/perl
 use strict;
 use warnings;
-use Net::SSH::Expect;
+use Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($opt_host, $opt_file, $opt_baseline, $opt_baseline_dir, $opt_log);
-my $opt_user    = $ENV{NET_USER} // 'admin';
-my $opt_pass    = $ENV{NET_PASS} // '';
-my $opt_timeout = 30;
+# =============================================================================
+# startup_running_diff.pl - Detect unsaved configuration changes on Cisco IOS
+#
+# PURPOSE:
+#   Connects to one or more Cisco IOS devices and compares running-config
+#   to startup-config. Reports which devices have uncommitted changes that
+#   would be lost on reboot. Useful before maintenance windows, planned
+#   reboots, or as a nightly hygiene check.
+#
+# USAGE:
+#   ./startup_running_diff.pl -H 192.168.1.1 -u admin -p secret
+#   ./startup_running_diff.pl -f devices.txt -u admin -p secret -l diff.log
+#   ./startup_running_diff.pl -H 10.0.0.1,10.0.0.2 -u admin -p secret
+#
+# OPTIONS:
+#   -H  Comma-separated list of device IPs/hostnames
+#   -f  File containing one device per line (# = comment)
+#   -u  SSH username
+#   -p  SSH password
+#   -e  Enable password (optional, for privilege escalation)
+#   -l  Log file path (appends; default: stdout only)
+#   -t  Timeout in seconds (default: 30)
+#
+# PREREQUISITES:
+#   cpan Expect
+#   Cisco IOS devices with SSH enabled, privilege 15 access recommended
+# =============================================================================
+
+my ($host_arg, $device_file, $username, $password, $enable_pass, $log_file);
+my $timeout = 30;
 
 GetOptions(
-    'host=s'         => \$opt_host,
-    'file=s'         => \$opt_file,
-    'baseline=s'     => \$opt_baseline,
-    'baseline-dir=s' => \$opt_baseline_dir,
-    'log=s'          => \$opt_log,
-    'user=s'         => \$opt_user,
-    'password=s'     => \$opt_pass,
-    'timeout=i'      => \$opt_timeout,
-) or die "Usage: $0 --host <ip> --baseline <file> [options]\n";
+    'H=s' => \$host_arg,
+    'f=s' => \$device_file,
+    'u=s' => \$username,
+    'p=s' => \$password,
+    'e=s' => \$enable_pass,
+    'l=s' => \$log_file,
+    't=i' => \$timeout,
+) or die "Usage: $0 -H host[,host] | -f file -u user -p pass [-e enable] [-l log] [-t sec]\n";
 
-die "Specify --host or --file\n" unless $opt_host || $opt_file;
+die "Provide -H or -f\n"    unless $host_arg || $device_file;
+die "Username required (-u)\n" unless $username;
+die "Password required (-p)\n" unless $password;
 
-my $log_fh;
-if ($opt_log) {
-    open($log_fh, '>>', $opt_log) or die "Cannot open log '$opt_log': $!\n";
+my @devices;
+push @devices, split(/,/, $host_arg) if $host_arg;
+if ($device_file) {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_; }
+    close $fh;
 }
 
-sub emit {
-    my $msg = shift;
+my $log_fh;
+if ($log_file) {
+    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
+}
+
+sub log_out {
+    my ($msg) = @_;
     print $msg;
     print $log_fh $msg if $log_fh;
 }
 
-sub fetch_running_config {
-    my ($host) = @_;
+sub get_config {
+    my ($exp, $cmd, $prompt) = @_;
+    $exp->send("$cmd\n");
+    my @lines;
+    while (1) {
+        my $pos = $exp->expect($timeout, [$prompt, sub { last }], ['-re', '-- More --', sub { $exp->send(' '); 1 }]);
+        last unless defined $pos && $pos == 2;
+    }
+    my $out = $exp->before() // '';
+    return grep { !/^\s*$/ && !/^Building configuration/ && !/^Current configuration/ && !/^!.*Last configuration change/ && !/^! Last/ && !/^ntp clock-period/ } split(/\r?\n/, $out);
+}
 
-    my $ssh = Net::SSH::Expect->new(
-        host     => $host,
-        user     => $opt_user,
-        password => $opt_pass,
-        raw_pty  => 1,
-        timeout  => $opt_timeout,
+my $ts      = strftime('%Y-%m-%d %H:%M:%S', localtime);
+my $summary = { clean => [], dirty => [], failed => [] };
+
+log_out("=" x 60 . "\n");
+log_out("Startup vs Running Config Diff Check  $ts\n");
+log_out("=" x 60 . "\n\n");
+
+for my $device (@devices) {
+    log_out("[$device] Connecting...\n");
+
+    my $exp = Expect->new();
+    $exp->raw_pty(1);
+    $exp->log_stdout(0);
+
+    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${username}\@${device}")) {
+        log_out("[$device] ERROR: spawn failed\n\n");
+        push @{$summary->{failed}}, $device;
+        next;
+    }
+
+    my $res = $exp->expect($timeout,
+        [qr/[Pp]assword:/,         sub { $exp->send("$password\n"); exp_continue; }],
+        [qr/yes\/no/,              sub { $exp->send("yes\n");       exp_continue; }],
+        [qr/[>#]/,                 sub { 1 }],
+        [qr/Connection refused/,   sub { 0 }],
+        [qr/No route to host/,     sub { 0 }],
+        ['timeout',                sub { 0 }],
     );
 
-    eval { $ssh->login() };
-    die "Login failed: $@\n" if $@;
+    unless (defined $res && $res == 1) {
+        log_out("[$device] ERROR: connection or auth failed\n\n");
+        push @{$summary->{failed}}, $device;
+        $exp->soft_close();
+        next;
+    }
 
-    $ssh->exec("terminal length 0");
-    my $raw = $ssh->exec("show running-config");
-    $ssh->close();
+    $exp->send("terminal length 0\n");
+    $exp->expect($timeout, qr/[>#]/);
 
-    # Drop prompt lines and blank lines; keep config body
-    my @lines = grep { $_ !~ /^[\w\-]+[>#]/ && $_ =~ /\S/ } split(/\n/, $raw);
-    return \@lines;
+    if ($enable_pass && $exp->before() =~ /\>$/) {
+        $exp->send("enable\n");
+        $exp->expect($timeout, qr/[Pp]assword:/);
+        $exp->send("$enable_pass\n");
+        $exp->expect($timeout, qr/#/);
+    }
+
+    my $prompt = qr/[\w\-]+[>#]/;
+
+    my @running  = get_config($exp, 'show running-config',  $prompt);
+    my @startup  = get_config($exp, 'show startup-config',  $prompt);
+
+    $exp->send("exit\n");
+    $exp->soft_close();
+
+    my %run_set  = map { $_ => 1 } @running;
+    my %start_set = map { $_ => 1 } @startup;
+    my @only_run   = grep { !$start_set{$_} } @running;
+    my @only_start = grep { !$run_set{$_}   } @startup;
+
+    if (@only_run == 0 && @only_start == 0) {
+        log_out("[$device] CLEAN — running matches startup\n\n");
+        push @{$summary->{clean}}, $device;
+    } else {
+        log_out("[$device] UNSAVED CHANGES (+run/-start): " . scalar(@only_run) . " added, " . scalar(@only_start) . " removed\n");
+        log_out("  + $_\n") for (sort @only_run)[0..([scalar(@only_run)-1, 9]->[$#_[0] < 10 ? 0 : 1])];
+        log_out("  - $_\n") for (sort @only_start)[0..([scalar(@only_start)-1, 9]->[$#_[0] < 10 ? 0 : 1])];
+        log_out("  (showing up to 10 lines per side)\n") if @only_run > 10 || @only_start > 10;
+        log_out("\n");
+        push @{$summary->{dirty}}, $device;
+    }
 }
 
-sub diff_configs {
-    my ($host, $current_lines, $baseline_path) = @_;
+log_out("=" x 60 . "\n");
+log_out(sprintf("SUMMARY: %d clean, %d unsaved, %d failed  (total: %d)\n",
+    scalar @{$summary->{clean}}, scalar @{$summary->{dirty}},
+    scalar @{$summary->{failed}}, scalar @devices));
+log_out("  Unsaved: " . join(', ', @{$summary->{dirty}})  . "\n") if @{$summary->{dirty}};
+log_out("  Failed:  " . join(', ', @{$summary->{failed}}) . "\n") if @{$summary->{failed}};
+log_out("=" x 60 . "\n");
 
-    unless (-f $baseline_path) {
-        emit("  [SKIP]  No baseline at $baseline_path\n");
-        return 0;
-    }
-
-    open(my $fh, '<', $baseline_path) or die "Cannot read baseline '$baseline_path': $!\n";
-    my @baseline = grep { /\S/ } <$fh>;
-    close($fh);
-    chomp @baseline;
-
-    # Noise patterns: cert blocks, timestamps, counters — not meaningful for drift
-    my $noise = qr/^(?:Building config|Current config|Last config|
-                       ntp\s+clock-period|\s*[0-9A-F]{2}(?:\s+[0-9A-F]{2})+|\s*quit)/x;
-
-    my %base_set; $base_set{$_}++ for @baseline;
-    my %curr_set; $curr_set{$_}++ for @$current_lines;
-
-    my @added   = grep { !$base_set{$_} && !/$noise/ } @$current_lines;
-    my @removed = grep { !$curr_set{$_} && !/$noise/ } @baseline;
-
-    if (@added || @removed) {
-        emit("  [DRIFT] $host — " . scalar(@added) . " added, " . scalar(@removed) . " removed\n");
-        emit("    + $_\n") for @added;
-        emit("    - $_\n") for @removed;
-        return 1;
-    }
-
-    emit("  [OK]    $host matches baseline\n");
-    return 0;
-}
-
-sub check_device {
-    my ($host, $bl_override) = @_;
-
-    emit("Checking $host ... ");
-
-    my $bl_path = $bl_override
-        // ($opt_baseline_dir ? "$opt_baseline_dir/${host}.cfg" : $opt_baseline);
-
-    unless ($bl_path) {
-        emit("[ERROR] no baseline path for $host\n");
-        return 0;
-    }
-
-    my $current;
-    eval { $current = fetch_running_config($host) };
-    if ($@) {
-        emit("[ERROR] $@");
-        return 0;
-    }
-
-    return diff_configs($host, $current, $bl_path);
-}
-
-# Build target list
-my @targets;
-if ($opt_host) {
-    push @targets, [ $opt_host, $opt_baseline ];
-} else {
-    open(my $fh, '<', $opt_file) or die "Cannot open device file '$opt_file': $!\n";
-    while (<$fh>) {
-        chomp; s/#.*//; s/^\s+|\s+$//g; next unless /\S/;
-        my ($dev, $bl) = split(/\s+/, $_, 2);
-        push @targets, [ $dev, $bl ];
-    }
-    close($fh);
-}
-
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-emit("=== Config Drift Check — $ts | " . scalar(@targets) . " device(s) ===\n");
-
-my $drifted = 0;
-$drifted += check_device(@$_) for @targets;
-
-emit("\n=== Result: $drifted/" . scalar(@targets) . " device(s) have configuration drift ===\n");
-close($log_fh) if $log_fh;
-exit($drifted > 0 ? 1 : 0);
-```
+close $log_fh if $log_fh;
+exit(scalar @{$summary->{dirty}} > 0 ? 1 : 0);
