@@ -1,167 +1,212 @@
-Writing the Perl Expect script now — a running-vs-startup config diff checker (distinct from the existing config_backup scripts which save configs).
-
+```perl
 #!/usr/bin/perl
+=pod
+=head1 NAME
+
+device_health_monitor.pl - Network Device System Health Monitoring Tool
+
+=head1 DESCRIPTION
+
+Connects to network devices via SSH and collects real-time system health metrics
+including CPU utilization, memory usage, uptime, and temperature. Supports both
+Cisco IOS and NX-OS platforms. Generates health status reports with alerting
+for critical thresholds.
+
+=head1 USAGE
+
+./device_health_monitor.pl [--device IP] [--file device_list.txt] [--log output.log]
+
+Examples:
+  ./device_health_monitor.pl --device 10.0.0.1
+  ./device_health_monitor.pl --file devices.txt --log health.log
+
+=head1 PREREQUISITES
+
+Perl modules: Net::SSH::Expect
+SSH access to devices with appropriate credentials
+Devices must support: show processes cpu, show memory, show version, show env
+
+=head1 NOTES
+
+Uses environment variables DEVICE_USER and DEVICE_PASS for credentials.
+Defaults to admin/password if not set.
+
+=cut
+
 use strict;
 use warnings;
-use Expect;
+use Net::SSH::Expect;
 use Getopt::Long;
-use POSIX qw(strftime);
+use Time::Localtime;
 
-# =============================================================================
-# startup_running_diff.pl - Detect unsaved configuration changes on Cisco IOS
-#
-# PURPOSE:
-#   Connects to one or more Cisco IOS devices and compares running-config
-#   to startup-config. Reports which devices have uncommitted changes that
-#   would be lost on reboot. Useful before maintenance windows, planned
-#   reboots, or as a nightly hygiene check.
-#
-# USAGE:
-#   ./startup_running_diff.pl -H 192.168.1.1 -u admin -p secret
-#   ./startup_running_diff.pl -f devices.txt -u admin -p secret -l diff.log
-#   ./startup_running_diff.pl -H 10.0.0.1,10.0.0.2 -u admin -p secret
-#
-# OPTIONS:
-#   -H  Comma-separated list of device IPs/hostnames
-#   -f  File containing one device per line (# = comment)
-#   -u  SSH username
-#   -p  SSH password
-#   -e  Enable password (optional, for privilege escalation)
-#   -l  Log file path (appends; default: stdout only)
-#   -t  Timeout in seconds (default: 30)
-#
-# PREREQUISITES:
-#   cpan Expect
-#   Cisco IOS devices with SSH enabled, privilege 15 access recommended
-# =============================================================================
-
-my ($host_arg, $device_file, $username, $password, $enable_pass, $log_file);
-my $timeout = 30;
-
+my ($device, $file, $logfile, $help);
 GetOptions(
-    'H=s' => \$host_arg,
-    'f=s' => \$device_file,
-    'u=s' => \$username,
-    'p=s' => \$password,
-    'e=s' => \$enable_pass,
-    'l=s' => \$log_file,
-    't=i' => \$timeout,
-) or die "Usage: $0 -H host[,host] | -f file -u user -p pass [-e enable] [-l log] [-t sec]\n";
+    'device=s' => \$device,
+    'file=s'   => \$file,
+    'log=s'    => \$logfile,
+    'help|h'   => \$help,
+) or die "Error in command line arguments\n";
 
-die "Provide -H or -f\n"    unless $host_arg || $device_file;
-die "Username required (-u)\n" unless $username;
-die "Password required (-p)\n" unless $password;
+die usage() if $help || (!$device && !$file);
 
 my @devices;
-push @devices, split(/,/, $host_arg) if $host_arg;
-if ($device_file) {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_; }
+if ($device) {
+    push @devices, $device;
+} elsif ($file) {
+    open my $fh, '<', $file or die "Cannot open $file: $!\n";
+    @devices = grep { chomp; $_ && !/^\s*#/ } <$fh>;
     close $fh;
 }
 
-my $log_fh;
-if ($log_file) {
-    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
-}
+my $timestamp = scalar(localtime);
+my $report = "\n" . "="x70 . "\n";
+$report .= "Device Health Monitoring Report - $timestamp\n";
+$report .= "="x70 . "\n\n";
 
-sub log_out {
-    my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
-}
+my $critical_count = 0;
 
-sub get_config {
-    my ($exp, $cmd, $prompt) = @_;
-    $exp->send("$cmd\n");
-    my @lines;
-    while (1) {
-        my $pos = $exp->expect($timeout, [$prompt, sub { last }], ['-re', '-- More --', sub { $exp->send(' '); 1 }]);
-        last unless defined $pos && $pos == 2;
-    }
-    my $out = $exp->before() // '';
-    return grep { !/^\s*$/ && !/^Building configuration/ && !/^Current configuration/ && !/^!.*Last configuration change/ && !/^! Last/ && !/^ntp clock-period/ } split(/\r?\n/, $out);
-}
-
-my $ts      = strftime('%Y-%m-%d %H:%M:%S', localtime);
-my $summary = { clean => [], dirty => [], failed => [] };
-
-log_out("=" x 60 . "\n");
-log_out("Startup vs Running Config Diff Check  $ts\n");
-log_out("=" x 60 . "\n\n");
-
-for my $device (@devices) {
-    log_out("[$device] Connecting...\n");
-
-    my $exp = Expect->new();
-    $exp->raw_pty(1);
-    $exp->log_stdout(0);
-
-    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${username}\@${device}")) {
-        log_out("[$device] ERROR: spawn failed\n\n");
-        push @{$summary->{failed}}, $device;
+foreach my $dev (@devices) {
+    $dev =~ s/^\s+|\s+$//g;
+    next unless $dev;
+    
+    print "[$dev] Collecting health metrics... ";
+    my %health = collect_health($dev);
+    
+    if ($health{error}) {
+        print "ERROR\n";
+        $report .= "DEVICE: $dev\n";
+        $report .= "  STATUS: CONNECTION FAILED\n";
+        $report .= "  ERROR: $health{error}\n\n";
+        $critical_count++;
         next;
     }
+    
+    print "OK\n";
+    
+    $report .= "DEVICE: $dev\n";
+    $report .= "  Hostname: $health{hostname}\n";
+    $report .= "  Uptime: $health{uptime}\n";
+    $report .= "  CPU 5-sec: $health{cpu_5sec}% ";
+    $report .= $health{cpu_5sec} > 80 ? "[CRITICAL]" : "";
+    $report .= "\n";
+    $report .= "  Memory Used: $health{memory_used}MB / $health{memory_total}MB ";
+    my $mem_pct = int(($health{memory_used} / $health{memory_total}) * 100);
+    $report .= "($mem_pct%) ";
+    $report .= $mem_pct > 85 ? "[WARNING]" : "";
+    $report .= "\n";
+    
+    if ($health{temperature}) {
+        $report .= "  Temperature: $health{temperature}C ";
+        $report .= $health{temperature} > 60 ? "[WARNING]" : "";
+        $report .= "\n";
+    }
+    
+    my $health_status = "HEALTHY";
+    $health_status = "WARNING" if ($health{cpu_5sec} > 70 || $mem_pct > 75);
+    $health_status = "CRITICAL" if ($health{cpu_5sec} > 85 || $mem_pct > 90);
+    
+    $report .= "  OVERALL STATUS: $health_status\n\n";
+    $critical_count++ if $health_status eq "CRITICAL";
+}
 
-    my $res = $exp->expect($timeout,
-        [qr/[Pp]assword:/,         sub { $exp->send("$password\n"); exp_continue; }],
-        [qr/yes\/no/,              sub { $exp->send("yes\n");       exp_continue; }],
-        [qr/[>#]/,                 sub { 1 }],
-        [qr/Connection refused/,   sub { 0 }],
-        [qr/No route to host/,     sub { 0 }],
-        ['timeout',                sub { 0 }],
+$report .= "="x70 . "\n";
+$report .= "Summary: " . scalar(@devices) . " device(s) monitored, ";
+$report .= "$critical_count critical\n";
+
+print $report;
+
+if ($logfile) {
+    open my $fh, '>', $logfile or die "Cannot write to $logfile: $!\n";
+    print $fh $report;
+    close $fh;
+    print "\nReport saved to $logfile\n";
+}
+
+sub collect_health {
+    my ($host) = @_;
+    my %health = (
+        hostname     => "",
+        uptime       => "",
+        cpu_5sec     => 0,
+        memory_used  => 0,
+        memory_total => 0,
+        temperature  => 0,
     );
-
-    unless (defined $res && $res == 1) {
-        log_out("[$device] ERROR: connection or auth failed\n\n");
-        push @{$summary->{failed}}, $device;
-        $exp->soft_close();
-        next;
+    
+    my $user = $ENV{DEVICE_USER} || 'admin';
+    my $pass = $ENV{DEVICE_PASS} || 'password';
+    
+    my $ssh = Net::SSH::Expect->new(
+        host    => $host,
+        user    => $user,
+        password => $pass,
+        timeout => 15,
+        raw_pty => 1,
+    );
+    
+    eval {
+        my $login = $ssh->login();
+        die "Login failed" if !$login || $login =~ /error|failed|denied/i;
+        
+        $ssh->send("terminal length 0");
+        $ssh->waitfor('>', 2);
+        
+        # Get hostname and uptime
+        $ssh->send("show version | include uptime|System uptime");
+        my $version = $ssh->read_till('>', 3);
+        ($health{uptime}) = $version =~ /uptime is (.+)/i;
+        
+        # Get CPU
+        $ssh->send("show processes cpu | include CPU|utilization");
+        my $cpu_out = $ssh->read_till('>', 3);
+        ($health{cpu_5sec}) = $cpu_out =~ /5\s+sec:\s+(\d+)%/i;
+        
+        # Get memory
+        $ssh->send("show memory | include Memory");
+        my $mem_out = $ssh->read_till('>', 3);
+        if ($mem_out =~ /(\d+)\s+bytes\s+total\s+\((.+?)\).+?(\d+)\s+bytes\s+free/i) {
+            $health{memory_total} = int($1 / (1024*1024));
+            $health{memory_used} = $health{memory_total} - int($3 / (1024*1024));
+        }
+        
+        # Get temperature (if available)
+        $ssh->send("show env temperature | include Temp");
+        my $temp_out = $ssh->read_till('>', 3);
+        ($health{temperature}) = $temp_out =~ /(\d+)\s*°?C/i;
+        
+        $ssh->close();
+    };
+    
+    if ($@) {
+        $health{error} = $@;
     }
-
-    $exp->send("terminal length 0\n");
-    $exp->expect($timeout, qr/[>#]/);
-
-    if ($enable_pass && $exp->before() =~ /\>$/) {
-        $exp->send("enable\n");
-        $exp->expect($timeout, qr/[Pp]assword:/);
-        $exp->send("$enable_pass\n");
-        $exp->expect($timeout, qr/#/);
-    }
-
-    my $prompt = qr/[\w\-]+[>#]/;
-
-    my @running  = get_config($exp, 'show running-config',  $prompt);
-    my @startup  = get_config($exp, 'show startup-config',  $prompt);
-
-    $exp->send("exit\n");
-    $exp->soft_close();
-
-    my %run_set  = map { $_ => 1 } @running;
-    my %start_set = map { $_ => 1 } @startup;
-    my @only_run   = grep { !$start_set{$_} } @running;
-    my @only_start = grep { !$run_set{$_}   } @startup;
-
-    if (@only_run == 0 && @only_start == 0) {
-        log_out("[$device] CLEAN — running matches startup\n\n");
-        push @{$summary->{clean}}, $device;
-    } else {
-        log_out("[$device] UNSAVED CHANGES (+run/-start): " . scalar(@only_run) . " added, " . scalar(@only_start) . " removed\n");
-        log_out("  + $_\n") for (sort @only_run)[0..([scalar(@only_run)-1, 9]->[$#_[0] < 10 ? 0 : 1])];
-        log_out("  - $_\n") for (sort @only_start)[0..([scalar(@only_start)-1, 9]->[$#_[0] < 10 ? 0 : 1])];
-        log_out("  (showing up to 10 lines per side)\n") if @only_run > 10 || @only_start > 10;
-        log_out("\n");
-        push @{$summary->{dirty}}, $device;
-    }
+    
+    return %health;
 }
 
-log_out("=" x 60 . "\n");
-log_out(sprintf("SUMMARY: %d clean, %d unsaved, %d failed  (total: %d)\n",
-    scalar @{$summary->{clean}}, scalar @{$summary->{dirty}},
-    scalar @{$summary->{failed}}, scalar @devices));
-log_out("  Unsaved: " . join(', ', @{$summary->{dirty}})  . "\n") if @{$summary->{dirty}};
-log_out("  Failed:  " . join(', ', @{$summary->{failed}}) . "\n") if @{$summary->{failed}};
-log_out("=" x 60 . "\n");
+sub usage {
+    return <<'EOF';
+Usage: device_health_monitor.pl [OPTIONS]
 
-close $log_fh if $log_fh;
-exit(scalar @{$summary->{dirty}} > 0 ? 1 : 0);
+OPTIONS:
+  --device IP          Target device IP or hostname
+  --file FILE          File containing device list (one per line)
+  --log FILE           Save report to file
+  --help               Display this help message
+
+ENVIRONMENT VARIABLES:
+  DEVICE_USER          SSH username (default: admin)
+  DEVICE_PASS          SSH password (default: password)
+
+EXAMPLES:
+  ./device_health_monitor.pl --device 192.168.1.1
+  ./device_health_monitor.pl --file devices.txt --log report.txt
+
+THRESHOLDS:
+  CPU Warning:  > 70%  |  Critical: > 85%
+  Memory Warning: > 75%  |  Critical: > 90%
+  Temperature Warning: > 60C
+
+EOF
+}
+```
