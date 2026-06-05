@@ -1,168 +1,123 @@
+```perl
 #!/usr/bin/perl
 #
-# cdp_lldp_neighbors.pl - CDP/LLDP Neighbor Discovery and Topology Mapper
+# hardware_health.pl - Collect CPU, memory, and environmental health metrics
+#                      from Cisco IOS/IOS-XE devices via SSH
 #
 # Purpose:
-#   Connects to Cisco IOS/IOS-XE devices via SSH and collects CDP and LLDP
-#   neighbor adjacencies. Use this to document physical topology, validate
-#   cabling after maintenance, or discover unexpected devices on the network.
-#   Distinct from inventory_collection (hardware/SW info) -- this maps
-#   port-to-port links between devices.
+#   Polls CPU utilization, memory usage, temperature sensors, power supplies,
+#   and fan status. Designed for routine health checks and pre/post-change
+#   baselines. Distinct from inventory_collection (platform/version data).
 #
 # Usage:
-#   ./cdp_lldp_neighbors.pl -h 10.0.0.1 -u admin -p secret [-l neighbors.log]
-#   ./cdp_lldp_neighbors.pl -f hosts.txt  -u admin -p secret [-l neighbors.log]
-#
-#   hosts.txt: one IP or hostname per line, # for comments
+#   Single device:  perl hardware_health.pl -h 192.168.1.1
+#   Multiple hosts: perl hardware_health.pl -f hosts.txt
+#   With logging:   perl hardware_health.pl -h 192.168.1.1 -o /var/log/health/
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect Getopt::Long
-#   SSH access to devices (port 22), CDP and/or LLDP enabled
+#   cpan Net::SSH::Expect
+#   SSH access with at least privilege 1 (show commands only)
+#   Environment: SSH_USER and SSH_PASS env vars, or use -u/-p flags
 #
-# Output:
-#   Per-device table of local port -> remote device/port/platform adjacencies
-#
+# Author: Erik Anderson
+# Tested: Cisco IOS 15.x, IOS-XE 16.x/17.x
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Std;
 use POSIX qw(strftime);
 
-my ($host, $hosts_file, $username, $password, $logfile);
-my $timeout = 30;
+my %opts;
+getopts('h:f:u:p:o:', \%opts);
 
-GetOptions(
-    'h|host=s'    => \$host,
-    'f|file=s'    => \$hosts_file,
-    'u|user=s'    => \$username,
-    'p|pass=s'    => \$password,
-    'l|log=s'     => \$logfile,
-    't|timeout=i' => \$timeout,
-) or die "Usage: $0 -h <host>|-f <file> -u <user> -p <pass> [-l <logfile>] [-t <secs>]\n";
+my $user    = $opts{u} || $ENV{SSH_USER} || 'admin';
+my $pass    = $opts{p} || $ENV{SSH_PASS} or die "Password required: set SSH_PASS or use -p\n";
+my $logdir  = $opts{o};
+my @hosts;
 
-die "Provide -h <host> or -f <file>\n"  unless $host || $hosts_file;
-die "Username required (-u)\n"          unless $username;
-die "Password required (-p)\n"          unless $password;
-
-my @targets;
-if ($hosts_file) {
-    open(my $fh, '<', $hosts_file) or die "Cannot open $hosts_file: $!\n";
+if ($opts{h}) {
+    push @hosts, $opts{h};
+} elsif ($opts{f}) {
+    open my $fh, '<', $opts{f} or die "Cannot open host file '$opts{f}': $!\n";
     while (<$fh>) {
-        chomp; s/#.*//; s/^\s+|\s+$//g;
-        push @targets, $_ if length $_;
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        push @hosts, $_;
     }
     close $fh;
 } else {
-    push @targets, $host;
+    die "Usage: $0 -h <host> | -f <hostfile> [-u user] [-p pass] [-o logdir]\n";
 }
 
-my $log_fh;
-if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log $logfile: $!\n";
-}
+my $timestamp = strftime('%Y%m%d_%H%M%S', localtime);
 
-sub emit {
-    my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
-}
+for my $host (@hosts) {
+    print "\n=== $host [$timestamp] ===\n";
 
-sub parse_cdp {
-    my ($output) = @_;
-    return unless $output && $output !~ /not enabled|invalid input/i;
-
-    emit(sprintf("\n  %-24s %-32s %-22s %s\n",
-        "Local Port", "Remote Device", "Remote Port", "Platform"));
-    emit("  " . "-" x 86 . "\n");
-
-    my ($lport, $rdev, $rport, $plat);
-    for my $line (split /\n/, $output) {
-        if    ($line =~ /^Device ID:\s*(\S+)/)                         { $rdev  = $1 }
-        elsif ($line =~ /Interface:\s*(\S+),\s*Port ID[^:]*:\s*(\S+)/) { $lport = $1; $rport = $2 }
-        elsif ($line =~ /Platform:\s*([^,]+)/)                         { ($plat = $1) =~ s/\s+$// }
-
-        if ($lport && $rdev && $rport) {
-            emit(sprintf("  %-24s %-32s %-22s %s\n",
-                $lport, $rdev, $rport, $plat // 'unknown'));
-            ($lport, $rdev, $rport, $plat) = (undef) x 4;
-        }
+    my $log_fh;
+    if ($logdir) {
+        my $logfile = "$logdir/${host}_health_${timestamp}.log";
+        open $log_fh, '>', $logfile or warn "Cannot write log '$logfile': $!\n";
     }
-}
 
-sub parse_lldp {
-    my ($output) = @_;
-    return unless $output && $output !~ /not enabled|invalid input|LLDP is not/i;
-
-    emit(sprintf("\n  %-24s %-32s %s\n", "Local Port", "Remote System", "Remote Port"));
-    emit("  " . "-" x 78 . "\n");
-
-    my ($lport, $rsys, $rport);
-    for my $line (split /\n/, $output) {
-        if    ($line =~ /Local Intf:\s*(\S+)/)  { $lport = $1 }
-        elsif ($line =~ /System Name:\s*(.+)/)  { ($rsys  = $1) =~ s/\s+$// }
-        elsif ($line =~ /Port id:\s*(.+)/)       { ($rport = $1) =~ s/\s+$// }
-
-        if ($lport && $rsys && $rport) {
-            emit(sprintf("  %-24s %-32s %s\n", $lport, $rsys, $rport));
-            ($lport, $rsys, $rport) = (undef) x 3;
-        }
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host        => $host,
+            user        => $user,
+            password    => $pass,
+            ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+            raw_pty     => 1,
+            timeout     => 15,
+        );
+    };
+    if ($@ || !$ssh) {
+        my $err = "ERROR: Cannot create SSH session to $host: $@";
+        print "$err\n";
+        print $log_fh "$err\n" if $log_fh;
+        next;
     }
-}
 
-sub collect_neighbors {
-    my ($target) = @_;
+    my $login = eval { $ssh->login() };
+    if ($@ || !defined $login) {
+        my $err = "ERROR: Authentication failed for $host (user=$user)";
+        print "$err\n";
+        print $log_fh "$err\n" if $log_fh;
+        next;
+    }
 
-    my $ssh = Net::SSH::Expect->new(
-        host       => $target,
-        user       => $username,
-        password   => $password,
-        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=15',
-        timeout    => $timeout,
-        raw_pty    => 1,
+    $ssh->send('terminal length 0');
+    $ssh->waitfor('\$\s*#', 5);
+
+    my @commands = (
+        ['CPU Utilization',   'show processes cpu sorted | head 15'],
+        ['Memory Utilization','show processes memory sorted | head 10'],
+        ['Environment',       'show environment all'],
     );
 
-    eval { $ssh->login() };
-    if ($@) {
-        emit("ERROR [$target]: SSH login failed -- $@\n");
-        return;
+    for my $cmd_pair (@commands) {
+        my ($label, $cmd) = @$cmd_pair;
+        $ssh->send($cmd);
+        my $output = eval { $ssh->waitfor('\S+#\s*$', 20, '-re') };
+        if ($@) {
+            my $msg = "TIMEOUT running '$cmd' on $host";
+            print "  [$label] $msg\n";
+            print $log_fh "[$label] $msg\n" if $log_fh;
+            next;
+        }
+
+        $output =~ s/^\Q$cmd\E\r?\n//;
+        $output =~ s/\S+#\s*$//;
+        $output =~ s/\r//g;
+        $output =~ s/^\s+|\s+$//g;
+
+        my $section = "[$label]\n$output\n";
+        print "$section\n";
+        print $log_fh "$section\n" if $log_fh;
     }
 
-    $ssh->exec("terminal length 0");
-
-    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-    emit("\n" . "=" x 90 . "\n");
-    emit("Device: $target    Collected: $ts\n");
-    emit("=" x 90 . "\n");
-
-    my $cdp = $ssh->exec("show cdp neighbors detail");
-    if ($cdp && $cdp =~ /Device ID/i) {
-        emit("CDP Neighbors:\n");
-        parse_cdp($cdp);
-    } else {
-        emit("CDP: not available or no neighbors\n");
-    }
-
-    my $lldp = $ssh->exec("show lldp neighbors detail");
-    if ($lldp && $lldp =~ /Local Intf/i) {
-        emit("\nLLDP Neighbors:\n");
-        parse_lldp($lldp);
-    } else {
-        emit("LLDP: not available or no neighbors\n");
-    }
-
-    $ssh->close();
+    $ssh->send('exit');
+    close $log_fh if $log_fh;
+    print "--- done ---\n";
 }
-
-my $start = strftime("%Y-%m-%d %H:%M:%S", localtime);
-emit("CDP/LLDP Neighbor Discovery  |  $start  |  Targets: " . scalar(@targets) . "\n");
-
-for my $target (@targets) {
-    collect_neighbors($target);
-}
-
-emit("\n" . "=" x 90 . "\n");
-emit("Scan complete: " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n");
-
-close $log_fh if $log_fh;
-exit 0;
+```
