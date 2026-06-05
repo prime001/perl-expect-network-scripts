@@ -1,28 +1,27 @@
-```perl
 #!/usr/bin/perl
 #
-# cdp_lldp_neighbors.pl - CDP/LLDP Neighbor Discovery and Topology Mapper
+# mac_table_collector.pl - Bulk MAC Address Table Collector
 #
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE/NX-OS devices via SSH and collects CDP and
-#   LLDP neighbor information to map adjacent devices. Useful for topology
-#   documentation, change validation, and troubleshooting unknown adjacencies.
+# PURPOSE:
+#   Connects to one or more Cisco IOS switches via SSH and collects the full
+#   MAC address table. Useful for device tracking, port security audits,
+#   locating rogue devices, and verifying post-change network state.
 #
-# Usage:
-#   Single device:   ./cdp_lldp_neighbors.pl -h 192.168.1.1 -u admin -p secret
-#   Device list:     ./cdp_lldp_neighbors.pl -f devices.txt -u admin -p secret
-#   With log file:   ./cdp_lldp_neighbors.pl -h 192.168.1.1 -u admin -p secret -l neighbors.log
-#   LLDP only:       ./cdp_lldp_neighbors.pl -h 192.168.1.1 -u admin -p secret --lldp
+# USAGE:
+#   Single device:  perl mac_table_collector.pl -h 192.168.1.1
+#   Device file:    perl mac_table_collector.pl -f switches.txt
+#   With logging:   perl mac_table_collector.pl -f switches.txt -l mac_audit.log
+#   Filter VLAN:    perl mac_table_collector.pl -h 192.168.1.1 -v 100
+#   Find MAC:       perl mac_table_collector.pl -f switches.txt -m 0050.7966.6800
 #
-# Prerequisites:
-#   - Perl modules: Net::SSH::Expect, Getopt::Long
-#   - SSH access to target devices
-#   - CDP or LLDP enabled on target devices
-#   - Install: cpan Net::SSH::Expect
+# PREREQUISITES:
+#   cpan Net::SSH::Expect Getopt::Long
+#   Credentials via environment: NET_USER, NET_PASS
+#   Cisco IOS switches with SSH enabled and 'ip ssh version 2'
 #
-# Output:
-#   Formatted neighbor table with local port, remote device, remote port,
-#   platform, and management IP per neighbor entry.
+# OUTPUT:
+#   DEVICE               VLAN   MAC                TYPE       PORT
+#   192.168.1.10         100    0050.7966.6800     DYNAMIC    Gi0/1
 #
 
 use strict;
@@ -31,147 +30,109 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host_arg, $device_file, $username, $password, $log_file, $use_lldp, $timeout);
-$timeout = 30;
+my ($opt_host, $opt_file, $opt_log, $opt_vlan, $opt_mac, $opt_timeout);
+$opt_timeout = 30;
 
 GetOptions(
-    'h|host=s'     => \$host_arg,
-    'f|file=s'     => \$device_file,
-    'u|user=s'     => \$username,
-    'p|pass=s'     => \$password,
-    'l|log=s'      => \$log_file,
-    'lldp'         => \$use_lldp,
-    't|timeout=i'  => \$timeout,
-) or die "Usage: $0 -h <host>|-f <file> -u <user> -p <pass> [-l logfile] [--lldp]\n";
+    'h|host=s'    => \$opt_host,
+    'f|file=s'    => \$opt_file,
+    'l|log=s'     => \$opt_log,
+    'v|vlan=i'    => \$opt_vlan,
+    'm|mac=s'     => \$opt_mac,
+    't|timeout=i' => \$opt_timeout,
+) or die "Usage: $0 [-h host|-f file] [-l log] [-v vlan] [-m mac] [-t timeout]\n";
 
-die "Provide -h <host> or -f <file>\n" unless $host_arg || $device_file;
-die "Username required (-u)\n" unless $username;
-die "Password required (-p)\n" unless $password;
+die "ERROR: Specify -h <host> or -f <file>\n" unless $opt_host || $opt_file;
 
-my @hosts = $host_arg ? ($host_arg) : ();
-if ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; push @hosts, $_ if /\S/ && !/^#/; }
+my $user = $ENV{NET_USER} or die "ERROR: Set NET_USER environment variable\n";
+my $pass = $ENV{NET_PASS} or die "ERROR: Set NET_PASS environment variable\n";
+
+my @devices;
+if ($opt_host) {
+    push @devices, $opt_host;
+} elsif ($opt_file) {
+    open(my $fh, '<', $opt_file) or die "ERROR: Cannot open $opt_file: $!\n";
+    while (<$fh>) {
+        chomp;
+        push @devices, $_ unless /^\s*$/ || /^#/;
+    }
     close $fh;
 }
 
+die "ERROR: No devices to process\n" unless @devices;
+
 my $log_fh;
-if ($log_file) {
-    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
+if ($opt_log) {
+    open($log_fh, '>', $opt_log) or die "ERROR: Cannot open log $opt_log: $!\n";
 }
 
-sub log_output {
-    my $msg = shift;
-    print $msg;
-    print $log_fh $msg if $log_fh;
+sub output {
+    my $line = shift;
+    print $line;
+    print $log_fh $line if $log_fh;
 }
 
-sub parse_cdp_neighbors {
-    my $output = shift;
-    my @neighbors;
-    my %entry;
+my $ts        = strftime("%Y-%m-%d %H:%M:%S", localtime);
+my $separator = "-" x 74 . "\n";
+my $header    = sprintf("%-20s %-6s %-18s %-10s %s\n", "DEVICE", "VLAN", "MAC", "TYPE", "PORT");
 
-    for my $line (split /\n/, $output) {
-        if ($line =~ /^Device ID:\s*(.+)/)        { %entry = (device => $1) }
-        elsif ($line =~ /IP address:\s*(\S+)/)     { $entry{mgmt_ip} //= $1 }
-        elsif ($line =~ /Platform:\s*([^,]+)/)     { $entry{platform} = $1 }
-        elsif ($line =~ /Interface:\s*(\S+),\s*Port ID.*?:\s*(\S+)/) {
-            $entry{local_port}  = $1;
-            $entry{remote_port} = $2;
-        }
-        elsif ($line =~ /^-{3,}/ && $entry{device}) {
-            push @neighbors, {%entry};
-            %entry = ();
-        }
-    }
-    push @neighbors, {%entry} if $entry{device};
-    return @neighbors;
-}
+output("MAC Address Table Collection - $ts\n");
+output($separator);
+output($header);
+output($separator);
 
-sub parse_lldp_neighbors {
-    my $output = shift;
-    my @neighbors;
-    my %entry;
+my ($total_entries, $total_errors) = (0, 0);
 
-    for my $line (split /\n/, $output) {
-        if ($line =~ /^Local Intf:\s*(\S+)/)           { %entry = (local_port => $1) }
-        elsif ($line =~ /System Name:\s*(.+)/)          { $entry{device} = $1 }
-        elsif ($line =~ /Port id:\s*(\S+)/)             { $entry{remote_port} = $1 }
-        elsif ($line =~ /System Description:\s*(.+)/)   { $entry{platform} = substr($1, 0, 40) }
-        elsif ($line =~ /Management Address:\s*(\S+)/)  { $entry{mgmt_ip} //= $1 }
-        elsif ($line =~ /^-{3,}/ && $entry{device}) {
-            push @neighbors, {%entry};
-            %entry = ();
-        }
-    }
-    push @neighbors, {%entry} if $entry{device};
-    return @neighbors;
-}
-
-my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
-log_output("=" x 70 . "\n");
-log_output("CDP/LLDP Neighbor Discovery  |  $timestamp\n");
-log_output("Protocol: " . ($use_lldp ? "LLDP" : "CDP") . "\n");
-log_output("=" x 70 . "\n\n");
-
-for my $host (@hosts) {
-    log_output("Device: $host\n");
-    log_output("-" x 70 . "\n");
-
+for my $device (@devices) {
     my $ssh = Net::SSH::Expect->new(
-        host        => $host,
-        user        => $username,
-        password    => $password,
-        timeout     => $timeout,
-        raw_pty     => 1,
+        host       => $device,
+        user       => $user,
+        password   => $pass,
+        raw_pty    => 1,
+        timeout    => $opt_timeout,
+        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=no',
     );
 
-    my $login_output;
-    eval { $login_output = $ssh->login() };
-    if ($@ || !defined $login_output) {
-        log_output("  ERROR: SSH connection failed to $host: $@\n\n");
-        next;
-    }
+    eval {
+        my $login = $ssh->login();
+        die "Authentication failed or unexpected prompt\n" unless $login =~ /[>#]/;
 
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('\S+[>#]', 5);
+        $ssh->exec("terminal length 0");
 
-    my $cmd = $use_lldp ? "show lldp neighbors detail" : "show cdp neighbors detail";
-    $ssh->send("$cmd\n");
-    my $output = $ssh->waitfor('\S+[>#]', $timeout);
+        my $cmd = $opt_vlan
+            ? "show mac address-table vlan $opt_vlan"
+            : "show mac address-table";
 
-    if (!defined $output || $output =~ /Invalid|Error|not enabled/i) {
-        log_output("  WARNING: Command failed or protocol not enabled on $host\n");
-        log_output("  Output: " . ($output // 'none') . "\n\n");
-        $ssh->close();
-        next;
-    }
+        my $output = $ssh->exec($cmd);
+        my $count = 0;
 
-    my @neighbors = $use_lldp ? parse_lldp_neighbors($output) : parse_cdp_neighbors($output);
-
-    if (!@neighbors) {
-        log_output("  No neighbors found.\n\n");
-    } else {
-        log_output(sprintf("  %-22s %-30s %-22s %-16s\n",
-            "LOCAL PORT", "NEIGHBOR DEVICE", "REMOTE PORT", "MGMT IP"));
-        log_output("  " . "-" x 92 . "\n");
-        for my $n (@neighbors) {
-            log_output(sprintf("  %-22s %-30s %-22s %-16s\n",
-                $n->{local_port}  // 'unknown',
-                $n->{device}      // 'unknown',
-                $n->{remote_port} // 'unknown',
-                $n->{mgmt_ip}     // 'n/a'));
-            log_output(sprintf("  %54s Platform: %s\n", '', $n->{platform} // 'unknown'))
-                if $n->{platform};
+        for my $line (split /\n/, $output) {
+            next unless $line =~ /^\s*(\d+)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(DYNAMIC|STATIC|dynamic|static)\s+(\S+)/i;
+            my ($vlan, $mac, $type, $port) = ($1, $2, uc($3), $4);
+            next if $opt_mac && lc($mac) ne lc($opt_mac);
+            output(sprintf("%-20s %-6s %-18s %-10s %s\n", $device, $vlan, $mac, $type, $port));
+            $count++;
+            $total_entries++;
         }
-        log_output("\n  Total neighbors: " . scalar(@neighbors) . "\n");
-    }
 
-    $ssh->send("exit\n");
-    $ssh->close();
-    log_output("\n");
+        output(sprintf("  [%-18s] %d entr%s\n", $device, $count, $count == 1 ? "y" : "ies"));
+        $ssh->exec("exit");
+    };
+
+    if ($@) {
+        my $err = $@;
+        chomp $err;
+        print STDERR "  [$device] ERROR: $err\n";
+        print $log_fh "  [$device] ERROR: $err\n" if $log_fh;
+        $total_errors++;
+    }
 }
 
-log_output("Run complete.\n");
+output($separator);
+output(sprintf("Devices: %d | Entries: %d | Errors: %d\n",
+    scalar(@devices), $total_entries, $total_errors));
+
 close $log_fh if $log_fh;
-```
+print "Log written to $opt_log\n" if $opt_log;
+
+exit($total_errors > 0 ? 1 : 0);
