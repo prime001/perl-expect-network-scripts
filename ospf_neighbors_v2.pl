@@ -3,171 +3,158 @@ use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use Time::HiRes qw(time);
-use File::Spec;
+use POSIX qw(strftime);
 
-=head1 DEVICE HEALTH MONITOR
+# ospf_lsdb_audit.pl - OSPF Link State Database audit tool
+#
+# Purpose:
+#   Audits the OSPF LSDB on Cisco IOS/IOS-XE routers, checking for stale LSAs
+#   (age approaching MaxAge 3600s), LSA counts per area, and type-7 to type-5
+#   redistribution. Complements ospf_neighbors.pl by validating database health
+#   rather than adjacency state.
+#
+# Usage:
+#   ospf_lsdb_audit.pl --host <ip> --user <user> --pass <pass> [--log <file>]
+#   ospf_lsdb_audit.pl --file <device_list.txt> [--log <file>]
+#
+# Prerequisites:
+#   cpan Net::SSH::Expect
+#   SSH enabled on device; user needs at minimum 'show' privilege level
+#
+# Output:
+#   Table of LSA counts, stale LSA warnings, and per-area summary to STDOUT.
+#   Optionally mirrors to a log file with timestamps.
 
-Purpose:
-  Monitor critical device health metrics: CPU, memory, uptime, interface status
-  Useful for rapid health assessment across network infrastructure
-
-Usage:
-  ./device_health_monitor.pl --device 192.168.1.1 --user admin --pass password
-  ./device_health_monitor.pl --file devices.txt --user admin --pass password --log health.log
-
-Prerequisites:
-  - Net::SSH::Expect module (cpan Net::SSH::Expect)
-  - SSH access to network devices
-  - Device support for: show system, show interfaces, show processes (vendor-specific)
-  - Devices running IOS/IOS-XE/NXOS
-
-Options:
-  --device <ip>     Target device IP or hostname
-  --file <path>     File with device list (one per line)
-  --user <user>     SSH username
-  --pass <pass>     SSH password (or use expect)
-  --port <port>     SSH port (default: 22)
-  --timeout <sec>   Connection timeout in seconds (default: 10)
-  --log <path>      Log file for results
-  --verbose         Show command output details
-
-=cut
-
-my ($device, $device_file, $username, $password, $port, $timeout, $log_file, $verbose);
+my ($host, $user, $pass, $device_file, $log_file);
+my $timeout = 15;
+my $stale_threshold = 3000;  # warn when LSA age exceeds this (seconds before MaxAge)
 
 GetOptions(
-    'device=s'   => \$device,
-    'file=s'     => \$device_file,
-    'user=s'     => \$username,
-    'pass=s'     => \$password,
-    'port=i'     => \$port,
-    'timeout=i'  => \$timeout,
-    'log=s'      => \$log_file,
-    'verbose!'   => \$verbose,
-) or die "Error in command line arguments\n";
+    'host=s'   => \$host,
+    'user=s'   => \$user,
+    'pass=s'   => \$pass,
+    'file=s'   => \$device_file,
+    'log=s'    => \$log_file,
+    'timeout=i' => \$timeout,
+) or die "Usage: $0 --host <ip> --user <user> --pass <pass> [--log <file>]\n"
+       . "       $0 --file <device_list.txt> [--log <file>]\n";
 
-$port //= 22;
-$timeout //= 10;
-die "Usage: $0 --device <ip> | --file <path> --user <user> --pass <password>\n"
-    unless ($device || $device_file) && $username;
+die "Provide --host or --file\n" unless $host || $device_file;
+die "Provide --user and --pass when using --host\n"
+    if $host && (!$user || !$pass);
 
-open my $log_fh, '>>', $log_file or warn "Cannot open log: $log_file\n"
-    if $log_file;
-
-sub log_output {
-    my ($msg) = @_;
-    print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
+my $LOG;
+if ($log_file) {
+    open($LOG, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
+    $LOG->autoflush(1);
 }
 
-sub check_device {
-    my ($host, $user, $pass, $port, $timeout) = @_;
-    my $timestamp = scalar localtime();
-    
-    log_output("\n[${timestamp}] Checking device: $host");
-    
-    my $ssh;
-    eval {
-        $ssh = Net::SSH::Expect->new(
-            host     => $host,
-            user     => $user,
-            password => $pass,
-            port     => $port,
-            timeout  => $timeout,
-            raw_pty  => 1,
-        );
-        $ssh->login();
-    };
-    
-    if ($@) {
-        log_output("  ERROR: Connection failed - $@");
-        return 0;
-    }
-    
-    my %health = (uptime => 'unknown', cpu => 'N/A', memory => 'N/A', interfaces => 0);
-    
-    my @commands = (
-        { cmd => 'show version', pattern => '(uptime|Uptime)' },
-        { cmd => 'show processes cpu', pattern => '(CPU|usage)' },
-        { cmd => 'show memory', pattern => '(Memory|bytes)' },
-        { cmd => 'show interfaces brief', pattern => 'Interface' },
+sub logprint {
+    my ($msg) = @_;
+    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    print "$msg\n";
+    print $LOG "[$ts] $msg\n" if $LOG;
+}
+
+sub audit_device {
+    my ($h, $u, $p) = @_;
+    logprint("=" x 60);
+    logprint("Host: $h");
+
+    my $ssh = Net::SSH::Expect->new(
+        host        => $h,
+        user        => $u,
+        password    => $p,
+        raw_pty     => 1,
+        timeout     => $timeout,
+        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
     );
-    
-    foreach my $cmd_obj (@commands) {
-        eval {
-            my $output = $ssh->exec($cmd_obj->{cmd});
-            if ($verbose) {
-                log_output("  CMD: $cmd_obj->{cmd}");
-                log_output("    " . join("\n    ", split /\n/, substr($output, 0, 200)));
-            }
-            
-            if ($cmd_obj->{cmd} =~ /uptime|version/) {
-                if ($output =~ /uptime[:\s]+(.+?)$/mi || $output =~ /Uptime[:\s]+(.+?)$/mi) {
-                    $health{uptime} = $1;
-                    log_output("  Uptime: $health{uptime}");
-                }
-            }
-            
-            if ($cmd_obj->{cmd} =~ /processes cpu/) {
-                if ($output =~ /(\d+(?:\.\d+)?)\s*%/) {
-                    $health{cpu} = $1 . '%';
-                    log_output("  CPU Usage: $health{cpu}");
-                }
-            }
-            
-            if ($cmd_obj->{cmd} =~ /memory/) {
-                if ($output =~ /(\d+).*free/i) {
-                    $health{memory} = "OK";
-                    log_output("  Memory: Available");
-                }
-            }
-            
-            if ($cmd_obj->{cmd} =~ /interfaces brief/) {
-                my @interfaces = $output =~ /^\s*(\S+)\s+/gm;
-                $health{interfaces} = scalar @interfaces;
-                my $up_count = $output =~ /up\s+up/g;
-                log_output("  Interfaces: $up_count up out of $health{interfaces} total");
-            }
-        };
-        
-        if ($@) {
-            log_output("  WARNING: Command '$cmd_obj->{cmd}' failed: $@");
+
+    my $login;
+    eval { $login = $ssh->login() };
+    if ($@ || !defined $login || $login !~ /[>#]/) {
+        logprint("  ERROR: SSH login failed - $@");
+        return;
+    }
+
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('[>#]', 5);
+
+    # Grab full LSDB summary
+    $ssh->send("show ip ospf database\n");
+    my $db_output = $ssh->waitfor('[>#]', 30) // '';
+
+    # Grab detail for age checking (summary LSAs only to keep output bounded)
+    $ssh->send("show ip ospf database summary\n");
+    my $sum_output = $ssh->waitfor('[>#]', 30) // '';
+
+    $ssh->send("exit\n");
+
+    # Parse area/LSA type counts from database header
+    my %areas;
+    my $current_area = '';
+    for my $line (split /\n/, $db_output) {
+        if ($line =~ /OSPF Router\s+with\s+ID.+\((\d+\.\d+\.\d+\.\d+)\)/) {
+            logprint("  Router ID: $1");
+        }
+        if ($line =~ /(?:Area|Router Link States in Area)\s+([\d.]+)/) {
+            $current_area = $1;
+            $areas{$current_area} //= { router => 0, network => 0, summary => 0, asbr => 0, external => 0, nssa => 0 };
+        }
+        next unless $current_area;
+        $areas{$current_area}{router}++   if $line =~ /^\s+\d+\.\d+\.\d+\.\d+\s+\d+\.\d+\.\d+\.\d+\s+\d+\s+0x/ && $db_output =~ /Router Link/;
+        $areas{$current_area}{network}++  if $line =~ /Net Link/;
+        $areas{$current_area}{summary}++  if $line =~ /Sum Net/;
+        $areas{$current_area}{external}++ if $line =~ /Type-5/;
+        $areas{$current_area}{nssa}++     if $line =~ /Type-7/;
+    }
+
+    # Detect stale LSAs from age field in summary output
+    my @stale;
+    while ($sum_output =~ /(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s+0x/g) {
+        my ($lsid, $adv, $age) = ($1, $2, $3);
+        if ($age >= $stale_threshold) {
+            push @stale, sprintf("LSA %s (adv %s) age=%ss", $lsid, $adv, $age);
         }
     }
-    
-    eval { $ssh->close(); };
-    
-    return 1;
+
+    # Report
+    if (%areas) {
+        logprint(sprintf("  %-18s %6s %7s %7s %8s %6s", "Area", "Router", "Network", "Summary", "External", "NSSA"));
+        for my $area (sort keys %areas) {
+            my $a = $areas{$area};
+            logprint(sprintf("  %-18s %6d %7d %7d %8d %6d",
+                $area, $a->{router}, $a->{network}, $a->{summary}, $a->{external}, $a->{nssa}));
+        }
+    } else {
+        logprint("  WARNING: No OSPF areas found - OSPF may not be running");
+    }
+
+    if (@stale) {
+        logprint("  STALE LSAs (age >= ${stale_threshold}s):");
+        logprint("    $_") for @stale;
+    } else {
+        logprint("  No stale LSAs detected");
+    }
 }
 
 my @devices;
-if ($device) {
-    push @devices, $device;
-} elsif ($device_file) {
-    open my $fh, '<', $device_file or die "Cannot read $device_file: $!\n";
+if ($device_file) {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
     while (<$fh>) {
-        chomp;
-        next if /^#/ || /^\s*$/;
-        push @devices, $_;
+        chomp; s/#.*//; s/^\s+|\s+$//g;
+        next unless /\S/;
+        my ($h, $u, $p) = split /\s+/, $_, 3;
+        push @devices, [$h, $u, $p] if $h && $u && $p;
     }
     close $fh;
+} else {
+    push @devices, [$host, $user, $pass];
 }
 
-die "No devices to check\n" unless @devices;
+logprint("OSPF LSDB Audit - " . strftime('%Y-%m-%d %H:%M:%S', localtime));
+logprint("Stale threshold: ${stale_threshold}s (MaxAge=3600s)");
+audit_device(@$_) for @devices;
+logprint("Done.");
 
-log_output("Device Health Monitor - Started at " . scalar localtime());
-log_output("Checking " . scalar(@devices) . " device(s)");
-
-my $start = time();
-my $success_count = 0;
-
-foreach my $host (@devices) {
-    $success_count++ if check_device($host, $username, $password, $port, $timeout);
-}
-
-my $elapsed = time() - $start;
-log_output("\nSummary: $success_count/" . scalar(@devices) . " devices reachable (${elapsed}s)");
-
-close $log_fh if $log_fh;
-exit($success_count == @devices ? 0 : 1);
+close $LOG if $LOG;
