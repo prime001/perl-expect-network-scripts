@@ -1,25 +1,27 @@
+```perl
 #!/usr/bin/perl
+# bgp_flap_monitor.pl - BGP peer flap detection and zero-prefix alerting
 #
-# bgp_route_dampening.pl - BGP Route Dampening and Flap Statistics Monitor
+# PURPOSE:
+#   Connects to Cisco IOS/IOS-XE routers via SSH and analyzes BGP summary
+#   output to detect recently-flapped peers (uptime under threshold) and
+#   established peers advertising zero prefixes. Useful for post-change
+#   validation and automated NOC health sweeps.
 #
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE routers via SSH and reports on BGP route
-#   dampening status: suppressed prefixes, active flap counts, penalty values,
-#   and configured half-life/reuse thresholds. Useful for diagnosing route
-#   instability events and confirming dampening policy is operational.
+# USAGE:
+#   Single device:  perl bgp_flap_monitor.pl -h 192.168.1.1 -u admin -p pass
+#   Device file:    perl bgp_flap_monitor.pl -f devices.txt -u admin -p pass
+#   With log:       perl bgp_flap_monitor.pl -h 192.168.1.1 -u admin -p pass -l bgp.log
+#   Custom threshold (seconds):
+#                   perl bgp_flap_monitor.pl -h 192.168.1.1 -u admin -p pass -t 600
 #
-# Usage:
-#   ./bgp_route_dampening.pl -h <host> [-u <user>] [-p <pass>] [-l <logfile>]
-#   ./bgp_route_dampening.pl -f <file>  [-u <user>] [-p <pass>] [-l <logfile>]
+# PREREQUISITES:
+#   cpan install Expect Getopt::Long
+#   SSH key auth preferred; password auth supported via -p flag
+#   Tested: Cisco IOS 15.x, IOS-XE 16.x/17.x
 #
-# Prerequisites:
-#   cpan Expect Getopt::Long
-#   SSH reachability with at least read-only (show) access
-#   Perl 5.10+
-#
-# Environment:
-#   NET_USER, NET_PASS — fallback credentials if -u/-p not supplied
-#
+# DEVICE FILE FORMAT:
+#   One IP or hostname per line; lines starting with # are skipped
 
 use strict;
 use warnings;
@@ -27,113 +29,160 @@ use Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $file, $user, $pass, $logfile, $timeout, $help);
-$user    = $ENV{NET_USER} // 'admin';
-$pass    = $ENV{NET_PASS} // '';
-$timeout = 30;
+my ($host, $file, $user, $pass, $logfile, $threshold, $help);
+$threshold = 300;
 
 GetOptions(
-    'h|host=s'    => \$host,
-    'f|file=s'    => \$file,
-    'u|user=s'    => \$user,
-    'p|pass=s'    => \$pass,
-    'l|log=s'     => \$logfile,
-    't|timeout=i' => \$timeout,
-    'help'        => \$help,
-) or usage();
+    'h|host=s'      => \$host,
+    'f|file=s'      => \$file,
+    'u|user=s'      => \$user,
+    'p|pass=s'      => \$pass,
+    'l|log=s'       => \$logfile,
+    't|threshold=i' => \$threshold,
+    'help'          => \$help,
+) or die usage();
 
-usage() if $help || (!$host && !$file);
+die usage() if $help or (!$host and !$file) or !$user;
 
 my @devices;
 if ($host) {
     push @devices, $host;
 } else {
-    open my $fh, '<', $file or die "Cannot open $file: $!\n";
-    while (<$fh>) { chomp; next if /^\s*[#;]/ || /^\s*$/; push @devices, $_; }
+    open(my $fh, '<', $file) or die "Cannot open device file $file: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ or /^\s*$/;
+        push @devices, $_;
+    }
     close $fh;
 }
 
 my $log_fh;
 if ($logfile) {
-    open $log_fh, '>>', $logfile or die "Cannot open log $logfile: $!\n";
-    $log_fh->autoflush(1);
+    open($log_fh, '>>', $logfile) or die "Cannot open log file $logfile: $!\n";
 }
 
 my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+log_out("=== BGP Flap Monitor: $ts | threshold=${threshold}s ===");
 
-for my $device (@devices) {
-    out("", "=" x 62, "Device: $device   [$ts]", "=" x 62);
+for my $dev (@devices) {
+    log_out("\n[+] Connecting to $dev ...");
+    check_device($dev);
+}
+
+close $log_fh if $log_fh;
+
+sub check_device {
+    my ($dev) = @_;
 
     my $exp = Expect->new;
     $exp->raw_pty(1);
     $exp->log_stdout(0);
 
-    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=$timeout $user\@$device")) {
-        out("ERROR: spawn failed for $device: $!");
-        next;
+    my @ssh_cmd = ('ssh',
+        '-o', 'StrictHostKeyChecking=no',
+        '-o', 'ConnectTimeout=10',
+        '-l', $user, $dev);
+
+    unless ($exp->spawn(@ssh_cmd)) {
+        log_out("  ERROR: spawn failed for $dev: $!");
+        return;
     }
 
-    my $ok = 0;
-    $exp->expect($timeout,
-        [ qr/[Pp]assword:/,          sub { $exp->send("$pass\n"); exp_continue } ],
-        [ qr/yes\/no\)/i,            sub { $exp->send("yes\n");   exp_continue } ],
-        [ qr/[>#]\s*$/,              sub { $ok = 1 } ],
-        [ qr/[Pp]ermission denied/,  sub { out("ERROR: auth failed for $device") } ],
-        [ 'timeout', sub { out("ERROR: connect timeout for $device") } ],
-        [ 'eof',     sub { out("ERROR: EOF on connect to $device") } ],
+    my $authed = 0;
+    $exp->expect(15,
+        [ qr/[Pp]assword:/,   sub { $exp->send("$pass\n"); exp_continue; } ],
+        [ qr/yes\/no/,        sub { $exp->send("yes\n");   exp_continue; } ],
+        [ qr/[>#]\s*$/,       sub { $authed = 1; } ],
+        [ timeout =>          sub { log_out("  ERROR: connection timeout to $dev"); } ],
     );
 
-    unless ($ok) { $exp->soft_close; next; }
+    unless ($authed) {
+        log_out("  ERROR: authentication failed for $dev");
+        $exp->soft_close;
+        return;
+    }
 
     $exp->send("terminal length 0\n");
-    $exp->expect($timeout, qr/[>#]\s*$/);
+    $exp->expect(5, qr/[>#]\s*$/);
 
-    for my $cmd (
-        'show bgp dampening parameters',
-        'show bgp dampening suppressed-routes',
-        'show bgp dampening flap-statistics',
-    ) {
-        $exp->send("$cmd\n");
-        $exp->expect($timeout, qr/[>#]\s*$/);
-        my $output = $exp->before() // '';
-        $output =~ s/\r//g;
-        out("", "--- $cmd ---");
-        if ($output =~ /^\s*$/ || $output =~ /not configured|Invalid input|% BGP/i) {
-            out("  (no output or feature not configured)");
-        } else {
-            for my $line (split /\n/, $output) {
-                next if $line =~ /^\s*$cmd/ || $line =~ /^\s*$/;
-                out("  $line");
-            }
-        }
-    }
+    my $label = $dev;
+    $exp->send("show version | include hostname\n");
+    $exp->expect(5, qr/[>#]\s*$/);
+    $label = $1 if $exp->before() =~ /hostname\s+(\S+)/i;
+
+    $exp->send("show ip bgp summary\n");
+    $exp->expect(15, qr/[>#]\s*$/);
+    my $raw = $exp->before();
 
     $exp->send("exit\n");
     $exp->soft_close;
+
+    parse_summary($label, $dev, $raw);
 }
 
-close $log_fh if $log_fh;
-exit 0;
+sub parse_summary {
+    my ($label, $ip, $raw) = @_;
 
-sub out {
-    for my $line (@_) {
-        print "$line\n";
-        print $log_fh "$line\n" if $log_fh;
+    my (@flapped, @zero_pfx, $total);
+
+    for my $line (split /\n/, $raw) {
+        # IOS BGP summary peer line format:
+        # Neighbor  V  AS  MsgRcvd MsgSent TblVer InQ OutQ Up/Down State/PfxRcd
+        next unless $line =~ /^(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\S+)\s+(\S+)/;
+        my ($peer, $as, $updown, $state) = ($1, $2, $3, $4);
+        $total++;
+
+        if ($state =~ /^\d+$/) {
+            push @zero_pfx, "$peer (AS$as)" if $state == 0;
+            my $secs = uptime_to_secs($updown);
+            if (defined $secs && $secs < $threshold) {
+                push @flapped, sprintf("    %-18s AS%-8s up/down=%-12s prefixes=%s", $peer, $as, $updown, $state);
+            }
+        } else {
+            push @flapped, sprintf("    %-18s AS%-8s up/down=%-12s state=%s", $peer, $as, $updown, $state);
+        }
+    }
+
+    $total //= 0;
+    log_out(sprintf("  Router: %s (%s) | peers found: %d", $label, $ip, $total));
+
+    if (@flapped) {
+        log_out("  [WARN] Recently flapped or non-Established peers:");
+        log_out($_) for @flapped;
+    } else {
+        log_out("  [OK]   No recently flapped peers");
+    }
+
+    if (@zero_pfx) {
+        log_out("  [WARN] Established peers with 0 prefixes received: " . join(', ', @zero_pfx));
     }
 }
 
-sub usage {
-    print <<'END';
-Usage: bgp_route_dampening.pl -h <host> | -f <file> [options]
-
-  -h, --host     Device IP or hostname
-  -f, --file     File with one device per line (# lines ignored)
-  -u, --user     SSH username  (env: NET_USER, default: admin)
-  -p, --pass     SSH password  (env: NET_PASS)
-  -l, --log      Append all output to this file
-  -t, --timeout  SSH timeout seconds (default: 30)
-  --help         This message
-
-END
-    exit 1;
+sub uptime_to_secs {
+    my ($t) = @_;
+    return undef if $t eq 'never';
+    return $1*3600 + $2*60 + $3 if $t =~ /^(\d+):(\d+):(\d+)$/;
+    return $1*604800 + $2*86400  if $t =~ /^(\d+)w(\d+)d$/;
+    return $1*86400  + $2*3600   if $t =~ /^(\d+)d(\d+)h$/;
+    return undef;
 }
+
+sub log_out {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $log_fh "$msg\n" if $log_fh;
+}
+
+sub usage {
+    return <<'END';
+Usage: bgp_flap_monitor.pl -h <host>|-f <file> -u <user> [-p <pass>] [-l <log>] [-t <secs>]
+  -h  Device IP or hostname
+  -f  File with device list (one per line, # comments ok)
+  -u  SSH username
+  -p  SSH password (omit for key-based auth)
+  -l  Log file (appended)
+  -t  Flap threshold in seconds (default: 300)
+END
+}
+```
