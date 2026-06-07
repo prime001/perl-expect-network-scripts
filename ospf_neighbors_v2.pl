@@ -5,156 +5,169 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-# ospf_lsdb_audit.pl - OSPF Link State Database audit tool
+# ospf_db_audit.pl - OSPF Link-State Database consistency checker
 #
 # Purpose:
-#   Audits the OSPF LSDB on Cisco IOS/IOS-XE routers, checking for stale LSAs
-#   (age approaching MaxAge 3600s), LSA counts per area, and type-7 to type-5
-#   redistribution. Complements ospf_neighbors.pl by validating database health
-#   rather than adjacency state.
+#   Connects to one or more IOS/IOS-XE routers and pulls OSPF LSDB summaries.
+#   Compares LSA counts across devices within the same area to surface
+#   database inconsistencies that neighbor-state checks won't catch
+#   (partial sync, stuck LSAs, unexpected external injection).
 #
 # Usage:
-#   ospf_lsdb_audit.pl --host <ip> --user <user> --pass <pass> [--log <file>]
-#   ospf_lsdb_audit.pl --file <device_list.txt> [--log <file>]
+#   ospf_db_audit.pl --host 10.0.0.1 [--host 10.0.0.2 ...] [options]
+#   ospf_db_audit.pl --file devices.txt [options]
+#
+# Options:
+#   --host <ip>        Device to audit (repeatable)
+#   --file <path>      Newline-separated list of device IPs
+#   --user <name>      SSH username (default: admin)
+#   --pass <pass>      SSH password (prompt if omitted)
+#   --timeout <sec>    Per-command timeout (default: 20)
+#   --log <path>       Append results to log file
+#   --area <id>        Filter to specific OSPF area (default: all)
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH enabled on device; user needs at minimum 'show' privilege level
-#
-# Output:
-#   Table of LSA counts, stale LSA warnings, and per-area summary to STDOUT.
-#   Optionally mirrors to a log file with timestamps.
+#   CPAN: Net::SSH::Expect, Getopt::Long
+#   Devices must have SSH enabled and 'show ip ospf database' accessible.
 
-my ($host, $user, $pass, $device_file, $log_file);
-my $timeout = 15;
-my $stale_threshold = 3000;  # warn when LSA age exceeds this (seconds before MaxAge)
+my (@hosts, $host_file, $username, $password, $timeout, $log_file, $filter_area);
+$username = 'admin';
+$timeout  = 20;
 
 GetOptions(
-    'host=s'   => \$host,
-    'user=s'   => \$user,
-    'pass=s'   => \$pass,
-    'file=s'   => \$device_file,
-    'log=s'    => \$log_file,
+    'host=s'    => \@hosts,
+    'file=s'    => \$host_file,
+    'user=s'    => \$username,
+    'pass=s'    => \$password,
     'timeout=i' => \$timeout,
-) or die "Usage: $0 --host <ip> --user <user> --pass <pass> [--log <file>]\n"
-       . "       $0 --file <device_list.txt> [--log <file>]\n";
+    'log=s'     => \$log_file,
+    'area=s'    => \$filter_area,
+) or die "Usage: $0 --host <ip> [--host <ip>...] | --file <path> [--user u] [--pass p] [--timeout n] [--log path] [--area id]\n";
 
-die "Provide --host or --file\n" unless $host || $device_file;
-die "Provide --user and --pass when using --host\n"
-    if $host && (!$user || !$pass);
+if ($host_file) {
+    open my $fh, '<', $host_file or die "Cannot open $host_file: $!";
+    while (<$fh>) { chomp; push @hosts, $_ if /\S/ && !/^#/ }
+    close $fh;
+}
+die "No hosts specified. Use --host or --file.\n" unless @hosts;
 
-my $LOG;
+unless ($password) {
+    print "SSH password: ";
+    system('stty', '-echo');
+    chomp($password = <STDIN>);
+    system('stty', 'echo');
+    print "\n";
+}
+
+my $log_fh;
 if ($log_file) {
-    open($LOG, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
-    $LOG->autoflush(1);
+    open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!";
 }
 
-sub logprint {
+sub output {
     my ($msg) = @_;
-    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-    print "$msg\n";
-    print $LOG "[$ts] $msg\n" if $LOG;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
 
-sub audit_device {
-    my ($h, $u, $p) = @_;
-    logprint("=" x 60);
-    logprint("Host: $h");
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+output("=== OSPF LSDB Audit: $ts ===\n");
+
+my %area_lsa_counts;  # area -> host -> {router,network,summary,asbr,external,nssa}
+
+for my $host (@hosts) {
+    output("\n--- $host ---\n");
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $h,
-        user        => $u,
-        password    => $p,
-        raw_pty     => 1,
+        host        => $host,
+        user        => $username,
+        password    => $password,
         timeout     => $timeout,
-        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+        raw_pty     => 1,
     );
 
-    my $login;
-    eval { $login = $ssh->login() };
-    if ($@ || !defined $login || $login !~ /[>#]/) {
-        logprint("  ERROR: SSH login failed - $@");
-        return;
+    my $login_output;
+    eval { $login_output = $ssh->login() };
+    if ($@ || !$login_output) {
+        output("  ERROR: SSH login failed for $host: $@\n");
+        next;
     }
 
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('[>#]', 5);
+    # Disable paging
+    $ssh->exec('terminal length 0');
 
-    # Grab full LSDB summary
-    $ssh->send("show ip ospf database\n");
-    my $db_output = $ssh->waitfor('[>#]', 30) // '';
+    my $db_output = $ssh->exec('show ip ospf database database-summary');
+    unless (defined $db_output) {
+        output("  ERROR: Command timeout on $host\n");
+        $ssh->close();
+        next;
+    }
 
-    # Grab detail for age checking (summary LSAs only to keep output bounded)
-    $ssh->send("show ip ospf database summary\n");
-    my $sum_output = $ssh->waitfor('[>#]', 30) // '';
-
-    $ssh->send("exit\n");
-
-    # Parse area/LSA type counts from database header
-    my %areas;
-    my $current_area = '';
+    my ($current_area, $current_proc);
     for my $line (split /\n/, $db_output) {
-        if ($line =~ /OSPF Router\s+with\s+ID.+\((\d+\.\d+\.\d+\.\d+)\)/) {
-            logprint("  Router ID: $1");
+        if ($line =~ /OSPF Router with ID.*Process (\d+)/) {
+            $current_proc = $1;
         }
-        if ($line =~ /(?:Area|Router Link States in Area)\s+([\d.]+)/) {
+        if ($line =~ /Area\s+(\S+)\s+database summary/i) {
             $current_area = $1;
-            $areas{$current_area} //= { router => 0, network => 0, summary => 0, asbr => 0, external => 0, nssa => 0 };
+            $current_area =~ s/[()]//g;
+            next if defined $filter_area && $current_area ne $filter_area;
         }
-        next unless $current_area;
-        $areas{$current_area}{router}++   if $line =~ /^\s+\d+\.\d+\.\d+\.\d+\s+\d+\.\d+\.\d+\.\d+\s+\d+\s+0x/ && $db_output =~ /Router Link/;
-        $areas{$current_area}{network}++  if $line =~ /Net Link/;
-        $areas{$current_area}{summary}++  if $line =~ /Sum Net/;
-        $areas{$current_area}{external}++ if $line =~ /Type-5/;
-        $areas{$current_area}{nssa}++     if $line =~ /Type-7/;
+        next unless defined $current_area;
+        next if defined $filter_area && $current_area ne $filter_area;
+
+        if ($line =~ /Router\s+\*?\s+(\d+)/) {
+            $area_lsa_counts{$current_area}{$host}{router} = $1;
+        } elsif ($line =~ /Network\s+(\d+)/) {
+            $area_lsa_counts{$current_area}{$host}{network} = $1;
+        } elsif ($line =~ /Summary Net\s+(\d+)/) {
+            $area_lsa_counts{$current_area}{$host}{summary} = $1;
+        } elsif ($line =~ /Summary ASBR\s+(\d+)/) {
+            $area_lsa_counts{$current_area}{$host}{asbr} = $1;
+        } elsif ($line =~ /Type-5 Ext\s+(\d+)/) {
+            $area_lsa_counts{$current_area}{$host}{external} = $1;
+        } elsif ($line =~ /NSSA Ext\s+(\d+)/) {
+            $area_lsa_counts{$current_area}{$host}{nssa} = $1;
+        }
     }
 
-    # Detect stale LSAs from age field in summary output
-    my @stale;
-    while ($sum_output =~ /(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s+0x/g) {
-        my ($lsid, $adv, $age) = ($1, $2, $3);
-        if ($age >= $stale_threshold) {
-            push @stale, sprintf("LSA %s (adv %s) age=%ss", $lsid, $adv, $age);
-        }
+    for my $area (sort keys %area_lsa_counts) {
+        my $h = $area_lsa_counts{$area}{$host} // {};
+        output(sprintf "  Area %-10s  Router:%3s  Net:%3s  SumNet:%3s  SumASBR:%3s  Ext5:%3s  NSSA:%3s\n",
+            $area,
+            $h->{router}   // '-',
+            $h->{network}  // '-',
+            $h->{summary}  // '-',
+            $h->{asbr}     // '-',
+            $h->{external} // '-',
+            $h->{nssa}     // '-',
+        );
     }
 
-    # Report
-    if (%areas) {
-        logprint(sprintf("  %-18s %6s %7s %7s %8s %6s", "Area", "Router", "Network", "Summary", "External", "NSSA"));
-        for my $area (sort keys %areas) {
-            my $a = $areas{$area};
-            logprint(sprintf("  %-18s %6d %7d %7d %8d %6d",
-                $area, $a->{router}, $a->{network}, $a->{summary}, $a->{external}, $a->{nssa}));
-        }
-    } else {
-        logprint("  WARNING: No OSPF areas found - OSPF may not be running");
-    }
-
-    if (@stale) {
-        logprint("  STALE LSAs (age >= ${stale_threshold}s):");
-        logprint("    $_") for @stale;
-    } else {
-        logprint("  No stale LSAs detected");
-    }
+    $ssh->exec('exit');
+    $ssh->close();
 }
 
-my @devices;
-if ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) {
-        chomp; s/#.*//; s/^\s+|\s+$//g;
-        next unless /\S/;
-        my ($h, $u, $p) = split /\s+/, $_, 3;
-        push @devices, [$h, $u, $p] if $h && $u && $p;
+output("\n=== Consistency Check ===\n");
+my $issues = 0;
+for my $area (sort keys %area_lsa_counts) {
+    my %by_type;
+    for my $host (keys %{$area_lsa_counts{$area}}) {
+        for my $type (keys %{$area_lsa_counts{$area}{$host}}) {
+            push @{$by_type{$type}}, { host => $host, count => $area_lsa_counts{$area}{$host}{$type} };
+        }
     }
-    close $fh;
-} else {
-    push @devices, [$host, $user, $pass];
+    for my $type (sort keys %by_type) {
+        my @entries = @{$by_type{$type}};
+        next if @entries < 2;
+        my %counts = map { $_->{count} => 1 } @entries;
+        if (keys %counts > 1) {
+            output("  MISMATCH  Area $area  $type LSAs: " .
+                join(', ', map { "$_->{host}=$_->{count}" } @entries) . "\n");
+            $issues++;
+        }
+    }
 }
-
-logprint("OSPF LSDB Audit - " . strftime('%Y-%m-%d %H:%M:%S', localtime));
-logprint("Stale threshold: ${stale_threshold}s (MaxAge=3600s)");
-audit_device(@$_) for @devices;
-logprint("Done.");
-
-close $LOG if $LOG;
+output($issues ? "  $issues inconsistency(ies) found.\n" : "  All compared LSA counts match.\n");
+output("=== Done ===\n");
+close $log_fh if $log_fh;
