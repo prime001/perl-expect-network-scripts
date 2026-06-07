@@ -1,169 +1,147 @@
-```perl
 #!/usr/bin/perl
-#
-# stp_audit.pl - Spanning Tree Protocol Topology Auditor
-#
+# =============================================================================
+# interface_errors.pl - Interface Error Counter Audit via SSH/Expect
+# =============================================================================
 # Purpose:
-#   Connects to Cisco IOS/IOS-XE switches via SSH and audits STP state:
-#   root bridge placement, port roles, topology change counts, and any
-#   ports in blocking or inconsistent states. Useful for validating STP
-#   topology after network changes or troubleshooting outage root causes.
+#   SSH into Cisco IOS/IOS-XE devices and audit interface error counters
+#   (CRC, input errors, output drops, runts). Flags interfaces above
+#   configurable thresholds to identify bad cables, duplex mismatches,
+#   and oversubscribed uplinks before they cause outages.
 #
 # Usage:
-#   ./stp_audit.pl <device_ip> [username] [password]
-#   ./stp_audit.pl --file devices.txt [username] [password]
-#   NET_USER=admin NET_PASS=secret ./stp_audit.pl 10.0.0.1
-#
-# Output:
-#   Results to STDOUT and stp_audit_YYYYMMDD_HHMMSS.log
+#   ./interface_errors.pl -h 192.168.1.1 [-u admin] [-p secret] [-l out.log]
+#   ./interface_errors.pl -f devices.txt [-u admin] [-l out.log]
 #
 # Prerequisites:
 #   cpan install Expect
-#   SSH access to target device(s), read-only privilege sufficient
+#   Set DEVICE_USER / DEVICE_PASS env vars or use -u/-p flags.
+#   SSH key auth works; omit -p and the password expect branch is skipped.
 #
-# Tested on: Cisco IOS 15.x, IOS-XE 16.x/17.x
+# Thresholds:
+#   Override via env: ERR_THRESHOLD (default 100), DROP_THRESHOLD (default 50)
+# =============================================================================
 
 use strict;
 use warnings;
 use Expect;
+use Getopt::Long qw(:config no_ignore_case);
 use POSIX qw(strftime);
-use Getopt::Long;
 
-my $timeout    = 30;
-my $timestamp  = strftime('%Y%m%d_%H%M%S', localtime);
-my $log_file   = "stp_audit_${timestamp}.log";
-my $device_file;
+my $err_threshold  = $ENV{ERR_THRESHOLD}  // 100;
+my $drop_threshold = $ENV{DROP_THRESHOLD} // 50;
+my $ssh_timeout    = 15;
 
-Getopt::Long::Configure('pass_through');
-GetOptions('file=s' => \$device_file);
+my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_log);
+GetOptions(
+    'h|host=s' => \$opt_host,
+    'f|file=s' => \$opt_file,
+    'u|user=s' => \$opt_user,
+    'p|pass=s' => \$opt_pass,
+    'l|log=s'  => \$opt_log,
+) or die "Usage: $0 -h HOST|-f FILE [-u user] [-p pass] [-l logfile]\n";
+
+die "Specify -h <host> or -f <file>\n" unless $opt_host || $opt_file;
+
+my $user = $opt_user // $ENV{DEVICE_USER} // 'admin';
+my $pass = $opt_pass // $ENV{DEVICE_PASS} // '';
 
 my @devices;
-if ($device_file) {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    @devices = grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
-    close $fh;
-} elsif (@ARGV >= 1) {
-    push @devices, shift @ARGV;
+if ($opt_host) {
+    @devices = ($opt_host);
 } else {
-    die "Usage: $0 <device_ip> [user] [pass]\n       $0 --file devices.txt [user] [pass]\n";
+    open(my $fh, '<', $opt_file) or die "Cannot open device list '$opt_file': $!\n";
+    @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
+    close $fh;
+    die "No devices found in $opt_file\n" unless @devices;
 }
 
-my $username = shift @ARGV // $ENV{NET_USER} // 'admin';
-my $password = shift @ARGV // $ENV{NET_PASS} // do {
-    local $| = 1;
-    print "Password: ";
-    system('stty', '-echo');
-    chomp(my $p = <STDIN>);
-    system('stty', 'echo');
-    print "\n";
-    $p;
-};
+my $log_fh;
+if ($opt_log) {
+    open($log_fh, '>>', $opt_log) or die "Cannot open log '$opt_log': $!\n";
+}
 
-open my $log_fh, '>', $log_file or die "Cannot open $log_file: $!\n";
+my $run_ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
 
-sub out {
-    my $msg = shift;
-    print $msg;
-    print $log_fh $msg;
+sub emit {
+    my ($msg) = @_;
+    print STDOUT $msg;
+    print $log_fh $msg if $log_fh;
 }
 
 sub audit_device {
-    my $host = shift;
-    out("\n" . ('=' x 62) . "\n");
-    out("Device: $host  [" . strftime('%Y-%m-%d %H:%M:%S', localtime) . "]\n");
-    out('=' x 62 . "\n");
+    my ($host) = @_;
+    emit("\n=== $host  [$run_ts] ===\n");
 
     my $exp = Expect->new;
     $exp->raw_pty(1);
     $exp->log_stdout(0);
 
-    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${username}\@${host}")) {
-        out("ERROR: Failed to spawn SSH for $host\n");
-        return;
-    }
+    $exp->spawn('ssh',
+        '-o', 'StrictHostKeyChecking=no',
+        '-o', 'ConnectTimeout=10',
+        '-o', 'BatchMode=no',
+        "$user\@$host"
+    ) or do { emit("ERROR: Cannot spawn SSH to $host: $!\n"); return; };
 
-    my $logged_in = 0;
-    $exp->expect($timeout,
-        [ qr/[Pp]assword:/,  sub { $exp->send("$password\n"); exp_continue; } ],
-        [ qr/yes\/no/i,      sub { $exp->send("yes\n");        exp_continue; } ],
-        [ qr/[>#]/,          sub { $logged_in = 1; }                           ],
-        [ 'timeout',         sub { out("ERROR: Login timeout on $host\n"); }   ],
+    my $authed = $exp->expect($ssh_timeout,
+        [ qr/[Pp]assword[: ]+$/,
+          sub { $exp->send("$pass\n"); exp_continue; } ],
+        [ qr/yes\/no/,
+          sub { $exp->send("yes\n"); exp_continue; } ],
+        [ qr/[>#]\s*$/,      sub { 1 } ],
+        [ 'timeout',         sub { emit("ERROR: Login timeout on $host\n"); } ],
+        [ 'eof',             sub { emit("ERROR: SSH connection failed on $host\n"); } ],
     );
-
-    unless ($logged_in) {
-        $exp->soft_close;
-        return;
-    }
+    return unless $authed;
 
     $exp->send("terminal length 0\n");
-    $exp->expect($timeout, qr/[>#]/);
+    $exp->expect($ssh_timeout, qr/[>#]\s*$/);
 
-    out("\n[STP Summary]\n");
-    $exp->send("show spanning-tree summary\n");
-    $exp->expect($timeout, [ qr/[>#]/ => sub {
-        for my $line (split /\n/, $exp->before) {
-            next unless $line =~ /\S/;
-            next if $line =~ /^show spanning/;
-            out("  $line\n");
-        }
-    }]);
-
-    out("\n[Root Bridge & Topology Changes per VLAN]\n");
-    $exp->send("show spanning-tree detail | include VLAN|is root|change count|from last change\n");
-    $exp->expect($timeout, [ qr/[>#]/ => sub {
-        my $vlan = 'VLAN?';
-        for my $line (split /\n/, $exp->before) {
-            next unless $line =~ /\S/;
-            $vlan = $1 if $line =~ /(VLAN\d+)/i;
-            if ($line =~ /This bridge is the root/i) {
-                out("  [$vlan] ROOT BRIDGE on this device\n");
-            }
-            if ($line =~ /Topology change count:\s*(\d+)/i) {
-                my $count = $1;
-                my $flag = $count > 0 ? ' *** WARNING ***' : '';
-                out("  [$vlan] Topology changes: $count$flag\n");
-            }
-            if ($line =~ /from last change occurred/i) {
-                out("  [$vlan] $line\n");
-            }
-        }
-    }]);
-
-    out("\n[Blocked / Non-Forwarding Ports]\n");
-    $exp->send("show spanning-tree blockedports\n");
-    $exp->expect($timeout, [ qr/[>#]/ => sub {
-        my @blocked = grep { /\S/ && !/^show spanning|blocked/i } split /\n/, $exp->before;
-        if (@blocked) {
-            out("  $_\n") for @blocked;
-        } else {
-            out("  None - all ports forwarding\n");
-        }
-    }]);
-
-    out("\n[PortFast / BPDU Guard Enabled Ports]\n");
-    $exp->send("show spanning-tree interface detail | include Port|PortFast|Bpdu\n");
-    $exp->expect($timeout, [ qr/[>#]/ => sub {
-        my $iface = '';
-        for my $line (split /\n/, $exp->before) {
-            next unless $line =~ /\S/;
-            next if $line =~ /^show spanning/;
-            $iface = $1 if $line =~ /^Port\s+\d+\s+\((\S+)\)/;
-            if ($line =~ /Portfast\s+is\s+enabled|Bpdu\s+guard\s+is\s+enabled/i) {
-                out("  $iface: $line\n");
-            }
-        }
-    }]);
+    $exp->send("show interfaces\n");
+    my $raw = '';
+    $exp->expect(30,
+        [ qr/[>#]\s*$/, sub { $raw = $exp->before(); } ],
+        [ 'timeout',    sub { emit("ERROR: Command timed out on $host\n"); } ],
+    );
 
     $exp->send("exit\n");
-    $exp->soft_close;
-    out("\nCompleted: $host\n");
+    $exp->soft_close();
+
+    return unless $raw;
+    parse_counters($host, $raw);
 }
 
-out("STP Audit  |  Started: " . strftime('%Y-%m-%d %H:%M:%S', localtime) . "\n");
-out("Log: $log_file\n");
+sub parse_counters {
+    my ($host, $text) = @_;
+    my (%flagged, $iface);
+
+    for my $line (split /\n/, $text) {
+        if ($line =~ /^(\S+)\s+is\s+(?:up|down|administratively down)/i) {
+            $iface = $1;
+        }
+        next unless $iface;
+
+        if ($line =~ /(\d+)\s+input errors/)  { $flagged{$iface}{input_errors} = $1  if $1 >= $err_threshold; }
+        if ($line =~ /(\d+)\s+CRC/)           { $flagged{$iface}{CRC}          = $1  if $1 >= $err_threshold; }
+        if ($line =~ /(\d+)\s+output drops/)  { $flagged{$iface}{output_drops} = $1  if $1 >= $drop_threshold; }
+        if ($line =~ /(\d+)\s+runts/)         { $flagged{$iface}{runts}        = $1  if $1 > 0; }
+        if ($line =~ /(\d+)\s+giants/)        { $flagged{$iface}{giants}       = $1  if $1 > 0; }
+
+        # Remove entry if no counters actually flagged for this interface
+        delete $flagged{$iface} if exists $flagged{$iface} && !%{$flagged{$iface}};
+    }
+
+    if (%flagged) {
+        emit("FLAGGED (threshold: errors>=$err_threshold, drops>=$drop_threshold):\n");
+        for my $if_name (sort keys %flagged) {
+            my @parts = map { "$_=$flagged{$if_name}{$_}" } sort keys %{$flagged{$if_name}};
+            emit(sprintf "  %-35s %s\n", $if_name, join('  ', @parts));
+        }
+    } else {
+        emit("OK - all interfaces within error thresholds\n");
+    }
+}
 
 audit_device($_) for @devices;
-
-out("\nDone. " . scalar(@devices) . " device(s) audited.\n");
-close $log_fh;
-```
+emit("\nAudit complete. " . scalar(@devices) . " device(s) checked.\n");
+close $log_fh if $log_fh;
