@@ -1,123 +1,151 @@
-```perl
 #!/usr/bin/perl
 #
-# hardware_health.pl - Collect CPU, memory, and environmental health metrics
-#                      from Cisco IOS/IOS-XE devices via SSH
+# hw_health_check.pl - Network Device Hardware Health Monitor
 #
-# Purpose:
-#   Polls CPU utilization, memory usage, temperature sensors, power supplies,
-#   and fan status. Designed for routine health checks and pre/post-change
-#   baselines. Distinct from inventory_collection (platform/version data).
+# PURPOSE:
+#   Checks CPU utilization, memory usage, environmental sensors (temperature,
+#   fans, power supplies) on Cisco IOS/IOS-XE devices. Flags any readings
+#   that exceed warning thresholds. Useful for pre-change health baselines
+#   and post-change verification.
 #
-# Usage:
-#   Single device:  perl hardware_health.pl -h 192.168.1.1
-#   Multiple hosts: perl hardware_health.pl -f hosts.txt
-#   With logging:   perl hardware_health.pl -h 192.168.1.1 -o /var/log/health/
+# USAGE:
+#   Single device:   ./hw_health_check.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:     ./hw_health_check.pl -f devices.txt -u admin -p secret
+#   With log output: ./hw_health_check.pl -h 192.168.1.1 -u admin -p secret -l health.log
 #
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH access with at least privilege 1 (show commands only)
-#   Environment: SSH_USER and SSH_PASS env vars, or use -u/-p flags
+# DEVICE FILE FORMAT:
+#   One IP or hostname per line. Lines starting with # are ignored.
 #
-# Author: Erik Anderson
-# Tested: Cisco IOS 15.x, IOS-XE 16.x/17.x
+# PREREQUISITES:
+#   cpan install Net::SSH::Expect
+#
+# THRESHOLDS:
+#   CPU  > 70% (5-min average) = WARNING
+#   CPU  > 90% = CRITICAL
+#   MEM  > 80% used = WARNING
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Std;
+use Getopt::Long;
 use POSIX qw(strftime);
 
-my %opts;
-getopts('h:f:u:p:o:', \%opts);
+my ($host, $user, $pass, $device_file, $log_file, $help);
+GetOptions(
+    'h=s' => \$host,
+    'u=s' => \$user,
+    'p=s' => \$pass,
+    'f=s' => \$device_file,
+    'l=s' => \$log_file,
+    'help' => \$help,
+) or die "Error parsing options\n";
 
-my $user    = $opts{u} || $ENV{SSH_USER} || 'admin';
-my $pass    = $opts{p} || $ENV{SSH_PASS} or die "Password required: set SSH_PASS or use -p\n";
-my $logdir  = $opts{o};
-my @hosts;
+if ($help || (!$host && !$device_file) || !$user || !$pass) {
+    print "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-l <logfile>]\n";
+    exit 1;
+}
 
-if ($opts{h}) {
-    push @hosts, $opts{h};
-} elsif ($opts{f}) {
-    open my $fh, '<', $opts{f} or die "Cannot open host file '$opts{f}': $!\n";
+my @devices = $host ? ($host) : ();
+if ($device_file) {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
     while (<$fh>) {
         chomp;
         next if /^\s*#/ || /^\s*$/;
-        push @hosts, $_;
+        push @devices, $_;
     }
     close $fh;
-} else {
-    die "Usage: $0 -h <host> | -f <hostfile> [-u user] [-p pass] [-o logdir]\n";
 }
 
-my $timestamp = strftime('%Y%m%d_%H%M%S', localtime);
+my $log_fh;
+if ($log_file) {
+    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
+}
 
-for my $host (@hosts) {
-    print "\n=== $host [$timestamp] ===\n";
+sub output {
+    my $msg = shift;
+    print $msg;
+    print $log_fh $msg if $log_fh;
+}
 
-    my $log_fh;
-    if ($logdir) {
-        my $logfile = "$logdir/${host}_health_${timestamp}.log";
-        open $log_fh, '>', $logfile or warn "Cannot write log '$logfile': $!\n";
-    }
+sub check_device {
+    my $dev = shift;
+    my $ts  = strftime("%Y-%m-%d %H:%M:%S", localtime);
 
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host        => $host,
-            user        => $user,
-            password    => $pass,
-            ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
-            raw_pty     => 1,
-            timeout     => 15,
-        );
-    };
-    if ($@ || !$ssh) {
-        my $err = "ERROR: Cannot create SSH session to $host: $@";
-        print "$err\n";
-        print $log_fh "$err\n" if $log_fh;
-        next;
-    }
+    output("\n=== $dev  [$ts] ===\n");
 
-    my $login = eval { $ssh->login() };
-    if ($@ || !defined $login) {
-        my $err = "ERROR: Authentication failed for $host (user=$user)";
-        print "$err\n";
-        print $log_fh "$err\n" if $log_fh;
-        next;
-    }
-
-    $ssh->send('terminal length 0');
-    $ssh->waitfor('\$\s*#', 5);
-
-    my @commands = (
-        ['CPU Utilization',   'show processes cpu sorted | head 15'],
-        ['Memory Utilization','show processes memory sorted | head 10'],
-        ['Environment',       'show environment all'],
+    my $ssh = Net::SSH::Expect->new(
+        host        => $dev,
+        user        => $user,
+        password     => $pass,
+        raw_pty     => 1,
+        timeout      => 20,
     );
 
-    for my $cmd_pair (@commands) {
-        my ($label, $cmd) = @$cmd_pair;
-        $ssh->send($cmd);
-        my $output = eval { $ssh->waitfor('\S+#\s*$', 20, '-re') };
-        if ($@) {
-            my $msg = "TIMEOUT running '$cmd' on $host";
-            print "  [$label] $msg\n";
-            print $log_fh "[$label] $msg\n" if $log_fh;
-            next;
+    eval {
+        my $login = $ssh->login();
+        if ($login !~ /[>#]/) {
+            die "Authentication failed or unexpected prompt\n";
         }
-
-        $output =~ s/^\Q$cmd\E\r?\n//;
-        $output =~ s/\S+#\s*$//;
-        $output =~ s/\r//g;
-        $output =~ s/^\s+|\s+$//g;
-
-        my $section = "[$label]\n$output\n";
-        print "$section\n";
-        print $log_fh "$section\n" if $log_fh;
+    };
+    if ($@) {
+        output("  [ERROR] Cannot connect to $dev: $@");
+        return;
     }
 
-    $ssh->send('exit');
-    close $log_fh if $log_fh;
-    print "--- done ---\n";
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('\s*[>#]', 5);
+
+    # CPU check
+    $ssh->send("show processes cpu | include CPU utilization\n");
+    my $cpu_out = $ssh->waitfor('\s*[>#]', 10) // '';
+    if ($cpu_out =~ /five minutes:\s*(\d+)%/) {
+        my $cpu5 = $1;
+        my $status = $cpu5 >= 90 ? 'CRITICAL' : $cpu5 >= 70 ? 'WARNING' : 'OK';
+        output("  CPU (5-min avg): $cpu5%  [$status]\n");
+    } else {
+        output("  CPU: could not parse output\n");
+    }
+
+    # Memory check
+    $ssh->send("show processes memory | include Processor\n");
+    my $mem_out = $ssh->waitfor('\s*[>#]', 10) // '';
+    if ($mem_out =~ /Processor\s+\S+\s+(\d+)\s+(\d+)/) {
+        my ($used, $free) = ($1, $2);
+        my $total = $used + $free;
+        my $pct   = $total > 0 ? int(($used / $total) * 100) : 0;
+        my $status = $pct >= 80 ? 'WARNING' : 'OK';
+        output(sprintf("  Memory: %dMB used / %dMB total (%d%%)  [%s]\n",
+            $used/1024, $total/1024, $pct, $status));
+    } else {
+        output("  Memory: could not parse output\n");
+    }
+
+    # Environmental sensors
+    $ssh->send("show env all\n");
+    my $env_out = $ssh->waitfor('\s*[>#]', 10) // '';
+
+    my @warnings;
+    while ($env_out =~ /^(.+?)\s+(FAULTY|Fan\s+Fail|Critical|FAIL)/gim) {
+        push @warnings, $1;
+    }
+    if (@warnings) {
+        output("  ENV: ALERT - " . join(", ", @warnings) . "\n");
+    } elsif ($env_out =~ /\S/) {
+        my $temp_count = () = $env_out =~ /Normal/gi;
+        output("  ENV: $temp_count sensor(s) normal\n");
+    } else {
+        # IOS-XE fallback
+        $ssh->send("show version | include uptime\n");
+        my $up_out = $ssh->waitfor('\s*[>#]', 5) // '';
+        ($up_out =~ /uptime is (.+)/) and output("  Uptime: $1\n");
+    }
+
+    $ssh->close();
 }
-```
+
+for my $dev (@devices) {
+    check_device($dev);
+}
+
+output("\nDone. Checked " . scalar(@devices) . " device(s).\n");
+close $log_fh if $log_fh;
