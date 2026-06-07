@@ -1,161 +1,155 @@
 #!/usr/bin/perl
-# vlan_trunk_audit.pl - VLAN Trunk Port Consistency Auditor
+# =============================================================================
+# vlan_stp_audit.pl - Per-VLAN Spanning Tree Protocol Stability Audit
 #
 # Purpose:
-#   Audits trunk port configurations on Cisco IOS/IOS-XE switches.
-#   Cross-references trunk allowed-VLAN lists against the VLAN database
-#   to flag: non-default native VLANs, overly permissive trunk configs,
-#   and VLANs defined in the database but pruned from all trunks.
+#   Connects to Cisco IOS/IOS-XE switches and audits spanning tree health
+#   per VLAN. Identifies root bridge placement, blocked/alternate port counts,
+#   and elevated topology change notifications (TCNs) that signal STP
+#   instability. Useful for post-change validation and incident triage.
 #
 # Usage:
-#   ./vlan_trunk_audit.pl <device_ip> [-u user] [-p pass] [-l logfile]
-#   ./vlan_trunk_audit.pl -f devices.txt [-u user] [-p pass] [-l logfile]
+#   ./vlan_stp_audit.pl -h <host>                   single device
+#   ./vlan_stp_audit.pl -f <hosts.txt>              bulk, one host per line
+#
+# Options:
+#   -u <user>    SSH username      (default: $NET_USER or 'admin')
+#   -p <pass>    SSH password      (default: $NET_PASS)
+#   -l <file>    Append output to log file
+#   -t <n>       TCN warning threshold, per VLAN (default: 50)
 #
 # Prerequisites:
-#   Perl modules: Expect, Getopt::Long   (cpan Expect)
-#   SSH access at privilege 15; device must support IOS/IOS-XE trunk CLI.
+#   cpan Net::SSH::Expect
+#   SSH enabled on target, privilege level 1+ sufficient
+# =============================================================================
 
 use strict;
 use warnings;
-use Expect;
-use POSIX qw(strftime);
+use Net::SSH::Expect;
 use Getopt::Long qw(:config no_ignore_case);
+use POSIX qw(strftime);
 
-my $TIMEOUT = 30;
-my $PROMPT  = qr/[>#]\s*$/;
-my ($device_file, $logfile, $username, $password);
+my ($opt_host, $opt_file, $opt_log);
+my $opt_user = $ENV{NET_USER} // 'admin';
+my $opt_pass = $ENV{NET_PASS} // '';
+my $opt_tcn  = 50;
 
 GetOptions(
-    'file|f=s' => \$device_file,
-    'log|l=s'  => \$logfile,
-    'user|u=s' => \$username,
-    'pass|p=s' => \$password,
-) or die "Usage: $0 <ip> [-u user] [-p pass] [-l log] | -f devices.txt\n";
+    'h|host=s' => \$opt_host,
+    'f|file=s' => \$opt_file,
+    'u|user=s' => \$opt_user,
+    'p|pass=s' => \$opt_pass,
+    'l|log=s'  => \$opt_log,
+    't|tcn=i'  => \$opt_tcn,
+) or die "Usage: $0 -h <host>|-f <file> [-u user] [-p pass] [-l logfile] [-t tcn_thresh]\n";
 
-my $device = shift @ARGV;
-die "Usage: $0 <ip> [-u user] [-p pass] [-l log] | -f devices.txt\n"
-    unless $device || $device_file;
+die "Specify -h <host> or -f <file>\n" unless $opt_host || $opt_file;
 
-$username //= $ENV{NET_USER} // do { print "Username: "; chomp(my $v = <STDIN>); $v };
-$password //= $ENV{NET_PASS} // do {
-    print "Password: "; system("stty -echo");
-    chomp(my $v = <STDIN>); system("stty echo"); print "\n"; $v;
-};
+my @devices;
+if ($opt_host) {
+    @devices = ($opt_host);
+} else {
+    open my $fh, '<', $opt_file or die "Cannot open $opt_file: $!\n";
+    @devices = map { chomp; $_ } grep { /\S/ && !/^\s*#/ } <$fh>;
+}
 
 my $log_fh;
-if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open $logfile: $!";
-}
-
-my @hosts = $device_file ? do {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!";
-    grep { /\S/ && !/^\s*#/ } <$fh>;
-} : ($device);
-
-for my $host (@hosts) {
-    chomp $host;
-    audit_device($host);
-}
-close($log_fh) if $log_fh;
-
-sub audit_device {
-    my ($host) = @_;
-    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-    out("\n" . "=" x 62);
-    out("Device: $host  |  $ts");
-    out("=" x 62);
-
-    my $exp = Expect->new;
-    $exp->raw_pty(1);
-    $exp->log_stdout(0);
-
-    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${username}\@${host}")) {
-        out("ERROR: spawn failed for $host: $!"); return;
-    }
-
-    my $ok = $exp->expect($TIMEOUT,
-        [ qr/yes\/no\)?/i,  sub { $exp->send("yes\n");          exp_continue } ],
-        [ qr/[Pp]assword:/, sub { $exp->send("$password\n");    exp_continue } ],
-        [ $PROMPT,          sub { 1 } ],
-        [ 'timeout',        sub { out("ERROR: timeout connecting to $host"); 0 } ],
-        [ 'eof',            sub { out("ERROR: EOF on connect to $host");     0 } ],
-    );
-    unless ($ok) { $exp->hard_close(); return; }
-
-    send_cmd($exp, "terminal length 0");
-    my $trunk_raw = send_cmd($exp, "show interfaces trunk");
-    my $vlan_raw  = send_cmd($exp, "show vlan brief");
-    $exp->send("exit\n"); $exp->soft_close();
-
-    parse_and_report($host, $trunk_raw, $vlan_raw);
-}
-
-sub send_cmd {
-    my ($exp, $cmd) = @_;
-    $exp->send("$cmd\n");
-    my $buf = '';
-    $exp->expect($TIMEOUT, [ $PROMPT, sub { $buf = $exp->before() } ]);
-    return $buf;
-}
-
-sub parse_and_report {
-    my ($host, $trunk_raw, $vlan_raw) = @_;
-    my (%trunks, %vlans_db);
-    my $section = '';
-
-    for my $line (split /\n/, $trunk_raw) {
-        if ($line =~ /^Port\s+Mode\s+Encapsulation\s+Status\s+Native vlan/i) { $section = 'hdr';     next }
-        if ($line =~ /^Port\s+Vlans allowed on trunk/i)                       { $section = 'allowed'; next }
-        if ($line =~ /^Port\s+Vlans in spanning/i)                            { $section = 'stp';     next }
-        if ($section eq 'hdr'     && $line =~ /^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)/)
-            { $trunks{$1} = { mode=>$2, encap=>$3, status=>$4, native=>$5 } }
-        if ($section eq 'allowed' && $line =~ /^(\S+)\s+(.+)/)
-            { $trunks{$1}{allowed} = $2 }
-    }
-
-    for my $line (split /\n/, $vlan_raw) {
-        $vlans_db{$1} = $2 if $line =~ /^(\d+)\s+(\S+)\s+active/i;
-    }
-
-    if (!%trunks) { out("  No trunk ports found."); return; }
-
-    out(sprintf("  %-22s %-8s %-12s %-8s %s", "Interface","Status","Encap","Native","Mode"));
-    out("  " . "-" x 56);
-
-    my %carried;
-    for my $intf (sort keys %trunks) {
-        my $t = $trunks{$intf};
-        out(sprintf("  %-22s %-8s %-12s %-8s %s",
-            $intf, $t->{status}//'?', $t->{encap}//'?', $t->{native}//'?', $t->{mode}//'?'));
-        out("  [WARN] $intf: non-default native VLAN $t->{native}")
-            if defined $t->{native} && $t->{native} != 1;
-        out("  [WARN] $intf: permits ALL VLANs 1-4094 -- consider pruning")
-            if ($t->{allowed}//'') =~ /^1-4094$/;
-        expand_range($t->{allowed}//'', \%carried);
-    }
-
-    my @orphans = grep { $_ != 1 && !$carried{$_} } sort { $a <=> $b } keys %vlans_db;
-    if (@orphans) {
-        out("\n  VLANs in DB not carried on any trunk:");
-        out("  " . join(", ", @orphans));
-    } else {
-        out("\n  All active VLANs are carried on at least one trunk.");
-    }
-    out(sprintf("  Summary: %d trunk(s) | %d VLANs in DB | %d not on any trunk",
-        scalar keys %trunks, scalar keys %vlans_db, scalar @orphans));
-}
-
-sub expand_range {
-    my ($str, $href) = @_;
-    for my $chunk (split /,/, $str) {
-        $chunk =~ s/\s//g;
-        if ($chunk =~ /^(\d+)-(\d+)$/) { $href->{$_}++ for $1..$2 }
-        elsif ($chunk =~ /^(\d+)$/)    { $href->{$1}++ }
-    }
+if ($opt_log) {
+    open $log_fh, '>>', $opt_log or die "Cannot open log $opt_log: $!\n";
 }
 
 sub out {
-    my $msg = shift;
-    print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
+    print @_;
+    print $log_fh @_ if $log_fh;
 }
+
+sub run_cmd {
+    my ($ssh, $cmd, $timeout) = @_;
+    $timeout //= 10;
+    $ssh->send($cmd);
+    return $ssh->waitfor('[\$#>]\s*$', $timeout) // '';
+}
+
+sub audit_host {
+    my ($host) = @_;
+    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    out "\n" . ('=' x 62) . "\n";
+    out "Host: $host    $ts\n";
+    out ('=' x 62) . "\n";
+
+    my $ssh = Net::SSH::Expect->new(
+        host     => $host,
+        user     => $opt_user,
+        password => $opt_pass,
+        raw_pty  => 1,
+        timeout  => 20,
+    );
+
+    eval { $ssh->login() };
+    if ($@) {
+        out "ERROR: SSH login failed for $host: $@\n";
+        return;
+    }
+
+    run_cmd($ssh, 'terminal length 0', 5);
+
+    my $summary = run_cmd($ssh, 'show spanning-tree summary', 10);
+    my $stp_mode = ($summary =~ /Switch is in (\S+)\s+mode/i) ? $1 : 'unknown';
+    my $bpdu_guard = ($summary =~ /Portfast BPDU Guard Default\s+is enabled/i) ? 'enabled' : 'disabled';
+    out sprintf("STP mode: %-12s  BPDU Guard default: %s\n", $stp_mode, $bpdu_guard);
+
+    my $brief = run_cmd($ssh, 'show spanning-tree brief', 20);
+
+    my (@root_vlans, @blocked_ports);
+    my $cur_vlan = '';
+    for my $line (split /\n/, $brief) {
+        $cur_vlan = $1 if $line =~ /^(VLAN\d+)\b/;
+        push @root_vlans, $cur_vlan if $line =~ /This bridge is the root/i && $cur_vlan;
+        if ($line =~ /\b(?:Altn|BLK)\b/ && $cur_vlan) {
+            my ($iface) = (split /\s+/, $line)[0];
+            push @blocked_ports, "$cur_vlan/$iface" if $iface;
+        }
+    }
+
+    out sprintf("Root bridge for %d VLAN(s)", scalar @root_vlans);
+    if (@root_vlans && @root_vlans <= 20) {
+        out ": " . join(' ', @root_vlans);
+    } elsif (@root_vlans > 20) {
+        out " (first 5: " . join(' ', @root_vlans[0..4]) . " ...)";
+    }
+    out "\n";
+
+    if (@blocked_ports) {
+        my $shown = join(', ', @blocked_ports[0 .. ($#blocked_ports < 8 ? $#blocked_ports : 8)]);
+        out "Blocked/Altn ports: $shown";
+        out " (+" . (@blocked_ports - 9) . " more)" if @blocked_ports > 9;
+        out "\n";
+    } else {
+        out "Blocked ports: none\n";
+    }
+
+    my $detail = run_cmd($ssh, 'show spanning-tree detail | include VLAN|topology changes', 25);
+    my (@tcn_warn);
+    $cur_vlan = '';
+    for my $line (split /\n/, $detail) {
+        $cur_vlan = $1 if $line =~ /^(VLAN\d+)\s/;
+        push @tcn_warn, "$cur_vlan(n=$1)"
+            if $line =~ /Number of topology changes\s+(\d+)/i && $1 >= $opt_tcn && $cur_vlan;
+    }
+
+    if (@tcn_warn) {
+        out "WARN: TCN >= $opt_tcn on: " . join(', ', @tcn_warn) . "\n";
+    } else {
+        out "TCN instability check: OK (threshold=$opt_tcn)\n";
+    }
+
+    $ssh->close();
+    out "Done: $host\n";
+}
+
+for my $dev (@devices) {
+    eval { audit_host($dev) };
+    out "FATAL [$dev]: $@\n" if $@;
+}
+
+close $log_fh if $log_fh;
