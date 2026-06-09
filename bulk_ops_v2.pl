@@ -1,177 +1,159 @@
 #!/usr/bin/perl
+#
+# spanning_tree_audit.pl - Spanning Tree Protocol topology audit
+#
+# Purpose:
+#   Audits STP state across Cisco IOS/IOS-XE switches. Reports the root
+#   bridge MAC per VLAN, flags when the polled device is itself the root,
+#   and lists any ports currently in BLK state. Use this after topology
+#   changes, new switch deployments, or when troubleshooting L2 loops.
+#
+# Usage:
+#   ./spanning_tree_audit.pl -u USER -p PASS [options] host1 [host2 ...]
+#   ./spanning_tree_audit.pl -u USER -p PASS -f device_list.txt
+#
+# Options:
+#   -u, --user    SSH username (required)
+#   -p, --pass    SSH password (required)
+#   -f, --file    File of device IPs/hostnames, one per line (# = comment)
+#   -l, --log     Append results to this logfile
+#   -t, --timeout SSH/command timeout in seconds (default: 30)
+#
+# Prerequisites:
+#   cpanm Net::SSH::Expect
+#   SSH access enabled on target devices
+#   Cisco IOS or IOS-XE with 802.1D/w/s spanning tree
+#
+# Example:
+#   ./spanning_tree_audit.pl -u netops -p s3cret \
+#       -l /var/log/stp_audit.log 10.1.1.1 10.1.1.2 10.1.1.3
+
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case);
 use POSIX qw(strftime);
 
-# stp_check.pl - Spanning Tree Protocol topology auditor
-#
-# PURPOSE:
-#   Audits STP state across one or more Cisco IOS devices: identifies root bridges
-#   per VLAN, flags non-default root priorities, reports topology-change counters,
-#   and lists any ports currently in BLK or LIS state that may indicate a loop risk.
-#
-# USAGE:
-#   Single device:  ./stp_check.pl --host 10.0.0.1 --user admin --pass s3cr3t
-#   Device list:    ./stp_check.pl --file devices.txt --user admin --pass s3cr3t
-#   With log file:  ./stp_check.pl --host 10.0.0.1 --user admin --pass s3cr3t --log stp_audit.log
-#
-# PREREQUISITES:
-#   cpan Net::SSH::Expect
-#   SSH must be enabled on target devices (crypto key generate rsa / ip ssh version 2)
-#   User account needs privilege 1+ (show commands only)
-#
-# OUTPUT:
-#   Tab-aligned summary to STDOUT; optional append to --log file.
-#   Exit code 0 = clean, 1 = anomalies found, 2 = connection/auth error.
-
-my ($host, $file, $user, $pass, $enable_pass, $logfile, $timeout);
-$timeout = 30;
+my ($user, $pass, $device_file, $logfile);
+my $timeout = 30;
 
 GetOptions(
-    'host=s'    => \$host,
-    'file=s'    => \$file,
-    'user=s'    => \$user,
-    'pass=s'    => \$pass,
-    'enable=s'  => \$enable_pass,
-    'log=s'     => \$logfile,
-    'timeout=i' => \$timeout,
-) or die "Usage: $0 --host HOST|--file FILE --user USER --pass PASS [--enable PASS] [--log FILE]\n";
+    'u|user=s'    => \$user,
+    'p|pass=s'    => \$pass,
+    'f|file=s'    => \$device_file,
+    'l|log=s'     => \$logfile,
+    't|timeout=i' => \$timeout,
+) or die "Usage: $0 -u USER -p PASS [-f file | host ...] [-l logfile]\n";
 
-die "Provide --host or --file\n"  unless $host || $file;
-die "Provide --user and --pass\n" unless $user && $pass;
+die "ERROR: -u (username) and -p (password) are required\n" unless $user && $pass;
 
 my @devices;
-if ($host) {
-    push @devices, $host;
-} else {
-    open my $fh, '<', $file or die "Cannot open $file: $!\n";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_; }
+if ($device_file) {
+    open my $fh, '<', $device_file or die "Cannot open '$device_file': $!\n";
+    while (<$fh>) { chomp; s/#.*//; next unless /\S/; push @devices, $_; }
     close $fh;
 }
+push @devices, @ARGV;
+die "ERROR: No devices specified. Pass hostnames as args or use -f.\n" unless @devices;
 
 my $log_fh;
 if ($logfile) {
-    open $log_fh, '>>', $logfile or die "Cannot open log $logfile: $!\n";
+    open $log_fh, '>>', $logfile
+        or warn "Cannot open logfile '$logfile': $! (logging disabled)\n";
 }
 
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-my $anomaly_found = 0;
-
-sub emit {
-    my $line = shift;
-    print $line, "\n";
-    print $log_fh $line, "\n" if $log_fh;
+sub out {
+    my ($line) = @_;
+    print "$line\n";
+    print $log_fh "$line\n" if $log_fh;
 }
 
-emit("=" x 72);
-emit("STP Topology Audit  $timestamp");
-emit("=" x 72);
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+out("=" x 58);
+out("STP Audit  |  $ts");
+out(sprintf("Devices: %d  |  Timeout: %ds", scalar(@devices), $timeout));
+out("=" x 58);
 
-for my $dev (@devices) {
-    emit("\n--- $dev ---");
+my ($ok, $fail) = (0, 0);
+
+for my $host (@devices) {
+    out("\n[$host]");
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $dev,
-        user        => $user,
-        password    => $pass,
-        raw_pty     => 1,
-        timeout     => $timeout,
+        host       => $host,
+        user       => $user,
+        password   => $pass,
+        raw_pty    => 1,
+        timeout    => $timeout,
+        log_stdout => 0,
     );
 
-    my $login_output;
-    eval { $login_output = $ssh->login() };
-    if ($@ || !defined $login_output) {
-        emit("  ERROR: SSH connection/auth failed - $@");
-        $anomaly_found = 1;
+    my $login;
+    eval { $login = $ssh->login() };
+    if ($@ || !defined $login) {
+        (my $err = $@ // 'unknown error') =~ s/\n/ /g;
+        out("  FAIL  connection error: $err");
+        $fail++;
+        next;
+    }
+    if ($login =~ /[Dd]enied|[Ii]ncorrect|[Ff]ail/i) {
+        out("  FAIL  authentication rejected");
+        $fail++;
         next;
     }
 
-    # Handle enable mode if needed
-    if ($enable_pass) {
-        $ssh->send("enable");
-        $ssh->waitfor('Password:', $timeout) or do {
-            emit("  ERROR: Enable prompt not received");
+    $ssh->exec("terminal length 0");
+
+    my $raw = $ssh->exec("show spanning-tree");
+    if (!defined $raw || length($raw) < 20) {
+        out("  FAIL  no output from 'show spanning-tree'");
+        $ssh->close();
+        $fail++;
+        next;
+    }
+
+    my (%roots, %blocked);
+    my ($cur_vlan, $in_root) = (undef, 0);
+
+    for my $line (split /\n/, $raw) {
+        if ($line =~ /^VLAN(\d+)/) {
+            $cur_vlan = int($1);
+            $in_root  = 0;
             next;
-        };
-        $ssh->send($enable_pass);
-        $ssh->waitfor('#', $timeout);
+        }
+        next unless defined $cur_vlan;
+
+        $in_root = 1 if $line =~ /\bRoot\s+ID\b/;
+        $in_root = 0 if $line =~ /\bBridge\s+ID\b/;
+
+        if ($in_root && $line =~ /Address\s+([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})/) {
+            $roots{$cur_vlan}{mac} = lc $1;
+        }
+        if ($line =~ /This bridge is the root/) {
+            $roots{$cur_vlan}{local_root} = 1;
+        }
+        if ($line =~ /^\s*((?:Gi|Fa|Te|Eth|Po)\S+)\s+\S+\s+BLK\b/i) {
+            push @{$blocked{$cur_vlan}}, $1;
+        }
     }
 
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('#', $timeout);
+    if (!%roots) {
+        out("  INFO  no STP VLANs detected (STP disabled or access-only uplink)");
+    }
 
-    # Collect STP summary
-    $ssh->send("show spanning-tree summary");
-    my $stp_summary = $ssh->waitfor('#', $timeout) // '';
+    for my $vlan (sort { $a <=> $b } keys %roots) {
+        my $mac  = $roots{$vlan}{mac}        // 'unknown';
+        my $flag = $roots{$vlan}{local_root} ? '  <-- THIS SWITCH IS ROOT' : '';
+        out(sprintf("  VLAN %-5d  root %s%s", $vlan, $mac, $flag));
+        if (my @blk = @{$blocked{$vlan} // []}) {
+            out("             blocked: " . join(', ', @blk));
+        }
+    }
 
-    # Collect per-VLAN STP detail
-    $ssh->send("show spanning-tree");
-    my $stp_detail = $ssh->waitfor('#', $timeout) // '';
-
-    $ssh->send("exit");
     $ssh->close();
-
-    # Parse root bridge info per VLAN
-    my %root_vlans;
-    while ($stp_detail =~ /VLAN(\d+)\s*\n.*?This bridge is the root/sg) {
-        $root_vlans{$1} = 1;
-    }
-
-    # Parse priority and root info
-    my @vlan_blocks;
-    while ($stp_detail =~ /(VLAN\d+\n(?:.*\n)*?(?=VLAN\d+|\z))/g) {
-        push @vlan_blocks, $1;
-    }
-
-    my @blocked_ports;
-    while ($stp_detail =~ /(\S+)\s+(?:BLK|LIS)\s+\d+\s+\d+\s+\d+\s+(BLK|LIS)/g) {
-        push @blocked_ports, "$1 ($2)";
-    }
-    # Alternative pattern for IOS-XE format
-    while ($stp_detail =~ /^\s+(\S+)\s+\S+\s+(BLK|LIS)\b/mg) {
-        push @blocked_ports, "$1 ($2)" unless grep { /^$1/ } @blocked_ports;
-    }
-
-    # Extract topology change counts
-    my $tc_count = 0;
-    if ($stp_summary =~ /topology changes\s+(\d+)/i) {
-        $tc_count = $1;
-    }
-
-    # Report root VLANs
-    if (%root_vlans) {
-        emit("  ROOT for VLANs: " . join(', ', sort { $a <=> $b } keys %root_vlans));
-    } else {
-        emit("  Not root bridge for any VLAN on this device");
-    }
-
-    # Flag high topology change count (>100 may indicate instability)
-    if ($tc_count > 100) {
-        emit("  WARN: High topology change count: $tc_count");
-        $anomaly_found = 1;
-    } else {
-        emit("  Topology changes: $tc_count");
-    }
-
-    # Report blocked/listening ports
-    if (@blocked_ports) {
-        my @uniq = do { my %s; grep { !$s{$_}++ } @blocked_ports };
-        emit("  Blocked/Listening ports: " . join(', ', @uniq));
-    } else {
-        emit("  No ports in BLK/LIS state");
-    }
-
-    # Flag missing portfast summary line (indicates possible misconfiguration)
-    if ($stp_summary !~ /portfast bpdu guard\s+enabled/i) {
-        emit("  NOTICE: BPDU Guard not globally enabled");
-    }
+    $ok++;
 }
 
-emit("\n" . "=" x 72);
-emit("Audit complete. Anomalies detected: " . ($anomaly_found ? "YES" : "none"));
-emit("=" x 72);
-
+out("\n" . "=" x 58);
+out("Done: $ok succeeded, $fail failed");
 close $log_fh if $log_fh;
-exit($anomaly_found ? 1 : 0);
