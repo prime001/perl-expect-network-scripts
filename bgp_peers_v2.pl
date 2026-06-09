@@ -1,188 +1,193 @@
 ```perl
 #!/usr/bin/perl
-# bgp_flap_monitor.pl - BGP peer flap detection and zero-prefix alerting
+#
+# bgp_prefix_monitor.pl
 #
 # PURPOSE:
-#   Connects to Cisco IOS/IOS-XE routers via SSH and analyzes BGP summary
-#   output to detect recently-flapped peers (uptime under threshold) and
-#   established peers advertising zero prefixes. Useful for post-change
-#   validation and automated NOC health sweeps.
+#   Monitor BGP neighbor prefix counts against configurable thresholds.
+#   Connects to one or more routers, collects BGP summary output, parses
+#   prefix counts per neighbor, and reports peers that are down or have
+#   dropped below warning/critical prefix thresholds.  Useful for detecting
+#   route withdrawals, session resets, or unexpected route leaks without
+#   relying on SNMP polling.
 #
 # USAGE:
-#   Single device:  perl bgp_flap_monitor.pl -h 192.168.1.1 -u admin -p pass
-#   Device file:    perl bgp_flap_monitor.pl -f devices.txt -u admin -p pass
-#   With log:       perl bgp_flap_monitor.pl -h 192.168.1.1 -u admin -p pass -l bgp.log
-#   Custom threshold (seconds):
-#                   perl bgp_flap_monitor.pl -h 192.168.1.1 -u admin -p pass -t 600
+#   Single device:   perl bgp_prefix_monitor.pl -h 192.168.1.1
+#   Device list:     perl bgp_prefix_monitor.pl -f devices.txt
+#   With thresholds: perl bgp_prefix_monitor.pl -h 10.0.0.1 -w 700000 -c 600000
+#   With log file:   perl bgp_prefix_monitor.pl -h 10.0.0.1 -l /var/log/bgp_prefixes.log
 #
 # PREREQUISITES:
-#   cpan install Expect Getopt::Long
-#   SSH key auth preferred; password auth supported via -p flag
-#   Tested: Cisco IOS 15.x, IOS-XE 16.x/17.x
+#   Perl modules: Net::SSH::Expect, Getopt::Long, POSIX
+#     Install: cpan Net::SSH::Expect
+#   SSH key-based auth recommended; password via -p or NET_PASS env var.
+#   Router user needs at minimum privilege level 1 (show commands).
 #
-# DEVICE FILE FORMAT:
-#   One IP or hostname per line; lines starting with # are skipped
+# EXIT CODES (Nagios-compatible):
+#   0 = OK       - all peers Established and within thresholds
+#   1 = WARNING  - at least one peer below warning prefix threshold
+#   2 = CRITICAL - at least one peer down or below critical threshold
+#
 
 use strict;
 use warnings;
-use Expect;
+use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $file, $user, $pass, $logfile, $threshold, $help);
-$threshold = 300;
+my ($host, $device_file, $username, $password, $log_file);
+my $warn_threshold = 0;
+my $crit_threshold = 0;
+my $timeout        = 30;
+my $ssh_port       = 22;
 
 GetOptions(
-    'h|host=s'      => \$host,
-    'f|file=s'      => \$file,
-    'u|user=s'      => \$user,
-    'p|pass=s'      => \$pass,
-    'l|log=s'       => \$logfile,
-    't|threshold=i' => \$threshold,
-    'help'          => \$help,
-) or die usage();
+    'h|host=s'    => \$host,
+    'f|file=s'    => \$device_file,
+    'u|user=s'    => \$username,
+    'p|pass=s'    => \$password,
+    'w|warn=i'    => \$warn_threshold,
+    'c|crit=i'    => \$crit_threshold,
+    'l|log=s'     => \$log_file,
+    't|timeout=i' => \$timeout,
+    'P|port=i'    => \$ssh_port,
+) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-w warn] [-c crit] [-l logfile]\n";
 
-die usage() if $help or (!$host and !$file) or !$user;
+$username //= $ENV{NET_USER} // 'admin';
+$password //= $ENV{NET_PASS} // '';
+
+die "Specify -h <host> or -f <file>\n" unless $host || $device_file;
 
 my @devices;
-if ($host) {
-    push @devices, $host;
-} else {
-    open(my $fh, '<', $file) or die "Cannot open device file $file: $!\n";
+if ($device_file) {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
     while (<$fh>) {
-        chomp;
-        next if /^\s*#/ or /^\s*$/;
-        push @devices, $_;
+        chomp; s/#.*//; s/^\s+|\s+$//g;
+        push @devices, $_ if length $_;
     }
     close $fh;
+} else {
+    push @devices, $host;
 }
 
 my $log_fh;
-if ($logfile) {
-    open($log_fh, '>>', $logfile) or die "Cannot open log file $logfile: $!\n";
+if ($log_file) {
+    open $log_fh, '>>', $log_file or warn "Cannot open log $log_file: $!\n";
 }
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-log_out("=== BGP Flap Monitor: $ts | threshold=${threshold}s ===");
+sub log_msg {
+    my ($msg) = @_;
+    my $ts   = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    my $line = "[$ts] $msg";
+    print "$line\n";
+    print $log_fh "$line\n" if $log_fh;
+}
 
-for my $dev (@devices) {
-    log_out("\n[+] Connecting to $dev ...");
-    check_device($dev);
+sub check_bgp_prefixes {
+    my ($device) = @_;
+    my %result = (device => $device, peers => [], errors => []);
+
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host       => $device,
+            user       => $username,
+            password   => $password,
+            raw_pty    => 1,
+            timeout    => $timeout,
+            ssh_option => "-p $ssh_port -o StrictHostKeyChecking=no -o ConnectTimeout=$timeout",
+        );
+    };
+    if ($@) {
+        push @{$result{errors}}, "SSH init failed: $@";
+        return \%result;
+    }
+
+    my $login = eval { $ssh->login() };
+    if ($@ || !$ssh->is_logged_in()) {
+        push @{$result{errors}}, "Login failed: " . ($@ // 'auth error');
+        return \%result;
+    }
+
+    $ssh->exec("terminal length 0");
+
+    # Try show bgp summary first (IOS-XE/NX-OS), fall back to show ip bgp summary (classic IOS)
+    my $output = $ssh->exec("show bgp summary");
+    if (!defined $output || length($output) < 20) {
+        $output = $ssh->exec("show ip bgp summary");
+    }
+    $ssh->close();
+
+    unless (defined $output && length($output) > 20) {
+        push @{$result{errors}}, "No BGP summary output received";
+        return \%result;
+    }
+
+    # Parse neighbor lines from IOS, IOS-XE, and NX-OS "show bgp summary"
+    # Established peer line ends with an integer (prefix count)
+    # Non-established peer line ends with a state string (Idle, Active, Connect, etc.)
+    for my $line (split /\n/, $output) {
+        next unless $line =~ /^\s*(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]{4,39})\s+/;
+        my @f = grep { length $_ } split /\s+/, $line;
+        next if @f < 9;
+
+        my $neighbor = $f[0];
+        my $last     = $f[-1];
+        my $updown   = $f[-2];
+
+        my $peer = { neighbor => $neighbor };
+        if ($last =~ /^\d+$/) {
+            $peer->{status}   = 'Established';
+            $peer->{prefixes} = int($last);
+            $peer->{uptime}   = $updown;
+        } else {
+            $peer->{status}   = $last;
+            $peer->{prefixes} = 0;
+            $peer->{uptime}   = 'N/A';
+        }
+        push @{$result{peers}}, $peer;
+    }
+
+    return \%result;
+}
+
+my $overall = 0;
+
+for my $device (@devices) {
+    log_msg("Checking BGP prefix counts on $device");
+    my $result = check_bgp_prefixes($device);
+
+    if (@{$result->{errors}}) {
+        log_msg("  ERROR   [$device] $_") for @{$result->{errors}};
+        $overall = 2 if $overall < 2;
+        next;
+    }
+
+    unless (@{$result->{peers}}) {
+        log_msg("  INFO    [$device] No BGP neighbors found");
+        next;
+    }
+
+    for my $peer (@{$result->{peers}}) {
+        my ($nbr, $pfx, $status, $up) = @{$peer}{qw(neighbor prefixes status uptime)};
+
+        if ($status ne 'Established') {
+            log_msg("  CRITICAL [$device] neighbor=$nbr state=$status prefixes=0 uptime=$up");
+            $overall = 2 if $overall < 2;
+        } elsif ($crit_threshold && $pfx < $crit_threshold) {
+            log_msg("  CRITICAL [$device] neighbor=$nbr prefixes=$pfx below_crit=$crit_threshold uptime=$up");
+            $overall = 2 if $overall < 2;
+        } elsif ($warn_threshold && $pfx < $warn_threshold) {
+            log_msg("  WARNING  [$device] neighbor=$nbr prefixes=$pfx below_warn=$warn_threshold uptime=$up");
+            $overall = 1 if $overall < 1;
+        } else {
+            log_msg("  OK       [$device] neighbor=$nbr prefixes=$pfx uptime=$up");
+        }
+    }
 }
 
 close $log_fh if $log_fh;
 
-sub check_device {
-    my ($dev) = @_;
-
-    my $exp = Expect->new;
-    $exp->raw_pty(1);
-    $exp->log_stdout(0);
-
-    my @ssh_cmd = ('ssh',
-        '-o', 'StrictHostKeyChecking=no',
-        '-o', 'ConnectTimeout=10',
-        '-l', $user, $dev);
-
-    unless ($exp->spawn(@ssh_cmd)) {
-        log_out("  ERROR: spawn failed for $dev: $!");
-        return;
-    }
-
-    my $authed = 0;
-    $exp->expect(15,
-        [ qr/[Pp]assword:/,   sub { $exp->send("$pass\n"); exp_continue; } ],
-        [ qr/yes\/no/,        sub { $exp->send("yes\n");   exp_continue; } ],
-        [ qr/[>#]\s*$/,       sub { $authed = 1; } ],
-        [ timeout =>          sub { log_out("  ERROR: connection timeout to $dev"); } ],
-    );
-
-    unless ($authed) {
-        log_out("  ERROR: authentication failed for $dev");
-        $exp->soft_close;
-        return;
-    }
-
-    $exp->send("terminal length 0\n");
-    $exp->expect(5, qr/[>#]\s*$/);
-
-    my $label = $dev;
-    $exp->send("show version | include hostname\n");
-    $exp->expect(5, qr/[>#]\s*$/);
-    $label = $1 if $exp->before() =~ /hostname\s+(\S+)/i;
-
-    $exp->send("show ip bgp summary\n");
-    $exp->expect(15, qr/[>#]\s*$/);
-    my $raw = $exp->before();
-
-    $exp->send("exit\n");
-    $exp->soft_close;
-
-    parse_summary($label, $dev, $raw);
-}
-
-sub parse_summary {
-    my ($label, $ip, $raw) = @_;
-
-    my (@flapped, @zero_pfx, $total);
-
-    for my $line (split /\n/, $raw) {
-        # IOS BGP summary peer line format:
-        # Neighbor  V  AS  MsgRcvd MsgSent TblVer InQ OutQ Up/Down State/PfxRcd
-        next unless $line =~ /^(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\S+)\s+(\S+)/;
-        my ($peer, $as, $updown, $state) = ($1, $2, $3, $4);
-        $total++;
-
-        if ($state =~ /^\d+$/) {
-            push @zero_pfx, "$peer (AS$as)" if $state == 0;
-            my $secs = uptime_to_secs($updown);
-            if (defined $secs && $secs < $threshold) {
-                push @flapped, sprintf("    %-18s AS%-8s up/down=%-12s prefixes=%s", $peer, $as, $updown, $state);
-            }
-        } else {
-            push @flapped, sprintf("    %-18s AS%-8s up/down=%-12s state=%s", $peer, $as, $updown, $state);
-        }
-    }
-
-    $total //= 0;
-    log_out(sprintf("  Router: %s (%s) | peers found: %d", $label, $ip, $total));
-
-    if (@flapped) {
-        log_out("  [WARN] Recently flapped or non-Established peers:");
-        log_out($_) for @flapped;
-    } else {
-        log_out("  [OK]   No recently flapped peers");
-    }
-
-    if (@zero_pfx) {
-        log_out("  [WARN] Established peers with 0 prefixes received: " . join(', ', @zero_pfx));
-    }
-}
-
-sub uptime_to_secs {
-    my ($t) = @_;
-    return undef if $t eq 'never';
-    return $1*3600 + $2*60 + $3 if $t =~ /^(\d+):(\d+):(\d+)$/;
-    return $1*604800 + $2*86400  if $t =~ /^(\d+)w(\d+)d$/;
-    return $1*86400  + $2*3600   if $t =~ /^(\d+)d(\d+)h$/;
-    return undef;
-}
-
-sub log_out {
-    my ($msg) = @_;
-    print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
-}
-
-sub usage {
-    return <<'END';
-Usage: bgp_flap_monitor.pl -h <host>|-f <file> -u <user> [-p <pass>] [-l <log>] [-t <secs>]
-  -h  Device IP or hostname
-  -f  File with device list (one per line, # comments ok)
-  -u  SSH username
-  -p  SSH password (omit for key-based auth)
-  -l  Log file (appended)
-  -t  Flap threshold in seconds (default: 300)
-END
-}
+my @labels = ('OK', 'WARNING', 'CRITICAL');
+log_msg("Result: $labels[$overall]");
+exit $overall;
 ```
