@@ -1,134 +1,165 @@
+```perl
 #!/usr/bin/perl
-use strict;
-use warnings;
-use Net::SSH::Expect;
-use Getopt::Long;
-use Time::HiRes qw(time);
-
 =head1 NAME
-acl_effectiveness_monitor.pl - Monitor ACL hit statistics on network devices
+
+acl_rule_counter.pl - Analyze and report device ACL configurations
+
+=head1 SYNOPSIS
+
+  ./acl_rule_counter.pl <device> [--username user] [--password pass] [--logfile path]
 
 =head1 DESCRIPTION
-Connects to Cisco IOS/IOS-XE devices via SSH and reports ACL statistics,
-showing which ACLs are being matched and which may be inactive. Helps identify
-unused rules and optimize security policies.
 
-=head1 USAGE
-acl_effectiveness_monitor.pl -h 192.168.1.1 -u admin -p password
-acl_effectiveness_monitor.pl -f devices.txt -u admin -p password -l acl_stats.log
+Connects to network device via SSH and analyzes Access Control Lists (ACLs).
+Reports on rule counts per ACL, identifies large ACLs (>100 rules), and detects
+potentially unused ACLs. Outputs summary to STDOUT and optional log file.
 
-=head1 REQUIREMENTS
-Net::SSH::Expect Perl module, SSH access to devices, valid credentials
+Useful for ACL management and capacity planning.
+
+=head1 PREREQUISITES
+
+  - Expect module (perl -e 'use Expect')
+  - SSH access to device with appropriate credentials
+  - Cisco IOS/IOS-XE network device
+
+=head1 USAGE EXAMPLES
+
+  # Single device with defaults (reads username/password from environment)
+  ./acl_rule_counter.pl 192.168.1.1
+
+  # With explicit credentials and logging
+  ./acl_rule_counter.pl 10.0.0.5 --username admin --password P@ssw0rd --logfile acl_audit.log
+
+  # Read credentials from environment variables
+  export NET_USER=admin NET_PASS=cisco
+  ./acl_rule_counter.pl core-router-1
 
 =cut
 
-my ($host, $file, $user, $pass, $log_file);
+use strict;
+use warnings;
+use Expect;
+use Getopt::Long;
 
+my ($username, $password, $logfile);
 GetOptions(
-    'h|host=s' => \$host,
-    'f|file=s' => \$file,
-    'u|user=s' => \$user,
-    'p|pass=s' => \$pass,
-    'l|log=s'  => \$log_file,
-) or die "Error in command line arguments\n";
+    'username=s' => \$username,
+    'password=s' => \$password,
+    'logfile=s'  => \$logfile,
+) or die "Error parsing options\n";
 
-die "Usage: $0 -h <host> OR -f <file> -u <user> -p <password>\n" 
-    unless (($host || $file) && $user && $pass);
+my $device = shift @ARGV or die "Usage: $0 <device> [--username user] [--password pass] [--logfile path]\n";
 
-my @devices = ();
-if ($host) {
-    @devices = ($host);
-} else {
-    open my $fh, '<', $file or die "Cannot open $file: $!\n";
-    @devices = map { chomp; $_ } <$fh>;
-    close $fh;
+$username ||= $ENV{NET_USER} || 'admin';
+$password ||= $ENV{NET_PASS} || 'cisco';
+
+open my $LOG, '>>', $logfile if $logfile;
+
+sub log_msg {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $LOG "$msg\n" if $logfile;
 }
 
-my $logfh;
-if ($log_file) {
-    open $logfh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
-}
-
-foreach my $device (@devices) {
-    next unless $device;
-    my $result = check_acl_stats($device, $user, $pass);
-    print $result;
-    print $logfh $result if $logfh;
-}
-
-close $logfh if $logfh;
-
-sub check_acl_stats {
-    my ($device, $username, $password) = @_;
-    my $output = "=== ACL Stats: $device @ ".scalar(localtime)." ===\n";
+eval {
+    my $exp = Expect->new();
+    $exp->log_stdout(0);
+    $exp->timeout(20);
     
-    my $ssh;
-    eval {
-        $ssh = Net::SSH::Expect->new(
-            host      => $device,
-            password  => $password,
-            user      => $username,
-            raw_pty   => 1,
-            timeout   => 20,
-        );
-    };
+    # Connect via SSH
+    $exp->spawn("ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -l $username $device")
+        or die "SSH spawn failed: $!\n";
     
-    if ($@) {
-        $output .= "ERROR: Connection failed - $@\n\n";
-        return $output;
-    }
+    # Wait for password prompt
+    my $ok = $exp->expect(15, 'password:');
+    die "No password prompt within 15 seconds\n" unless $ok;
     
-    eval {
-        $ssh->login();
-    };
+    # Send password
+    $exp->send("$password\r");
     
-    if ($@) {
-        $output .= "ERROR: Authentication failed - $@\n\n";
-        return $output;
-    }
+    # Wait for CLI prompt
+    $ok = $exp->expect(15, ['#', '>']);
+    die "Authentication failed or prompt timeout\n" unless $ok;
     
-    my $result;
-    eval {
-        $ssh->send("show ip access-list\n");
-        $result = $ssh->read_all(3);
-    };
+    log_msg("\n=== ACL Analysis Report ===");
+    log_msg("Device: $device");
+    log_msg("Timestamp: " . scalar(localtime()));
+    log_msg("");
     
-    if ($@ || !$result) {
-        $output .= "ERROR: Command execution failed - $@\n\n";
-        eval { $ssh->close(); };
-        return $output;
-    }
+    # Retrieve ACL configuration
+    $exp->send("show access-lists\r");
+    $ok = $exp->expect(15, ['#', '>']);
+    die "Command timeout\n" unless $ok;
     
-    if ($result =~ /^Error|^\s+\^|Invalid input/i) {
-        $output .= "WARNING: No ACLs found or command not supported\n\n";
-        eval { $ssh->close(); };
-        return $output;
-    }
-    
-    my %acl_stats = ();
+    my @lines = split /\n/, $exp->before();
+    my %acl_rules = ();
     my $current_acl = '';
     
-    foreach my $line (split /\n/, $result) {
-        if ($line =~ /^Extended IP access list (\S+)/) {
+    # Parse ACL output
+    foreach my $line (@lines) {
+        # Detect ACL start line
+        if ($line =~ /^(?:Extended |Standard )?[Ii]P\s+access list\s+(\S+)/) {
             $current_acl = $1;
-            $acl_stats{$current_acl} = { lines => 0, matches => 0 };
-        } elsif ($current_acl && $line =~ /(\d+)\s+(permit|deny).*match/) {
-            $acl_stats{$current_acl}{lines}++;
-            $acl_stats{$current_acl}{matches}++ if $line =~ /match/;
-        } elsif ($current_acl && $line =~ /(\d+)\s+(permit|deny)/) {
-            $acl_stats{$current_acl}{lines}++;
+            $acl_rules{$current_acl} = 0 unless exists $acl_rules{$current_acl};
+        }
+        # Count permit/deny rules
+        elsif ($current_acl && $line =~ /^\s+\d+\s+(?:permit|deny)/) {
+            $acl_rules{$current_acl}++;
         }
     }
     
-    foreach my $acl (sort keys %acl_stats) {
-        my $stats = $acl_stats{$acl};
-        $output .= sprintf("  ACL: %-30s Rules: %3d  Matched: %s\n",
-                          $acl, $stats->{lines}, 
-                          $stats->{matches} ? "Yes" : "No");
+    # Display results
+    log_msg("Total ACLs Found: " . scalar(keys %acl_rules));
+    log_msg("");
+    
+    # Sort by rule count (descending)
+    my @sorted_acls = sort { $acl_rules{$b} <=> $acl_rules{$a} } keys %acl_rules;
+    
+    my (@large, @empty);
+    log_msg("ACL Rule Count Summary:");
+    log_msg("-" x 50);
+    
+    foreach my $acl (@sorted_acls) {
+        my $count = $acl_rules{$acl};
+        my $status = '';
+        
+        if ($count > 100) {
+            $status = ' [LARGE - capacity concern]';
+            push @large, $acl;
+        } elsif ($count == 0) {
+            $status = ' [EMPTY]';
+            push @empty, $acl;
+        }
+        
+        log_msg(sprintf("  %-40s %4d rules%s", $acl, $count, $status));
     }
     
-    eval { $ssh->close(); };
+    log_msg("-" x 50);
     
-    $output .= "\n";
-    return $output;
-}
+    # Warnings and notes
+    if (@large) {
+        log_msg("\nWARNING: " . scalar(@large) . " ACL(s) exceed 100 rules:");
+        foreach my $acl (@large) {
+            log_msg("  - $acl (" . $acl_rules{$acl} . " rules)");
+        }
+    }
+    
+    if (@empty) {
+        log_msg("\nNOTE: " . scalar(@empty) . " ACL(s) have no rules (potential cleanup candidates)");
+    }
+    
+    # Cleanup
+    $exp->send("exit\r");
+    $exp->soft_close();
+    
+    log_msg("\nReport completed successfully");
+    
+} or do {
+    log_msg("ERROR: $@");
+    $exp->soft_close() if defined $exp;
+    exit 1;
+};
+
+close $LOG if $logfile;
+exit 0;
+```
