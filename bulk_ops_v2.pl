@@ -1,159 +1,166 @@
 #!/usr/bin/perl
-#
-# spanning_tree_audit.pl - Spanning Tree Protocol topology audit
+# =============================================================================
+# acl_audit.pl - Cisco IOS ACL Audit Tool
 #
 # Purpose:
-#   Audits STP state across Cisco IOS/IOS-XE switches. Reports the root
-#   bridge MAC per VLAN, flags when the polled device is itself the root,
-#   and lists any ports currently in BLK state. Use this after topology
-#   changes, new switch deployments, or when troubleshooting L2 loops.
+#   Connects to Cisco IOS/IOS-XE devices via SSH and audits access control
+#   lists. Flags overly permissive rules (permit ip any any), ACLs missing
+#   a deny-log terminator, collects hit counts for optimization review, and
+#   produces a per-device summary suitable for security compliance reports.
 #
 # Usage:
-#   ./spanning_tree_audit.pl -u USER -p PASS [options] host1 [host2 ...]
-#   ./spanning_tree_audit.pl -u USER -p PASS -f device_list.txt
+#   acl_audit.pl -h 192.168.1.1
+#   acl_audit.pl -f hosts.txt -l
+#   acl_audit.pl -h 10.0.0.1 -u netops -p secret -e enablepass -l
 #
 # Options:
-#   -u, --user    SSH username (required)
-#   -p, --pass    SSH password (required)
-#   -f, --file    File of device IPs/hostnames, one per line (# = comment)
-#   -l, --log     Append results to this logfile
-#   -t, --timeout SSH/command timeout in seconds (default: 30)
+#   -h <host>     Single device IP or hostname
+#   -f <file>     File with one device IP/hostname per line (# = comment)
+#   -u <user>     SSH username (default: $NET_USER env var or 'admin')
+#   -p <pass>     SSH password (default: $NET_PASS env var)
+#   -e <pass>     Enable password (default: same as SSH password)
+#   -l            Write output to acl_audit_TIMESTAMP.log in addition to STDOUT
+#   -t <secs>     Per-command timeout in seconds (default: 30)
 #
 # Prerequisites:
-#   cpanm Net::SSH::Expect
-#   SSH access enabled on target devices
-#   Cisco IOS or IOS-XE with 802.1D/w/s spanning tree
-#
-# Example:
-#   ./spanning_tree_audit.pl -u netops -p s3cret \
-#       -l /var/log/stp_audit.log 10.1.1.1 10.1.1.2 10.1.1.3
+#   cpan install Net::SSH::Expect
+#   Devices must have SSH enabled; account needs at minimum 'show' privilege.
+# =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
+use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($user, $pass, $device_file, $logfile);
-my $timeout = 30;
+my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_enable, $opt_log);
+my $opt_timeout = 30;
 
 GetOptions(
-    'u|user=s'    => \$user,
-    'p|pass=s'    => \$pass,
-    'f|file=s'    => \$device_file,
-    'l|log=s'     => \$logfile,
-    't|timeout=i' => \$timeout,
-) or die "Usage: $0 -u USER -p PASS [-f file | host ...] [-l logfile]\n";
+    'h|host=s'    => \$opt_host,
+    'f|file=s'    => \$opt_file,
+    'u|user=s'    => \$opt_user,
+    'p|pass=s'    => \$opt_pass,
+    'e|enable=s'  => \$opt_enable,
+    'l|log'       => \$opt_log,
+    't|timeout=i' => \$opt_timeout,
+) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-e enable] [-l] [-t secs]\n";
 
-die "ERROR: -u (username) and -p (password) are required\n" unless $user && $pass;
+die "ERROR: Specify -h <host> or -f <file>\n" unless $opt_host || $opt_file;
+
+$opt_user   //= $ENV{NET_USER} // 'admin';
+$opt_pass   //= $ENV{NET_PASS} // die "ERROR: Set -p <pass> or NET_PASS env var\n";
+$opt_enable //= $ENV{NET_ENABLE} // $opt_pass;
 
 my @devices;
-if ($device_file) {
-    open my $fh, '<', $device_file or die "Cannot open '$device_file': $!\n";
-    while (<$fh>) { chomp; s/#.*//; next unless /\S/; push @devices, $_; }
+if ($opt_file) {
+    open my $fh, '<', $opt_file or die "ERROR: Cannot open $opt_file: $!\n";
+    while (<$fh>) { chomp; s/#.*//; push @devices, $_ if /\S/; }
     close $fh;
-}
-push @devices, @ARGV;
-die "ERROR: No devices specified. Pass hostnames as args or use -f.\n" unless @devices;
-
-my $log_fh;
-if ($logfile) {
-    open $log_fh, '>>', $logfile
-        or warn "Cannot open logfile '$logfile': $! (logging disabled)\n";
+} else {
+    @devices = ($opt_host);
 }
 
-sub out {
-    my ($line) = @_;
-    print "$line\n";
-    print $log_fh "$line\n" if $log_fh;
+my $logfh;
+if ($opt_log) {
+    my $logfile = 'acl_audit_' . strftime('%Y%m%d_%H%M%S', localtime) . '.log';
+    open $logfh, '>', $logfile or die "ERROR: Cannot open $logfile: $!\n";
+    print "Logging output to: $logfile\n";
 }
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-out("=" x 58);
-out("STP Audit  |  $ts");
-out(sprintf("Devices: %d  |  Timeout: %ds", scalar(@devices), $timeout));
-out("=" x 58);
+sub emit { print @_; print $logfh @_ if $logfh; }
 
-my ($ok, $fail) = (0, 0);
+sub audit_device {
+    my ($dev) = @_;
+    my $ssh;
 
-for my $host (@devices) {
-    out("\n[$host]");
-
-    my $ssh = Net::SSH::Expect->new(
-        host       => $host,
-        user       => $user,
-        password   => $pass,
-        raw_pty    => 1,
-        timeout    => $timeout,
-        log_stdout => 0,
-    );
-
-    my $login;
-    eval { $login = $ssh->login() };
-    if ($@ || !defined $login) {
-        (my $err = $@ // 'unknown error') =~ s/\n/ /g;
-        out("  FAIL  connection error: $err");
-        $fail++;
-        next;
-    }
-    if ($login =~ /[Dd]enied|[Ii]ncorrect|[Ff]ail/i) {
-        out("  FAIL  authentication rejected");
-        $fail++;
-        next;
+    eval {
+        $ssh = Net::SSH::Expect->new(
+            host       => $dev,
+            user       => $opt_user,
+            password   => $opt_pass,
+            raw_pty    => 1,
+            timeout    => $opt_timeout,
+            ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=no',
+        );
+        $ssh->login();
+    };
+    if ($@) {
+        emit "[$dev] FAIL: Connection or authentication error -- $@\n";
+        return;
     }
 
-    $ssh->exec("terminal length 0");
-
-    my $raw = $ssh->exec("show spanning-tree");
-    if (!defined $raw || length($raw) < 20) {
-        out("  FAIL  no output from 'show spanning-tree'");
-        $ssh->close();
-        $fail++;
-        next;
+    eval {
+        $ssh->send('enable');
+        my $r = $ssh->waitfor('assword:|#', $opt_timeout);
+        if ($r =~ /assword:/i) {
+            $ssh->send($opt_enable);
+            $ssh->waitfor('#', $opt_timeout);
+        }
+        $ssh->send('terminal length 0');
+        $ssh->waitfor('#', $opt_timeout);
+    };
+    if ($@) {
+        emit "[$dev] FAIL: Could not enter enable mode\n";
+        return;
     }
 
-    my (%roots, %blocked);
-    my ($cur_vlan, $in_root) = (undef, 0);
+    $ssh->send('show ip access-lists');
+    my $acl_output = $ssh->waitfor('#', $opt_timeout * 2);
 
-    for my $line (split /\n/, $raw) {
-        if ($line =~ /^VLAN(\d+)/) {
-            $cur_vlan = int($1);
-            $in_root  = 0;
-            next;
-        }
-        next unless defined $cur_vlan;
+    $ssh->send('show version | include uptime');
+    my $ver_output = $ssh->waitfor('#', $opt_timeout);
+    $ssh->send('exit');
 
-        $in_root = 1 if $line =~ /\bRoot\s+ID\b/;
-        $in_root = 0 if $line =~ /\bBridge\s+ID\b/;
+    my ($uptime) = ($ver_output =~ /uptime is (.+)/i);
+    $uptime //= 'unknown';
 
-        if ($in_root && $line =~ /Address\s+([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})/) {
-            $roots{$cur_vlan}{mac} = lc $1;
-        }
-        if ($line =~ /This bridge is the root/) {
-            $roots{$cur_vlan}{local_root} = 1;
-        }
-        if ($line =~ /^\s*((?:Gi|Fa|Te|Eth|Po)\S+)\s+\S+\s+BLK\b/i) {
-            push @{$blocked{$cur_vlan}}, $1;
+    my (%acls, $cur, @warnings);
+    for my $line (split /\r?\n/, $acl_output) {
+        if ($line =~ /^(?:Extended|Standard)\s+IP\s+access\s+list\s+(\S+)/i) {
+            $cur = $1;
+            $acls{$cur} = { entries => 0, hits => 0, permit_any => 0, deny_log => 0 };
+        } elsif ($cur && $line =~ /^\s+\d+\s+(.+?)\s*(?:\((\d+)\s+match)?/) {
+            my ($rule, $hits) = ($1, $2 // 0);
+            $acls{$cur}{entries}++;
+            $acls{$cur}{hits} += $hits;
+            if ($rule =~ /permit\s+ip\s+any\s+any/i) {
+                $acls{$cur}{permit_any} = 1;
+                push @warnings, "WARN  [$cur] permit ip any any detected (overly permissive)";
+            }
+            $acls{$cur}{deny_log} = 1 if $rule =~ /deny\s+any.*\blog\b/i;
         }
     }
 
-    if (!%roots) {
-        out("  INFO  no STP VLANs detected (STP disabled or access-only uplink)");
+    emit "\n" . "=" x 62 . "\n";
+    emit sprintf("Device  : %s\n", $dev);
+    emit sprintf("Uptime  : %s\n", $uptime);
+    emit sprintf("ACLs    : %d\n", scalar keys %acls);
+    emit "-" x 62 . "\n";
+    emit sprintf("%-28s %7s %11s %10s %8s\n", 'ACL Name', 'Entries', 'Hits', 'PermitAny', 'DenyLog');
+    emit "-" x 62 . "\n";
+
+    for my $name (sort keys %acls) {
+        my $a = $acls{$name};
+        emit sprintf("%-28s %7d %11d %10s %8s\n",
+            $name, $a->{entries}, $a->{hits},
+            $a->{permit_any} ? 'YES(!)' : 'no',
+            $a->{deny_log}   ? 'yes'    : 'NO(!)',
+        );
     }
 
-    for my $vlan (sort { $a <=> $b } keys %roots) {
-        my $mac  = $roots{$vlan}{mac}        // 'unknown';
-        my $flag = $roots{$vlan}{local_root} ? '  <-- THIS SWITCH IS ROOT' : '';
-        out(sprintf("  VLAN %-5d  root %s%s", $vlan, $mac, $flag));
-        if (my @blk = @{$blocked{$vlan} // []}) {
-            out("             blocked: " . join(', ', @blk));
-        }
+    if (@warnings) {
+        emit "\n";
+        emit "  $_\n" for @warnings;
     }
-
-    $ssh->close();
-    $ok++;
 }
 
-out("\n" . "=" x 58);
-out("Done: $ok succeeded, $fail failed");
-close $log_fh if $log_fh;
+my $start = strftime('%Y-%m-%d %H:%M:%S', localtime);
+emit "ACL Audit  : $start\n";
+emit "Devices    : " . scalar(@devices) . "\n";
+
+audit_device($_) for @devices;
+
+emit "\n" . "=" x 62 . "\n";
+emit "Audit complete: " . strftime('%Y-%m-%d %H:%M:%S', localtime) . "\n";
+close $logfh if $logfh;
