@@ -1,37 +1,32 @@
-Permission wasn't granted for the write. Here's the complete script content — paste it directly:
+The user wants the script content as direct output. Here it is:
 
-```perl
 #!/usr/bin/perl
 #
-# acl_hit_counter.pl - Cisco IOS/IOS-XE ACL Hit Count Analyzer
+# syslog_analyzer.pl - Cisco IOS Syslog Severity Analyzer
 #
 # Purpose:
-#   SSH to a Cisco device, pull 'show ip access-lists', parse hit counts
-#   per ACE, and flag unused rules (0 matches) and high-hit rules exceeding
-#   a configurable threshold. Useful for ACL cleanup, security audits, and
-#   identifying top-traffic rules before making changes.
+#   SSH into one or more Cisco IOS devices, retrieve the in-memory syslog
+#   buffer (show logging), categorize every message by RFC 5424 / Cisco
+#   severity level (0-EMERG through 7-DEBUG), and produce a structured
+#   report with per-severity counts plus a full listing of all events at
+#   ERROR level or above -- the entries most likely to warrant action.
 #
 # Usage:
-#   perl acl_hit_counter.pl --host <ip/hostname> --user <user> --pass <pass>
-#                           [--acl <acl-name>] [--log <logfile>]
-#                           [--threshold <N>] [--show-unused]
+#   perl syslog_analyzer.pl <host|hostfile> <user> <pass> [--logfile=FILE]
 #
-# Options:
-#   --host        Device IP or hostname (required)
-#   --user        SSH username (required)
-#   --pass        SSH password (required)
-#   --acl         Specific ACL name to inspect (default: all ACLs)
-#   --log         Append output to this file in addition to STDOUT
-#   --threshold   Hit count to flag as HIGH-TRAFFIC (default: 1000)
-#   --show-unused Include rules with 0 hits in per-ACL detail table
+# Arguments:
+#   host|hostfile  Single IP/hostname, or a file containing one per line
+#                  (lines starting with # are treated as comments)
+#   user           SSH username
+#   pass           SSH password
+#   --logfile      Optional path; output is written to both STDOUT and file
 #
 # Prerequisites:
 #   cpan Net::SSH::Expect
-#   SSH enabled on device; account needs privilege level 1+
 #
-# Example:
-#   perl acl_hit_counter.pl --host 10.0.1.1 --user netops --pass s3cr3t \
-#       --acl OUTSIDE-IN --log /var/log/acl_audit.log --show-unused
+# Examples:
+#   perl syslog_analyzer.pl 192.168.1.1  admin cisco123
+#   perl syslog_analyzer.pl routers.txt  admin cisco123 --logfile=sev_report.txt
 
 use strict;
 use warnings;
@@ -39,147 +34,107 @@ use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $user, $pass, $acl_filter, $logfile, $show_unused);
-my $threshold = 1000;
+my $logfile = '';
+GetOptions('logfile=s' => \$logfile);
 
-GetOptions(
-    'host=s'      => \$host,
-    'user=s'      => \$user,
-    'pass=s'      => \$pass,
-    'acl=s'       => \$acl_filter,
-    'log=s'       => \$logfile,
-    'threshold=i' => \$threshold,
-    'show-unused' => \$show_unused,
-) or die "See script header for usage.\n";
+my ($target, $username, $password) = @ARGV;
+die "Usage: $0 <host|hostfile> <user> <pass> [--logfile=FILE]\n"
+    unless $target && $username && $password;
 
-die "Required: --host, --user, --pass\n" unless $host && $user && $pass;
+my %SEV_NAME = (
+    0 => 'EMERGENCY', 1 => 'ALERT',  2 => 'CRITICAL', 3 => 'ERROR',
+    4 => 'WARNING',   5 => 'NOTICE', 6 => 'INFO',      7 => 'DEBUG',
+);
 
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-my $logfh;
+my @hosts;
+if (-f $target) {
+    open(my $fh, '<', $target) or die "Cannot open '$target': $!\n";
+    @hosts = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
+    close $fh;
+} else {
+    @hosts = ($target);
+}
+
+my $log_fh;
 if ($logfile) {
-    open($logfh, '>>', $logfile) or die "Cannot open log '$logfile': $!\n";
+    open($log_fh, '>', $logfile) or die "Cannot open logfile '$logfile': $!\n";
 }
 
 sub out {
-    my ($msg) = @_;
+    my $msg = shift;
     print $msg;
-    print $logfh $msg if $logfh;
+    print {$log_fh} $msg if $log_fh;
 }
 
-out("=" x 62 . "\n");
-out("ACL Hit Count Analysis  |  Device: $host\n");
-out("Timestamp: $timestamp\n");
-out("=" x 62 . "\n");
+my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+out("=" x 68 . "\n");
+out("Cisco Syslog Severity Report  --  $ts\n");
+out("=" x 68 . "\n\n");
 
-my $ssh = Net::SSH::Expect->new(
-    host     => $host,
-    user     => $user,
-    password => $pass,
-    timeout  => 20,
-    raw_pty  => 1,
-);
+for my $host (@hosts) {
+    out("Host: $host\n");
+    out("-" x 52 . "\n");
 
-eval {
-    my $banner = $ssh->login();
-    die "Auth failed or no prompt returned\n" unless $banner =~ /[>#]/;
-};
-if ($@) {
-    out("ERROR: Cannot connect to $host: $@\n");
-    close($logfh) if $logfh;
-    exit 1;
-}
-
-$ssh->exec("terminal length 0");
-
-my $cmd = $acl_filter ? "show ip access-lists $acl_filter" : "show ip access-lists";
-my $raw = $ssh->exec($cmd);
-$ssh->close();
-
-unless (defined $raw && $raw =~ /\S/) {
-    out("ERROR: No output received for: $cmd\n");
-    close($logfh) if $logfh;
-    exit 1;
-}
-
-# Parse ACL blocks
-my (%acls, $cur);
-for my $line (split /\n/, $raw) {
-    if ($line =~ /^\s*(Standard|Extended)\s+IP\s+access\s+list\s+(\S+)/i) {
-        $cur = $2;
-        $acls{$cur}{type}  = lc($1);
-        $acls{$cur}{rules} = [];
-    } elsif ($cur && $line =~ /^\s+(\d+)\s+(permit|deny)\s+(.+?)(?:\s+\((\d+)\s+match(?:es)?\))?\s*$/) {
-        push @{$acls{$cur}{rules}}, {
-            seq      => $1,
-            action   => $2,
-            criteria => $3,
-            hits     => defined($4) ? int($4) : 0,
-        };
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host     => $host,
+            user     => $username,
+            password => $password,
+            raw_pty  => 1,
+            timeout  => 15,
+        );
+    };
+    if ($@ || !$ssh) {
+        out("  FAIL: Could not create SSH session -- $@\n\n");
+        next;
     }
-}
 
-unless (%acls) {
-    out("No ACLs parsed. Device may use named ACLs only, or '$cmd' returned no data.\n");
-    out("Raw output:\n$raw\n");
-    close($logfh) if $logfh;
-    exit 1;
-}
+    my $logged_in = eval { $ssh->login() };
+    if ($@ || !$logged_in) {
+        out("  FAIL: Authentication failed or connection refused\n\n");
+        next;
+    }
 
-my ($total_rules, $total_unused, $total_high) = (0, 0, 0);
+    eval { $ssh->exec("terminal length 0") };
 
-for my $name (sort keys %acls) {
-    my @rules = @{$acls{$name}{rules}};
-    my $type  = $acls{$name}{type};
+    my $raw = eval { $ssh->exec("show logging") };
+    if ($@ || !$raw) {
+        out("  FAIL: 'show logging' returned no output -- $@\n\n");
+        $ssh->close();
+        next;
+    }
 
-    my $unused = grep { $_->{hits} == 0 } @rules;
-    my $high   = grep { $_->{hits} >= $threshold } @rules;
+    my (%counts, @flagged);
+    $counts{$_} = 0 for keys %SEV_NAME;
 
-    out("\nACL: $name  ($type)  Rules: " . scalar(@rules) .
-        "  Unused: $unused  High-traffic: $high\n");
-    out("-" x 62 . "\n");
+    # Cisco syslog line: *timestamp: %FACILITY-SEVERITY-MNEMONIC: message
+    while ($raw =~ /^(.*%[A-Z0-9_]+-([0-7])-[A-Z0-9_]+:.+)$/mg) {
+        my ($line, $sev) = ($1, $2);
+        $counts{$sev}++;
+        push @flagged, "    $line" if $sev <= 3;
+    }
 
-    if (@rules && ($show_unused || grep { $_->{hits} > 0 } @rules)) {
-        out(sprintf("%-6s %-7s %8s  %s\n", "Seq", "Action", "Hits", "Criteria"));
-        out("-" x 62 . "\n");
-        for my $r (sort { $b->{hits} <=> $a->{hits} } @rules) {
-            next if $r->{hits} == 0 && !$show_unused;
-            my $flag = '';
-            $flag = ' <<HIGH>>'   if $r->{hits} >= $threshold;
-            $flag = ' <<UNUSED>>' if $r->{hits} == 0;
-            out(sprintf("%-6s %-7s %8d  %.42s%s\n",
-                $r->{seq}, $r->{action}, $r->{hits},
-                $r->{criteria}, $flag));
-        }
+    my $total = 0;
+    $total += ($counts{$_} // 0) for keys %SEV_NAME;
+
+    out(sprintf("  Parsed entries : %d\n\n  Per-severity breakdown:\n", $total));
+
+    for my $s (0 .. 7) {
+        my $n   = $counts{$s} // 0;
+        my $tag = ($s <= 3 && $n > 0) ? "  <<" : "";
+        out(sprintf("    [%d] %-13s  %4d%s\n", $s, $SEV_NAME{$s}, $n, $tag));
+    }
+
+    if (@flagged) {
+        out("\n  High-severity events (levels 0-3):\n");
+        out("$_\n") for @flagged;
     } else {
-        out("  (all rules have 0 hits; use --show-unused to display)\n")
-            if !$show_unused && $unused == scalar @rules;
+        out("\n  No high-severity events detected.\n");
     }
 
-    $total_rules  += scalar @rules;
-    $total_unused += $unused;
-    $total_high   += $high;
+    $ssh->close();
+    out("\n");
 }
 
-out("\n" . "=" x 62 . "\n");
-out("Summary\n");
-out(sprintf("  ACLs analyzed:       %d\n", scalar keys %acls));
-out(sprintf("  Total ACEs:          %d\n", $total_rules));
-out(sprintf("  Unused ACEs (0 hits):%d\n", $total_unused));
-out(sprintf("  High-traffic ACEs:   %d  (>= $threshold hits)\n", $total_high));
-out("=" x 62 . "\n");
-
-if ($logfile) {
-    close($logfh);
-    print "Output appended to: $logfile\n";
-}
-
-exit 0;
-```
-
-This is `acl_hit_counter.pl` — covers ACL auditing which none of the existing scripts touch. It:
-
-- Runs `show ip access-lists [name]` via `Net::SSH::Expect`
-- Parses every ACE's sequence number, action, criteria, and hit count
-- Flags `<<UNUSED>>` (0 hits) and `<<HIGH>>` (>= threshold) rules
-- Sorts rules by hit count descending so top-traffic rules surface first
-- Outputs a per-ACL table plus a summary, dual-written to STDOUT and an optional log file
+close $log_fh if $log_fh;
+out("Report complete.\n");
