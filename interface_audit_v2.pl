@@ -1,142 +1,137 @@
-I'll write a CDP/LLDP neighbor discovery script — distinct from the existing interface audit, inventory collection, and show_commands scripts already in the repo.
-
 ```perl
 #!/usr/bin/perl
-# cdp_lldp_neighbors.pl - CDP/LLDP neighbor discovery and topology mapping
 #
-# PURPOSE:
-#   Connects to Cisco IOS/IOS-XE/NX-OS devices via SSH and collects CDP and
-#   LLDP neighbor tables for topology documentation, cabling verification, and
-#   unauthorized device detection. Output is pipe-delimited for easy import
-#   into spreadsheets or CMDB tools.
+# health_check.pl - Network Device Hardware Health Monitor
 #
-# USAGE:
-#   Single device:  ./cdp_lldp_neighbors.pl -h 192.168.1.1 -u admin [-p pass] [-l out.log]
-#   Device list:    ./cdp_lldp_neighbors.pl -f devices.txt  -u admin [-p pass] [-l out.log]
+# Purpose:
+#   Connects to Cisco IOS/IOS-XE devices via SSH and collects hardware health
+#   metrics: CPU utilization (5-min avg), memory usage percentage, temperature
+#   sensor readings, and power supply status. Flags values exceeding thresholds
+#   with a leading '!' in output.
 #
-# OUTPUT FORMAT:
-#   PROTO|LOCAL_DEVICE|LOCAL_PORT|NEIGHBOR_ID|NEIGHBOR_PORT|PLATFORM|MGMT_IP
+# Usage:
+#   Single device:  ./health_check.pl -h 192.168.1.1 -u admin [-p password] [-l logfile]
+#   Device list:    ./health_check.pl -f devices.txt -u admin [-p password] [-l logfile]
 #
-# PREREQUISITES:
+# Device file format: one IP or hostname per line; blank lines and # comments ignored
+#
+# Prerequisites:
 #   cpan install Net::SSH::Expect
+#   SSH key auth recommended (omit -p); password auth supported via -p
+#
+# Thresholds (edit below): CPU 80%, Memory 85%, Temperature 55C
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Std;
 use POSIX qw(strftime);
 
-my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_logfile, $opt_help);
-my $TIMEOUT = 20;
+my %opts;
+getopts('h:f:u:p:l:t:', \%opts);
 
-GetOptions(
-    'h|host=s' => \$opt_host,
-    'f|file=s' => \$opt_file,
-    'u|user=s' => \$opt_user,
-    'p|pass=s' => \$opt_pass,
-    'l|log=s'  => \$opt_logfile,
-    'help'     => \$opt_help,
-) or usage();
-
-usage() if $opt_help || (!$opt_host && !$opt_file) || !$opt_user;
+my $user    = $opts{u} or die "Usage: $0 -h <host>|-f <file> -u <user> [-p pass] [-l log] [-t timeout]\n";
+my $pass    = $opts{p} // '';
+my $logfile = $opts{l} // '';
+my $timeout = $opts{t} // 30;
 
 my @devices;
-if ($opt_host) {
-    push @devices, $opt_host;
-} else {
-    open(my $fh, '<', $opt_file) or die "Cannot open '$opt_file': $!\n";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if length }
+if ($opts{h}) {
+    push @devices, $opts{h};
+} elsif ($opts{f}) {
+    open my $fh, '<', $opts{f} or die "Cannot open $opts{f}: $!\n";
+    while (<$fh>) { chomp; next if /^\s*$/ || /^#/; push @devices, $_; }
     close $fh;
+} else {
+    die "Specify -h <host> or -f <device_file>\n";
 }
 
 my $log_fh;
-if ($opt_logfile) {
-    open($log_fh, '>', $opt_logfile) or die "Cannot open log '$opt_logfile': $!\n";
-    printf $log_fh "# CDP/LLDP Neighbor Report generated %s\n", strftime("%Y-%m-%d %H:%M:%S", localtime);
-    print  $log_fh "# PROTO|LOCAL_DEVICE|LOCAL_PORT|NEIGHBOR_ID|NEIGHBOR_PORT|PLATFORM|MGMT_IP\n";
+if ($logfile) {
+    open $log_fh, '>>', $logfile or die "Cannot open logfile $logfile: $!\n";
+}
+
+my $CPU_WARN  = 80;
+my $MEM_WARN  = 85;
+my $TEMP_WARN = 55;
+
+my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+out("=" x 68);
+out("Health Check: $ts");
+out("=" x 68);
+printf "%-22s %-12s %-12s %-10s %-8s\n", "Device", "CPU5min%", "MemUsed%", "TempC", "PSU";
+printf "%s\n", "-" x 68;
+
+for my $host (@devices) {
+    my ($cpu, $mem, $temp, $psu) = check_device($host);
+    my $cs = defined $cpu  ? ($cpu  >= $CPU_WARN  ? "!$cpu"  : $cpu)  : 'ERR';
+    my $ms = defined $mem  ? ($mem  >= $MEM_WARN  ? "!$mem"  : $mem)  : 'ERR';
+    my $ts2 = defined $temp ? ($temp >= $TEMP_WARN ? "!$temp" : $temp) : 'N/A';
+    my $ps = $psu // 'ERR';
+    printf "%-22s %-12s %-12s %-10s %-8s\n", $host, $cs, $ms, $ts2, $ps;
+    out(sprintf "%-22s cpu=%-5s mem=%-5s temp=%-6s psu=%s", $host, $cs, $ms, $ts2, $ps);
+}
+out("=" x 68 . "\n");
+close $log_fh if $log_fh;
+
+sub check_device {
+    my ($host) = @_;
+    my $ssh = Net::SSH::Expect->new(
+        host       => $host,
+        user       => $user,
+        password   => $pass,
+        raw_pty    => 1,
+        timeout    => $timeout,
+        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+    );
+    eval { $pass ? $ssh->login() : $ssh->login_no_password() };
+    if ($@) {
+        warn "[$host] SSH failed: $@\n";
+        return (undef, undef, undef, 'NOCONN');
+    }
+    $ssh->exec("terminal length 0");
+    my ($cpu, $mem, $temp, $psu) = (get_cpu($ssh), get_mem($ssh), get_temp($ssh), get_psu($ssh));
+    eval { $ssh->close() };
+    return ($cpu, $mem, $temp, $psu);
+}
+
+sub get_cpu {
+    my ($ssh) = @_;
+    my $out = $ssh->exec("show processes cpu | include CPU utilization") // return undef;
+    return $1 if $out =~ /five minutes:\s*(\d+)%/;
+    return undef;
+}
+
+sub get_mem {
+    my ($ssh) = @_;
+    my $out = $ssh->exec("show processes memory | include Processor") // return undef;
+    if ($out =~ /\d+\s+(\d+)\s+(\d+)/) {
+        my ($used, $free) = ($1, $2);
+        return int($used / ($used + $free) * 100) if ($used + $free) > 0;
+    }
+    return undef;
+}
+
+sub get_temp {
+    my ($ssh) = @_;
+    my $out = $ssh->exec("show environment temperature") // return undef;
+    my $max;
+    while ($out =~ /(\d{2,3})\s*(?:Celsius|C\b)/gi) {
+        $max = $1 if !defined $max || $1 > $max;
+    }
+    return $max;
+}
+
+sub get_psu {
+    my ($ssh) = @_;
+    my $out = $ssh->exec("show environment power") // return 'N/A';
+    return 'FAIL' if $out =~ /fail|absent|critical/i;
+    return 'OK'   if $out =~ /normal|good|present|ok/i;
+    return 'N/A';
 }
 
 sub out {
-    my ($line) = @_;
-    print $line;
-    print $log_fh $line if $log_fh;
-}
-
-for my $device (@devices) {
-    audit_device($device);
-}
-close $log_fh if $log_fh;
-
-sub audit_device {
-    my ($target) = @_;
-
-    my $ssh = Net::SSH::Expect->new(
-        host     => $target,
-        user     => $opt_user,
-        $opt_pass ? (password => $opt_pass) : (),
-        raw_pty  => 1,
-        timeout  => $TIMEOUT,
-    );
-
-    my $login;
-    eval { $login = $ssh->login() };
-    if ($@ || !defined $login) {
-        out("ERROR|$target|||||||connection failed\n");
-        return;
-    }
-
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('[\$#>]', 5);
-
-    my $hostname = $target;
-    $ssh->send("show version | include uptime");
-    my $ver = $ssh->waitfor('[\$#>]', 10) // '';
-    $hostname = $1 if $ver =~ /^(\S+)\s+uptime/m;
-
-    $ssh->send("show cdp neighbors detail");
-    my $cdp = $ssh->waitfor('[\$#>]', $TIMEOUT) // '';
-    parse_cdp($hostname, $cdp);
-
-    $ssh->send("show lldp neighbors detail");
-    my $lldp = $ssh->waitfor('[\$#>]', $TIMEOUT) // '';
-    parse_lldp($hostname, $lldp) unless $lldp =~ /invalid|% LLDP is not enabled|error/i;
-
-    $ssh->close();
-}
-
-sub parse_cdp {
-    my ($device, $raw) = @_;
-    my @blocks = split /[-]{4,}/, $raw;
-    for my $b (@blocks) {
-        next unless $b =~ /Device ID/i;
-        my ($nbr)   = $b =~ /Device ID:\s*(\S+)/i;
-        my ($lport) = $b =~ /Interface:\s*(\S+),/i;
-        my ($rport) = $b =~ /Port ID[^:]*:\s*(\S+)/i;
-        my ($plat)  = $b =~ /Platform:\s*([^,\n]+)/i;
-        my ($mgmt)  = $b =~ /IP(?:v4)? [Aa]ddress:\s*(\d[\d.]+)/;
-        $_ //= 'unknown' for $nbr, $lport, $rport, $plat, $mgmt;
-        s/^\s+|\s+$//g for $plat;
-        out("CDP|$device|$lport|$nbr|$rport|$plat|$mgmt\n");
-    }
-}
-
-sub parse_lldp {
-    my ($device, $raw) = @_;
-    my @blocks = split /(?=Local Intf)/i, $raw;
-    for my $b (@blocks) {
-        next unless $b =~ /System Name/i;
-        my ($lport) = $b =~ /Local Intf[^:]*:\s*(\S+)/i;
-        my ($nbr)   = $b =~ /System Name[^:]*:\s*(\S+)/i;
-        my ($rport) = $b =~ /Port (?:id|desc)[^:]*:\s*(\S+)/i;
-        my ($plat)  = $b =~ /System Description[^:]*:\s*([^\n]+)/i;
-        my ($mgmt)  = $b =~ /(\d{1,3}(?:\.\d{1,3}){3})/;
-        $_ //= 'unknown' for $nbr, $lport, $rport, $plat, $mgmt;
-        s/^\s+|\s+$//g for $plat;
-        out("LLDP|$device|$lport|$nbr|$rport|$plat|$mgmt\n");
-    }
-}
-
-sub usage {
-    die "Usage: $0 -h HOST|-f FILE -u USER [-p PASS] [-l LOGFILE]\n";
+    my ($msg) = @_;
+    print $log_fh "$msg\n" if $log_fh;
 }
 ```
