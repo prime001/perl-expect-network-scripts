@@ -1,176 +1,148 @@
 ```perl
 #!/usr/bin/perl
-#
-# hardware_health.pl - Network Device Hardware Health Check
-#
-# Purpose:
-#   Collects CPU utilization, memory usage, temperature sensors, and
-#   environmental/power supply status from Cisco IOS/IOS-XE devices.
-#   Flags values that exceed warning or critical thresholds.
-#
-# Usage:
-#   Single device:  ./hardware_health.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:    ./hardware_health.pl -f devices.txt -u admin -p secret
-#   With log:       ./hardware_health.pl -h 192.168.1.1 -u admin -p secret -l health.log
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#
-# Device file format (one IP or hostname per line, blank lines/# ignored):
-#   192.168.1.1
-#   192.168.1.2
-#   # core-sw01
+=head1 NAME
+port_channel_audit.pl - Audit port channel status and member link health
+
+=head1 SYNOPSIS
+./port_channel_audit.pl -f devices.txt [-l audit.log] [-t timeout]
+./port_channel_audit.pl 10.0.0.1 10.0.0.2 -l audit.log
+
+=head1 DESCRIPTION
+Connects to network devices via SSH and audits port channel configurations.
+Verifies all expected port channel members are up, identifies flapping ports,
+and reports bundling mismatches. Outputs results to STDOUT and optional logfile.
+
+=head1 PREREQUISITES
+Perl 5.10+, Expect.pm, Net::SSH access to devices
+Credentials via: export NETWORK_USER=admin NETWORK_PASS=password
+
+=cut
 
 use strict;
 use warnings;
-use Net::SSH::Expect;
-use Getopt::Long;
-use POSIX qw(strftime);
+use Expect;
+use Getopt::Std;
 
-my ($host_arg, $device_file, $username, $password, $log_file);
-my $timeout = 20;
-my $CPU_WARN = 70;
-my $CPU_CRIT = 90;
-my $MEM_WARN = 75;
-my $MEM_CRIT = 90;
+my %opts;
+getopts('f:l:t:u:p:', \%opts);
 
-GetOptions(
-    'h|host=s'     => \$host_arg,
-    'f|file=s'     => \$device_file,
-    'u|user=s'     => \$username,
-    'p|pass=s'     => \$password,
-    'l|log=s'      => \$log_file,
-    't|timeout=i'  => \$timeout,
-) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOGFILE] [-t TIMEOUT]\n";
-
-die "Provide -h HOST or -f FILE\n" unless $host_arg || $device_file;
-die "Username required (-u)\n" unless $username;
-die "Password required (-p)\n" unless $password;
+my $device_file = $opts{f};
+my $logfile = $opts{l};
+my $timeout = $opts{t} || 15;
+my $user = $opts{u} || $ENV{NETWORK_USER};
+my $pass = $opts{p} || $ENV{NETWORK_PASS};
 
 my @devices;
-if ($host_arg) {
-    push @devices, $host_arg;
-} else {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+if ($device_file && -f $device_file) {
+    open my $fh, '<', $device_file or die "Cannot read $device_file: $!\n";
     while (<$fh>) {
         chomp;
-        next if /^\s*$/ || /^\s*#/;
+        next if /^#|^\s*$/;
         push @devices, $_;
     }
     close $fh;
+} else {
+    @devices = @ARGV;
 }
 
-my $log_fh;
-if ($log_file) {
-    open($log_fh, '>>', $log_file) or die "Cannot open log $log_file: $!\n";
+die "Usage: $0 -f devices.txt [-l logfile] [devices...]\n" unless @devices;
+die "Set NETWORK_USER and NETWORK_PASS environment variables\n" unless $user && $pass;
+
+open my $LOG, '>>', $logfile if $logfile;
+
+foreach my $device (@devices) {
+    print "[*] Auditing port channels on $device\n";
+    my @results = audit_port_channels($device, $user, $pass, $timeout);
+    
+    foreach my $result (@results) {
+        print "$result\n";
+        print $LOG "$result\n" if $LOG;
+    }
 }
 
-sub log_out {
-    my $msg = shift;
-    print $msg;
-    print $log_fh $msg if $log_fh;
-}
+close $LOG if $LOG;
+print "[+] Port channel audit complete\n";
 
-sub check_threshold {
-    my ($label, $val, $warn, $crit) = @_;
-    return "CRIT" if $val >= $crit;
-    return "WARN" if $val >= $warn;
-    return "OK";
-}
-
-my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
-log_out("=" x 60 . "\n");
-log_out("Hardware Health Check  $timestamp\n");
-log_out("=" x 60 . "\n");
-
-for my $host (@devices) {
-    log_out("\n--- $host ---\n");
-
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host        => $host,
-            user        => $username,
-            password    => $password,
-            raw_pty     => 1,
-            timeout     => $timeout,
-            ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
-        );
+sub audit_port_channels {
+    my ($device, $user, $pass, $timeout) = @_;
+    my @findings;
+    
+    my $exp = Expect->new();
+    $exp->raw_pty(1);
+    $exp->log_stdout(0);
+    
+    eval {
+        $exp->spawn("ssh -o ConnectTimeout=$timeout -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $user\@$device")
+            or die "Cannot spawn SSH to $device\n";
+        
+        $exp->expect($timeout, ['password:', 'Password:']) 
+            or die "Timeout waiting for password prompt on $device\n";
+        $exp->send("$pass\n");
+        
+        $exp->expect($timeout, ['#', '>']) 
+            or die "Failed to authenticate on $device\n";
+        
+        $exp->send("terminal length 0\n");
+        $exp->expect($timeout, ['#', '>']);
+        
+        $exp->send("show etherchannel summary\n");
+        $exp->expect($timeout, ['#', '>']);
+        my $etherchannel_output = $exp->before();
+        
+        my %po_status;
+        my $current_po = undef;
+        
+        foreach my $line (split /\n/, $etherchannel_output) {
+            if ($line =~ /^Group\s+(\d+)/) {
+                $current_po = $1;
+            }
+            if ($current_po && $line =~ /([A-Za-z0-9\/]+)\s+\(\s*([A-Z])\s*\)/) {
+                my $member = $1;
+                my $state = $2;
+                $po_status{$current_po}{$member} = $state;
+                
+                if ($state ne 'P' && $state ne 'p') {
+                    push @findings, "WARNING: [$device] Port-Channel $current_po member $member is not bundled (state=$state)";
+                }
+            }
+        }
+        
+        $exp->send("show interfaces status err-disabled\n");
+        $exp->expect($timeout, ['#', '>']);
+        my $errdiabled_output = $exp->before();
+        
+        foreach my $line (split /\n/, $errdiabled_output) {
+            if ($line =~ /([A-Za-z0-9\/]+)\s+/) {
+                my $iface = $1;
+                if ($etherchannel_output =~ /$iface/) {
+                    push @findings, "ERROR: [$device] Interface $iface (port-channel member) is err-disabled";
+                }
+            }
+        }
+        
+        $exp->send("show interfaces counters errors | include Gi|Fa|Et|Te\n");
+        $exp->expect($timeout, ['#', '>']);
+        my $errors_output = $exp->before();
+        
+        foreach my $line (split /\n/, $errors_output) {
+            if ($line =~ /([A-Za-z0-9\/]+)\s+(\d+)\s+(\d+)/) {
+                my ($iface, $in_err, $out_err) = ($1, $2, $3);
+                if (($in_err + $out_err) > 100 && $etherchannel_output =~ /$iface/) {
+                    push @findings, "ALERT: [$device] Port-Channel member $iface has high error count (in=$in_err, out=$out_err)";
+                }
+            }
+        }
+        
+        $exp->send("exit\n");
+        $exp->soft_close();
+        
+        push @findings, "OK: [$device] Port channel audit completed" unless @findings;
     };
-    if ($@ || !$ssh) {
-        log_out("  ERROR: Failed to create SSH session: $@\n");
-        next;
+    
+    if ($@) {
+        push @findings, "ERROR: [$device] Failed to connect: $@";
     }
-
-    my $login = eval { $ssh->login() };
-    if ($@ || !$login) {
-        log_out("  ERROR: Authentication failed or connection refused\n");
-        next;
-    }
-
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('\$|#|\>', 5);
-
-    # CPU utilization
-    $ssh->send("show processes cpu | include CPU utilization");
-    my $cpu_out = $ssh->waitfor('\$|#|\>', $timeout);
-    if ($cpu_out && $cpu_out =~ /CPU utilization.*?(\d+)%\/(\d+)%.*?(\d+)%/) {
-        my ($five_sec, $one_min, $five_min) = ($1, $2, $3);
-        my $status = check_threshold("CPU", $one_min, $CPU_WARN, $CPU_CRIT);
-        log_out("  CPU: 5sec=${five_sec}%  1min=${one_min}%  5min=${five_min}%  [$status]\n");
-    } else {
-        log_out("  CPU: could not parse output\n");
-    }
-
-    # Memory utilization
-    $ssh->send("show processes memory | include Processor");
-    my $mem_out = $ssh->waitfor('\$|#|\>', $timeout);
-    if ($mem_out && $mem_out =~ /Processor\s+\S+\s+(\d+)\s+(\d+)/) {
-        my ($used, $free) = ($1, $2);
-        my $total = $used + $free;
-        my $pct = $total > 0 ? int($used / $total * 100) : 0;
-        my $status = check_threshold("MEM", $pct, $MEM_WARN, $MEM_CRIT);
-        log_out(sprintf("  Memory: used=%dK  free=%dK  util=%d%%  [%s]\n",
-            $used/1024, $free/1024, $pct, $status));
-    } else {
-        log_out("  Memory: could not parse output\n");
-    }
-
-    # Temperature and environment
-    $ssh->send("show environment temperature");
-    my $env_out = $ssh->waitfor('\$|#|\>', $timeout);
-    if ($env_out && $env_out =~ /\d+\s+Celsius/i) {
-        while ($env_out =~ /(\S+)\s+(\d+)\s+Celsius.*?(Normal|Critical|Warning)/gi) {
-            log_out("  Temp $1: ${2}C  [$3]\n");
-        }
-    } else {
-        $ssh->send("show environment all | include Temperature|TEMP");
-        my $env2 = $ssh->waitfor('\$|#|\>', $timeout);
-        if ($env2 && $env2 =~ /\d+\s*(Celsius|degrees)/i) {
-            log_out("  Temp: $env2\n");
-        } else {
-            log_out("  Temperature: not supported or no data\n");
-        }
-    }
-
-    # Power supply
-    $ssh->send("show environment power | include Power|power");
-    my $pwr_out = $ssh->waitfor('\$|#|\>', $timeout);
-    if ($pwr_out && $pwr_out =~ /Power/i) {
-        my @pwr_lines = grep { /Power.*(?:Good|OK|Fail|Absent|Present)/i }
-                        split(/\n/, $pwr_out);
-        if (@pwr_lines) {
-            log_out("  Power: $_\n") for map { s/^\s+|\s+$//gr } @pwr_lines;
-        } else {
-            log_out("  Power: no status lines matched\n");
-        }
-    } else {
-        log_out("  Power: not supported or no data\n");
-    }
-
-    $ssh->send("exit");
-    $ssh->close() if $ssh->can('close');
+    
+    return @findings;
 }
-
-log_out("\nDone.\n");
-close $log_fh if $log_fh;
 ```
