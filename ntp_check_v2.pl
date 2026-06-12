@@ -1,145 +1,150 @@
+```perl
 #!/usr/bin/perl
+# =============================================================================
+# ntp_stratum_audit.pl - NTP Stratum & Drift Compliance Auditor
+#
+# Purpose:
+#   Connects to Cisco IOS/IOS-XE devices and audits NTP stratum levels,
+#   reference clock associations, and frequency drift for compliance.
+#   Useful for validating NTP hierarchy integrity across a fleet and
+#   identifying devices with misconfigured stratum or excessive drift.
+#
+# Usage:
+#   perl ntp_stratum_audit.pl -h 192.168.1.1 -u admin -p password
+#   perl ntp_stratum_audit.pl -f devices.txt -u admin -p password -l audit.log
+#   perl ntp_stratum_audit.pl -h 10.0.0.1 -u admin -p pass -s 4 -d 200
+#
+# Options:
+#   -h  Single device IP or hostname
+#   -f  File containing one device per line (# comments and blanks ignored)
+#   -u  SSH username
+#   -p  SSH password
+#   -l  Optional log file (appended)
+#   -s  Max acceptable stratum (default: 5)
+#   -d  Max acceptable drift in ppm (default: 500)
+#   -t  SSH timeout in seconds (default: 15)
+#
+# Prerequisites:
+#   cpanm Net::SSH::Expect
+#
+# Tested on: Cisco IOS 15.x, IOS-XE 16.x/17.x
+# =============================================================================
+
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-# ntp_drift_audit.pl - NTP Offset and Stratum Compliance Auditor
-#
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE devices and audits NTP health against
-#   configurable thresholds. Flags devices with excessive clock drift,
-#   high stratum values, or unsynchronized state. Useful for pre-change
-#   validation and compliance sweeps.
-#
-# Usage:
-#   ./ntp_drift_audit.pl -h 192.168.1.1 -u admin -p secret
-#   ./ntp_drift_audit.pl -f devices.txt -u admin -p secret -l audit.log
-#   ./ntp_drift_audit.pl -h 10.0.0.1 -u admin -p secret --warn-ms 50 --crit-ms 200
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#
-# Thresholds (defaults):
-#   WARNING  : offset > 100ms or stratum > 4
-#   CRITICAL : offset > 500ms or stratum > 8 or not synchronized
-
-my ($host, $user, $pass, $device_file, $log_file);
-my $warn_ms   = 100;
-my $crit_ms   = 500;
-my $warn_strat = 4;
-my $crit_strat = 8;
-my $timeout   = 20;
+my ($host, $device_file, $username, $password, $log_file);
+my $timeout       = 15;
+my $max_stratum   = 5;
+my $max_drift_ppm = 500;
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'f|file=s'     => \$device_file,
-    'u|user=s'     => \$user,
-    'p|pass=s'     => \$pass,
-    'l|log=s'      => \$log_file,
-    'warn-ms=i'    => \$warn_ms,
-    'crit-ms=i'    => \$crit_ms,
-    't|timeout=i'  => \$timeout,
-) or die "Invalid options. Use -h host or -f file, -u user, -p pass\n";
+    'h|host=s'    => \$host,
+    'f|file=s'    => \$device_file,
+    'u|user=s'    => \$username,
+    'p|pass=s'    => \$password,
+    'l|log=s'     => \$log_file,
+    's|stratum=i' => \$max_stratum,
+    'd|drift=i'   => \$max_drift_ppm,
+    't|timeout=i' => \$timeout,
+) or die "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [options]\n";
 
-die "Provide -h host or -f file\n" unless $host || $device_file;
-die "Provide -u user and -p pass\n" unless $user && $pass;
+die "Provide -h <host> or -f <file>\n" unless $host || $device_file;
+die "Username required (-u)\n"         unless $username;
+die "Password required (-p)\n"         unless $password;
 
-my @devices = $host ? ($host) : do {
+my @devices;
+if ($host) {
+    @devices = ($host);
+} else {
     open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
-    grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
-};
+    @devices = map { chomp; $_ } grep { /\S/ && !/^#/ } <$fh>;
+    close $fh;
+}
 
 my $log_fh;
 if ($log_file) {
     open $log_fh, '>>', $log_file or die "Cannot open log $log_file: $!\n";
 }
 
-my $timestamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
-output("=" x 60);
-output("NTP Drift Audit  |  $timestamp");
-output("Thresholds: WARN offset>${warn_ms}ms strat>$warn_strat  CRIT offset>${crit_ms}ms strat>$crit_strat");
-output("=" x 60);
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+out("=" x 62);
+out("NTP Stratum & Drift Audit  |  $ts");
+out(sprintf("Thresholds: stratum <= %d, drift <= +/-%d ppm", $max_stratum, $max_drift_ppm));
+out("=" x 62);
 
-my ($ok, $warn, $crit) = (0, 0, 0);
+my ($pass_count, $fail_count) = (0, 0);
 
-for my $dev (@devices) {
-    my $ssh = Net::SSH::Expect->new(
-        host        => $dev,
-        user        => $user,
-        password    => $pass,
-        raw_pty     => 1,
-        timeout     => $timeout,
-    );
+for my $device (@devices) {
+    out("\n[$device]");
 
-    my $login_ok = eval { $ssh->run_ssh() };
-    if ($@ || !$login_ok) {
-        output(sprintf("%-20s  CRITICAL  connection failed: %s", $dev, $@ // 'unknown'));
-        $crit++;
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host     => $device,
+            user     => $username,
+            password => $password,
+            raw_pty  => 1,
+            timeout  => $timeout,
+        );
+    };
+    if ($@ || !$ssh) {
+        out("  ERROR: Cannot initialize SSH session: " . ($@ || "unknown error"));
+        $fail_count++;
         next;
     }
 
-    $ssh->waitfor('>\s*$|#\s*$', 5) or do {
-        output(sprintf("%-20s  CRITICAL  prompt not found", $dev));
-        $crit++;
+    my $logged_in = eval { $ssh->login() };
+    if ($@ || !$logged_in) {
+        out("  ERROR: Authentication failed");
+        $fail_count++;
         next;
-    };
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('#\s*$', 5);
+    }
 
-    $ssh->send("show ntp status\n");
-    my $status_out = $ssh->waitfor('#\s*$', 15) // '';
-
-    $ssh->send("show ntp associations\n");
-    my $assoc_out  = $ssh->waitfor('#\s*$', 15) // '';
-
-    $ssh->send("exit\n");
+    $ssh->exec("terminal length 0");
+    my $ntp_status = $ssh->exec("show ntp status")       // '';
+    my $ntp_assoc  = $ssh->exec("show ntp associations")  // '';
     $ssh->close();
 
-    my $synced   = ($status_out =~ /Clock is synchronized/i) ? 1 : 0;
-    my ($offset) = ($status_out =~ /offset of ([\d.]+) msec/i);
-    my ($strat)  = ($status_out =~ /stratum (\d+)/i);
-    my ($refclock)= ($status_out =~ /reference is ([\d.]+)/i);
+    my $sync_state = ($ntp_status =~ /Clock is (\S+)/i)                 ? ucfirst(lc($1)) : 'unknown';
+    my $stratum    = ($ntp_status =~ /stratum\s+(\d+)/i)                 ? $1              : 'N/A';
+    my $drift      = ($ntp_status =~ /frequency is\s+([\d.+-]+)\s+ppm/i) ? $1              : 'N/A';
+    my $ref_clock  = ($ntp_status =~ /reference is\s+(\S+)/i)            ? $1              : 'N/A';
+    my $sync_peer  = ($ntp_assoc  =~ /^\*(\d[\d.]+)/m)                   ? $1              : 'none';
 
-    $offset  //= 0;
-    $strat   //= 16;
-    $refclock //= 'unknown';
+    my @issues;
+    push @issues, "NOT SYNCHRONIZED"
+        if $sync_state !~ /synchronized/i;
+    push @issues, "stratum $stratum > max $max_stratum"
+        if $stratum ne 'N/A' && $stratum > $max_stratum;
+    push @issues, "drift ${drift}ppm exceeds +/-${max_drift_ppm}ppm"
+        if $drift ne 'N/A' && abs($drift) > $max_drift_ppm;
 
-    my $level;
-    my @flags;
+    my $verdict = @issues ? 'FAIL' : 'PASS';
 
-    push @flags, "NOT-SYNCED"             unless $synced;
-    push @flags, "offset=${offset}ms"     if $offset > $warn_ms;
-    push @flags, "stratum=$strat"         if $strat  > $warn_strat;
+    out(sprintf("  %-12s %s  [%s]", "Sync State:", $sync_state, $verdict));
+    out(sprintf("  %-12s %s",       "Stratum:",    $stratum));
+    out(sprintf("  %-12s %s ppm",   "Drift:",      $drift));
+    out(sprintf("  %-12s %s",       "Ref Clock:",  $ref_clock));
+    out(sprintf("  %-12s %s",       "Sync Peer:",  $sync_peer));
+    out("  ISSUES:      " . join("; ", @issues)) if @issues;
 
-    if (!$synced || $offset > $crit_ms || $strat > $crit_strat) {
-        $level = 'CRITICAL';
-        $crit++;
-    } elsif (@flags) {
-        $level = 'WARNING';
-        $warn++;
-    } else {
-        $level = 'OK';
-        $ok++;
-    }
-
-    my $detail = $level eq 'OK'
-        ? "synced refclock=$refclock stratum=$strat offset=${offset}ms"
-        : join(' ', @flags) . " refclock=$refclock";
-
-    output(sprintf("%-20s  %-8s  %s", $dev, $level, $detail));
+    @issues ? $fail_count++ : $pass_count++;
 }
 
-output("-" x 60);
-output(sprintf("Summary: %d OK  %d WARNING  %d CRITICAL  (%d total)",
-    $ok, $warn, $crit, scalar @devices));
+out("\n" . "=" x 62);
+out(sprintf("Summary: %d PASSED  |  %d FAILED  |  %d total",
+    $pass_count, $fail_count, $pass_count + $fail_count));
+out("=" x 62);
 
 close $log_fh if $log_fh;
-exit($crit ? 2 : $warn ? 1 : 0);
+exit($fail_count > 0 ? 1 : 0);
 
-sub output {
+sub out {
     my ($msg) = @_;
     print "$msg\n";
     print $log_fh "$msg\n" if $log_fh;
 }
+```
