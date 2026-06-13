@@ -1,151 +1,162 @@
 ```perl
 #!/usr/bin/perl
+# =============================================================================
+# vlan_orphan_check.pl - Orphaned VLAN and Trunk Mismatch Detector
+# =============================================================================
+# Purpose : Identifies VLANs defined in the database but not active on any
+#           access or trunk port, and trunk ports missing expected VLANs.
+#           Complements vlan_audit.pl (basic inventory) and vlan_audit_v2.pl
+#           (extended stats) with consistency/hygiene analysis.
 #
-# trunk_vlan_audit.pl - Cisco IOS trunk port VLAN allowed-list auditor
+# Usage   : perl vlan_orphan_check.pl -h <host> [-u <user>] [-p <pass>]
+#                                     [-f <device_file>] [-o <logfile>]
+#           Device file: one IP or hostname per line, comments (#) ignored.
 #
-# Purpose:
-#   Connects to one or more Cisco IOS/IOS-XE switches via SSH and audits trunk
-#   port state: encapsulation, native VLAN, allowed VLAN ranges, and active
-#   VLAN sets. Flags native VLAN 1 usage (security risk) and trunks carrying
-#   no active VLANs (potential misconfiguration).
+# Output  : Per-device report: orphaned VLANs, access-only VLANs, trunk gaps.
 #
-# Usage:
-#   ./trunk_vlan_audit.pl -H 192.168.1.1 -u admin -p secret
-#   ./trunk_vlan_audit.pl -f switches.txt -u netops -p secret -e enablepass -l audit.log
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect
-#   Read-only SSH access sufficient; -e enables privileged exec if needed
-#   Tested: Cisco IOS 12.2+, IOS-XE 16.x/17.x
+# Prereqs : Net::SSH::Expect  (cpanm Net::SSH::Expect)
+#           Tested against Cisco IOS / IOS-XE; adapt regexes for NX-OS/EOS.
+# =============================================================================
 
 use strict;
 use warnings;
-use Net::SSH::Expect;
 use Getopt::Long;
-use POSIX qw(strftime);
+use Net::SSH::Expect;
 
-my ($single_host, $host_file, $username, $password, $enable_pass, $log_file, $timeout);
+my ($host, $user, $pass, $device_file, $logfile);
+$user = $ENV{NET_USER} // 'admin';
+$pass = $ENV{NET_PASS} // '';
 
 GetOptions(
-    'H|host=s'    => \$single_host,
-    'f|file=s'    => \$host_file,
-    'u|user=s'    => \$username,
-    'p|pass=s'    => \$password,
-    'e|enable=s'  => \$enable_pass,
-    'l|log=s'     => \$log_file,
-    't|timeout=i' => \$timeout,
-) or die usage();
+    'h|host=s'   => \$host,
+    'u|user=s'   => \$user,
+    'p|pass=s'   => \$pass,
+    'f|file=s'   => \$device_file,
+    'o|log=s'    => \$logfile,
+) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-o logfile]\n";
 
-$timeout //= 30;
-die usage() unless ($single_host || $host_file) && $username && $password;
+die "Provide -h <host> or -f <file>\n" unless $host || $device_file;
 
-my @hosts;
-if ($single_host) {
-    push @hosts, $single_host;
-} else {
-    open my $fh, '<', $host_file or die "Cannot open '$host_file': $!\n";
-    while (<$fh>) { chomp; push @hosts, $_ unless /^\s*(?:#|$)/ }
+my @devices;
+push @devices, $host if $host;
+if ($device_file) {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!";
+    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if length }
     close $fh;
 }
 
 my $log_fh;
-if ($log_file) {
-    open $log_fh, '>>', $log_file or warn "Cannot open log '$log_file': $!\n";
+if ($logfile) {
+    open $log_fh, '>', $logfile or die "Cannot open $logfile: $!";
 }
 
-sub log_out { print @_; print $log_fh @_ if $log_fh }
-sub usage   { "Usage: $0 -H host|-f file -u user -p pass [-e enable] [-l log] [-t secs]\n" }
+sub emit {
+    my $msg = shift;
+    print $msg;
+    print $log_fh $msg if $log_fh;
+}
 
-log_out("=== Trunk VLAN Audit - " . strftime('%Y-%m-%d %H:%M:%S', localtime) . " ===\n\n");
+sub audit_device {
+    my ($dev) = @_;
+    emit("\n=== $dev ===\n");
 
-for my $host (@hosts) {
-    log_out("Host: $host\n" . "-" x 62 . "\n");
+    my $ssh = Net::SSH::Expect->new(
+        host        => $dev,
+        user        => $user,
+        password    => $pass,
+        raw_pty     => 1,
+        timeout     => 20,
+    );
 
-    my $ssh;
     eval {
-        $ssh = Net::SSH::Expect->new(
-            host     => $host,
-            user     => $username,
-            password => $password,
-            raw_pty  => 1,
-            timeout  => $timeout,
-        );
-        $ssh->login();
+        my $login = $ssh->login();
+        die "Auth failed" unless $login =~ /[>#]/;
     };
-
     if ($@) {
-        my $err = $@;
-        if    ($err =~ /timed.?out/i)           { log_out("  FAIL: Connection timed out\n\n") }
-        elsif ($err =~ /auth|password|denied/i) { log_out("  FAIL: Authentication failed\n\n") }
-        else                                    { log_out("  FAIL: $err\n\n") }
-        next;
+        emit("  [ERROR] Connection/auth failed: $@\n");
+        return;
     }
 
-    if ($enable_pass) {
-        $ssh->send("enable");
-        $ssh->waitfor('Password:', 10) or log_out("  WARN: enable prompt not seen\n");
-        $ssh->send($enable_pass);
-        $ssh->waitfor('#', 10)         or log_out("  WARN: enable mode not confirmed\n");
-    }
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('[>#]', 10);
 
-    $ssh->exec("terminal length 0");
-    my $trunk_out = $ssh->exec("show interfaces trunk");
+    # Collect VLAN database
+    $ssh->send("show vlan brief\n");
+    my $vlan_brief = $ssh->waitfor('[>#]', 15) // '';
 
-    my (%trunks, $section);
+    # Collect trunk status
+    $ssh->send("show interfaces trunk\n");
+    my $trunk_out = $ssh->waitfor('[>#]', 15) // '';
 
-    for my $line (split /\n/, $trunk_out) {
-        $section = 'header'  if $line =~ /^Port\s+Mode\s+Encapsulation/;
-        $section = 'allowed' if $line =~ /^Port\s+Vlans allowed on trunk/;
-        $section = 'active'  if $line =~ /^Port\s+Vlans allowed and active/;
-        $section = 'pruned'  if $line =~ /^Port\s+Vlans in spanning tree/;
-        next unless $line =~ /^(\S+)\s+(.*\S)/ && $1 ne 'Port';
-
-        my ($port, $rest) = ($1, $2);
-        if ($section eq 'header') {
-            my ($mode, $encap, $status, $native) = split /\s+/, $rest;
-            $trunks{$port} = { mode => $mode//'?', encap => $encap//'?',
-                               status => $status//'?', native => $native//'?' };
-        }
-        $trunks{$port}{allowed} = $rest if $section eq 'allowed' && exists $trunks{$port};
-        $trunks{$port}{active}  = $rest if $section eq 'active'  && exists $trunks{$port};
-        $trunks{$port}{pruned}  = $rest if $section eq 'pruned'  && exists $trunks{$port};
-    }
-
-    unless (keys %trunks) {
-        log_out("  No trunk interfaces found.\n\n");
-        $ssh->close();
-        next;
-    }
-
-    log_out(sprintf("  %-20s %-8s %-12s %-8s %s\n", 'Interface','Status','Encap','Native','Flags'));
-    log_out("  " . "-" x 60 . "\n");
-
-    my ($warn_native1, $warn_no_active) = (0, 0);
-
-    for my $port (sort keys %trunks) {
-        my $t = $trunks{$port};
-        my @flags;
-        push @flags, 'NATIVE=1!'       if ($t->{native}//'') eq '1';
-        push @flags, 'NO-ACTIVE-VLANS' if ($t->{active}//'') =~ /^\s*none\s*$/i;
-        $warn_native1++   if grep { /NATIVE/ } @flags;
-        $warn_no_active++ if grep { /NO-ACTIVE/ } @flags;
-        log_out(sprintf("  %-20s %-8s %-12s %-8s %s\n",
-            $port, $t->{status}, $t->{encap}, $t->{native},
-            @flags ? join(' ', @flags) : 'ok'));
-        if ($t->{active} && $t->{active} !~ /none/i) {
-            log_out(sprintf("    active VLANs: %s\n", $t->{active}));
-        }
-    }
-
-    log_out(sprintf("\n  Summary: %d trunk(s) | %d native-VLAN-1 warning(s) | %d no-active-VLANs\n",
-        scalar keys %trunks, $warn_native1, $warn_no_active));
-    log_out("  ACTION: Change native VLAN from 1 on flagged trunks (CVE-2005-4258 / VLAN hopping)\n")
-        if $warn_native1;
-    log_out("\n");
-
+    $ssh->send("exit\n");
     $ssh->close();
+
+    # Parse VLANs from database (skip 1 and reserved 1002-1005)
+    my %vlan_db;
+    for my $line (split /\n/, $vlan_brief) {
+        if ($line =~ /^(\d+)\s+(\S+)\s+(active|act\/lshut)\s+(.*)/) {
+            my ($id, $name, $state, $ports) = ($1, $2, $3, $4);
+            next if $id == 1 || ($id >= 1002 && $id <= 1005);
+            my @port_list = grep { length } split /[\s,]+/, $ports;
+            $vlan_db{$id} = { name => $name, ports => \@port_list };
+        }
+    }
+
+    if (!%vlan_db) {
+        emit("  No user VLANs found (or parse failed).\n");
+        return;
+    }
+
+    # Parse trunk allowed VLANs
+    my %trunked_vlans;
+    my $in_allowed = 0;
+    for my $line (split /\n/, $trunk_out) {
+        $in_allowed = 1 if $line =~ /VLANs allowed and active in management domain/;
+        if ($in_allowed && $line =~ /^\S+\s+([\d,\-]+)/) {
+            for my $part (split /,/, $1) {
+                if ($part =~ /(\d+)-(\d+)/) { $trunked_vlans{$_}++ for $1..$2 }
+                elsif ($part =~ /(\d+)/)    { $trunked_vlans{$1}++ }
+            }
+        }
+    }
+
+    # Classify
+    my (@orphaned, @access_only, @trunked_not_db);
+    for my $id (sort { $a <=> $b } keys %vlan_db) {
+        my $has_access = @{ $vlan_db{$id}{ports} } > 0;
+        my $has_trunk  = exists $trunked_vlans{$id};
+        push @orphaned,    $id unless $has_access || $has_trunk;
+        push @access_only, $id if $has_access && !$has_trunk;
+    }
+    for my $id (sort { $a <=> $b } keys %trunked_vlans) {
+        push @trunked_not_db, $id unless exists $vlan_db{$id} || $id == 1;
+    }
+
+    my $total = scalar keys %vlan_db;
+    emit(sprintf "  DB VLANs: %d  |  Orphaned: %d  |  Access-only: %d  |  Trunk-not-in-DB: %d\n",
+        $total, scalar @orphaned, scalar @access_only, scalar @trunked_not_db);
+
+    if (@orphaned) {
+        emit("  [WARN] Orphaned (no ports, not trunked): " . join(', ', @orphaned) . "\n");
+        for my $id (@orphaned) {
+            emit(sprintf "         VLAN %-5d  %s\n", $id, $vlan_db{$id}{name});
+        }
+    }
+    if (@trunked_not_db) {
+        emit("  [WARN] Trunked VLANs not in local DB (pruned or missing): "
+            . join(', ', @trunked_not_db) . "\n");
+    }
+    unless (@orphaned || @trunked_not_db) {
+        emit("  [OK] No orphaned VLANs or trunk inconsistencies detected.\n");
+    }
 }
 
+my $ts = localtime;
+emit("VLAN Orphan/Consistency Check  $ts\n");
+emit("Devices: " . scalar(@devices) . "\n");
+
+audit_device($_) for @devices;
+
+emit("\nDone.\n");
 close $log_fh if $log_fh;
-log_out("=== Audit complete ===\n");
 ```
