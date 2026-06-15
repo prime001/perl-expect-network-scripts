@@ -1,144 +1,146 @@
-```perl
 #!/usr/bin/perl
 use strict;
 use warnings;
-use Expect;
+use Net::SSH::Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-# cdp_lldp_neighbors.pl - Cisco CDP/LLDP Neighbor Discovery
+# stp_audit.pl - Spanning Tree Protocol topology auditor
 #
 # PURPOSE:
-#   Connects to one or more network devices via SSH and collects CDP and LLDP
-#   neighbor tables. Useful for topology mapping, change verification, and
-#   documenting physical adjacencies before/after maintenance windows.
+#   Connects to one or more Cisco IOS/IOS-XE devices and audits the STP
+#   topology: root bridge identity, port roles/states, TC counters, and
+#   any ports in BLOCKING or LISTENING state that may indicate instability.
 #
 # USAGE:
-#   Single device:   ./cdp_lldp_neighbors.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:     ./cdp_lldp_neighbors.pl -f devices.txt -u admin -p secret
-#   With log file:   ./cdp_lldp_neighbors.pl -h 10.0.0.1 -u admin -p secret -l neighbors.log
-#   LLDP only:       ./cdp_lldp_neighbors.pl -h 10.0.0.1 -u admin -p secret --lldp-only
+#   Single device:  perl stp_audit.pl -H 192.168.1.1 -u admin -p secret
+#   Device file:    perl stp_audit.pl -f devices.txt -u admin -p secret -l stp_report.log
+#   With VLAN:      perl stp_audit.pl -H 10.0.0.1 -u admin -p secret -v 100
 #
 # PREREQUISITES:
-#   cpan install Expect
-#   SSH key auth or password auth; device must have CDP/LLDP enabled
-#   Tested against IOS 15.x, IOS-XE 16.x/17.x
-#
-# DEVICE FILE FORMAT: one IP or hostname per line, lines starting with # ignored
+#   cpanm Net::SSH::Expect
+#   SSH must be enabled on target device; enable password optional (-e flag)
+#   Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x
 
-my ($host, $user, $pass, $enable_pass, $device_file, $log_file);
-my ($lldp_only, $cdp_only, $timeout) = (0, 0, 15);
+my ($host, $file, $user, $pass, $enable, $logfile, $vlan, $timeout);
+$timeout = 15;
 
 GetOptions(
-    'h|host=s'       => \$host,
-    'u|user=s'       => \$user,
-    'p|pass=s'       => \$pass,
-    'e|enable=s'     => \$enable_pass,
-    'f|file=s'       => \$device_file,
-    'l|log=s'        => \$log_file,
-    'lldp-only'      => \$lldp_only,
-    'cdp-only'       => \$cdp_only,
-    't|timeout=i'    => \$timeout,
-) or die "Usage: $0 -h HOST | -f FILE -u USER -p PASS [-e ENABLE] [-l LOGFILE] [--lldp-only|--cdp-only]\n";
+    'H|host=s'    => \$host,
+    'f|file=s'    => \$file,
+    'u|user=s'    => \$user,
+    'p|pass=s'    => \$pass,
+    'e|enable=s'  => \$enable,
+    'l|log=s'     => \$logfile,
+    'v|vlan=s'    => \$vlan,
+    't|timeout=i' => \$timeout,
+) or die "Usage: $0 -H host | -f file -u user -p pass [-e enable] [-l logfile] [-v vlan]\n";
 
-die "Specify -h HOST or -f FILE\n" unless $host || $device_file;
-die "Username (-u) required\n" unless $user;
-die "Password (-p) required\n" unless $pass;
+die "Specify -H <host> or -f <file>\n" unless $host || $file;
+die "Specify -u <user> and -p <pass>\n" unless $user && $pass;
 
-my @devices;
-if ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; next if /^\s*#/ || /^\s*$/; push @devices, $_; }
-    close $fh;
-} else {
-    @devices = ($host);
-}
+my @devices = $host ? ($host) : do {
+    open my $fh, '<', $file or die "Cannot open $file: $!";
+    grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
+};
 
 my $log_fh;
-if ($log_file) {
-    open($log_fh, '>', $log_file) or die "Cannot open log $log_file: $!\n";
+if ($logfile) {
+    open $log_fh, '>', $logfile or die "Cannot open log $logfile: $!";
 }
 
-sub log_output {
-    my $msg = shift;
-    print $msg;
-    print $log_fh $msg if $log_fh;
+sub output {
+    print @_;
+    print $log_fh @_ if $log_fh;
 }
 
-sub collect_neighbors {
+sub audit_device {
     my ($device) = @_;
-    my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    output("\n" . "=" x 60 . "\n");
+    output("Host: $device  Time: $ts\n");
+    output("=" x 60 . "\n");
 
-    log_output("\n" . "=" x 60 . "\n");
-    log_output("Device: $device  [$timestamp]\n");
-    log_output("=" x 60 . "\n");
+    my $ssh = Net::SSH::Expect->new(
+        host        => $device,
+        user        => $user,
+        password    => $pass,
+        raw_pty     => 1,
+        timeout     => $timeout,
+    );
 
-    my $exp = Expect->new();
-    $exp->raw_pty(1);
-    $exp->log_stdout(0);
-
-    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=$timeout $user\@$device")) {
-        log_output("ERROR: Failed to spawn SSH to $device: $!\n");
+    my $login_out = eval { $ssh->login() };
+    if ($@ || !defined $login_out) {
+        output("ERROR: SSH login failed to $device: $@\n");
         return;
     }
 
-    my $logged_in = 0;
-    $exp->expect($timeout,
-        [ qr/[Pp]assword:/,        sub { $exp->send("$pass\n"); exp_continue; } ],
-        [ qr/yes\/no/,             sub { $exp->send("yes\n");   exp_continue; } ],
-        [ qr/Connection refused/,  sub { log_output("ERROR: Connection refused on $device\n"); } ],
-        [ qr/No route to host/,    sub { log_output("ERROR: No route to $device\n"); } ],
-        [ qr/[>#]\s*$/,            sub { $logged_in = 1; } ],
-        [ timeout => sub { log_output("ERROR: Timeout connecting to $device\n"); } ],
-    );
+    $ssh->send("terminal length 0\n");
+    $ssh->waitfor('.*[>#]\s*$', 5);
 
-    unless ($logged_in) { $exp->soft_close(); return; }
-
-    # Enter enable mode if needed
-    my $prompt = ($exp->before() =~ />/) ? 'user' : 'priv';
-    if ($prompt eq 'user') {
-        $exp->send("enable\n");
-        $exp->expect($timeout,
-            [ qr/[Pp]assword:/,  sub { $exp->send(($enable_pass // $pass) . "\n"); exp_continue; } ],
-            [ qr/#\s*$/,         sub { } ],
-            [ timeout =>         sub { log_output("WARN: Could not enter enable mode on $device\n"); } ],
-        );
-    }
-
-    $exp->send("terminal length 0\n");
-    $exp->expect($timeout, [ qr/#\s*$/, sub { } ]);
-
-    my @commands;
-    push @commands, 'show cdp neighbors detail' unless $lldp_only;
-    push @commands, 'show lldp neighbors detail' unless $cdp_only;
-
-    for my $cmd (@commands) {
-        $exp->send("$cmd\n");
-        my $output = '';
-        $exp->expect(30,
-            [ qr/#\s*$/m, sub {
-                $output = $exp->before();
-                $output =~ s/\r//g;
-            }],
-            [ timeout => sub { log_output("WARN: Timeout on '$cmd' for $device\n"); } ],
-        );
-        if ($output) {
-            log_output("\n--- $cmd ---\n");
-            # Strip the echoed command line
-            $output =~ s/^[^\n]*\n//;
-            log_output($output . "\n");
+    if ($enable) {
+        $ssh->send("enable\n");
+        my $result = $ssh->waitfor('Password:|[>#]\s*$', 5);
+        if ($result && $result =~ /Password:/) {
+            $ssh->send("$enable\n");
+            $ssh->waitfor('.*#\s*$', 5);
         }
     }
 
-    $exp->send("exit\n");
-    $exp->soft_close();
+    my $cmd = $vlan ? "show spanning-tree vlan $vlan" : "show spanning-tree";
+    $ssh->send("$cmd\n");
+    my $output = $ssh->waitfor('.*[>#]\s*$', $timeout) // '';
+
+    my $root_found = 0;
+    my (@blocked, @desg, @root_ports);
+    my $tc_count = 0;
+
+    for my $line (split /\n/, $output) {
+        if ($line =~ /This bridge is the root/i) {
+            output("  [ROOT] This device IS the root bridge\n");
+            $root_found = 1;
+        }
+        if ($line =~ /Root ID.*Priority\s+(\d+)/i || $line =~ /^\s+Priority\s+(\d+)\s+Address\s+(\S+)/i) {
+            output("  Root Priority: $1" . ($2 ? "  MAC: $2" : "") . "\n") if $1;
+        }
+        if ($line =~ /^\s+Address\s+([0-9a-f.:]+)/i && !$root_found) {
+            output("  Root MAC: $1\n");
+        }
+        if ($line =~ /Number of topology changes\s+(\d+)/i) {
+            $tc_count = $1;
+            my $warn = $tc_count > 10 ? " <== HIGH" : "";
+            output("  Topology Changes: $tc_count$warn\n");
+        }
+        if ($line =~ /^\s*(\S+)\s+(\S+)\s+(\S+)\s+(BLK|BLOCK)\s*/i) {
+            push @blocked, $1;
+        }
+        if ($line =~ /^\s*(\S+)\s+\S+\s+\S+\s+FWD\s+Desg/i) {
+            push @desg, $1;
+        }
+        if ($line =~ /^\s*(\S+)\s+\S+\s+\S+\s+FWD\s+Root/i) {
+            push @root_ports, $1;
+        }
+    }
+
+    output("  Root ports:       " . (@root_ports ? join(', ', @root_ports) : 'none') . "\n");
+    output("  Designated ports: " . scalar(@desg) . " total\n");
+    if (@blocked) {
+        output("  BLOCKED ports:    " . join(', ', @blocked) . "\n");
+    } else {
+        output("  Blocked ports:    none\n");
+    }
+
+    $ssh->send("exit\n");
+    $ssh->close();
 }
+
+output("STP Audit Report\n");
+output("Devices: " . scalar(@devices) . "  VLAN filter: " . ($vlan // 'all') . "\n");
 
 for my $dev (@devices) {
-    collect_neighbors($dev);
+    eval { audit_device($dev) };
+    output("ERROR: $dev: $@\n") if $@;
 }
 
+output("\nAudit complete.\n");
 close $log_fh if $log_fh;
-log_output("\nDone. Processed " . scalar(@devices) . " device(s).\n");
-log_output("Output saved to $log_file\n") if $log_file;
-```
