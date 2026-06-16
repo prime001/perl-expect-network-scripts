@@ -1,148 +1,174 @@
-```perl
 #!/usr/bin/perl
-=head1 NAME
-port_channel_audit.pl - Audit port channel status and member link health
-
-=head1 SYNOPSIS
-./port_channel_audit.pl -f devices.txt [-l audit.log] [-t timeout]
-./port_channel_audit.pl 10.0.0.1 10.0.0.2 -l audit.log
-
-=head1 DESCRIPTION
-Connects to network devices via SSH and audits port channel configurations.
-Verifies all expected port channel members are up, identifies flapping ports,
-and reports bundling mismatches. Outputs results to STDOUT and optional logfile.
-
-=head1 PREREQUISITES
-Perl 5.10+, Expect.pm, Net::SSH access to devices
-Credentials via: export NETWORK_USER=admin NETWORK_PASS=password
-
-=cut
+#
+# cdp_lldp_neighbors.pl - CDP/LLDP Neighbor Discovery and Topology Mapper
+#
+# PURPOSE:
+#   Connects to Cisco IOS/NX-OS devices via SSH and collects CDP and LLDP
+#   neighbor tables. Useful for discovering unknown devices, verifying topology
+#   changes post-maintenance, and generating seed lists for network documentation.
+#
+# USAGE:
+#   Single device:  ./cdp_lldp_neighbors.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:    ./cdp_lldp_neighbors.pl -f devices.txt -u admin -p secret
+#   With log file:  ./cdp_lldp_neighbors.pl -h 192.168.1.1 -u admin -p secret -l out.log
+#
+# PREREQUISITES:
+#   cpan Net::SSH::Expect Getopt::Long
+#
+# DEVICE FILE FORMAT:
+#   One IP or hostname per line; lines starting with # are ignored.
 
 use strict;
 use warnings;
-use Expect;
-use Getopt::Std;
+use Net::SSH::Expect;
+use Getopt::Long;
+use POSIX qw(strftime);
 
-my %opts;
-getopts('f:l:t:u:p:', \%opts);
+my ($host, $file, $username, $password, $logfile, $help);
+my $timeout = 30;
 
-my $device_file = $opts{f};
-my $logfile = $opts{l};
-my $timeout = $opts{t} || 15;
-my $user = $opts{u} || $ENV{NETWORK_USER};
-my $pass = $opts{p} || $ENV{NETWORK_PASS};
+GetOptions(
+    'h|host=s'     => \$host,
+    'f|file=s'     => \$file,
+    'u|user=s'     => \$username,
+    'p|password=s' => \$password,
+    'l|log=s'      => \$logfile,
+    't|timeout=i'  => \$timeout,
+    'help'         => \$help,
+) or die "Error parsing options. Use --help for usage.\n";
+
+if ($help || (!$host && !$file) || !$username || !$password) {
+    print "Usage: $0 -h <host> | -f <file> -u <user> -p <pass> [-l <logfile>] [-t <sec>]\n";
+    exit 1;
+}
 
 my @devices;
-if ($device_file && -f $device_file) {
-    open my $fh, '<', $device_file or die "Cannot read $device_file: $!\n";
+if ($host) {
+    push @devices, $host;
+} else {
+    open(my $fh, '<', $file) or die "Cannot open device file '$file': $!\n";
     while (<$fh>) {
         chomp;
-        next if /^#|^\s*$/;
+        next if /^\s*#/ || /^\s*$/;
         push @devices, $_;
     }
     close $fh;
-} else {
-    @devices = @ARGV;
 }
 
-die "Usage: $0 -f devices.txt [-l logfile] [devices...]\n" unless @devices;
-die "Set NETWORK_USER and NETWORK_PASS environment variables\n" unless $user && $pass;
+die "No devices to process.\n" unless @devices;
 
-open my $LOG, '>>', $logfile if $logfile;
-
-foreach my $device (@devices) {
-    print "[*] Auditing port channels on $device\n";
-    my @results = audit_port_channels($device, $user, $pass, $timeout);
-    
-    foreach my $result (@results) {
-        print "$result\n";
-        print $LOG "$result\n" if $LOG;
-    }
+my $log_fh;
+if ($logfile) {
+    open($log_fh, '>', $logfile) or die "Cannot open log file '$logfile': $!\n";
 }
 
-close $LOG if $LOG;
-print "[+] Port channel audit complete\n";
+my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+out("=" x 70);
+out("CDP/LLDP Neighbor Discovery Report - $ts");
+out("=" x 70);
 
-sub audit_port_channels {
-    my ($device, $user, $pass, $timeout) = @_;
-    my @findings;
-    
-    my $exp = Expect->new();
-    $exp->raw_pty(1);
-    $exp->log_stdout(0);
-    
+for my $device (@devices) {
+    out("\n[Device: $device]");
+
+    my $ssh;
     eval {
-        $exp->spawn("ssh -o ConnectTimeout=$timeout -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $user\@$device")
-            or die "Cannot spawn SSH to $device\n";
-        
-        $exp->expect($timeout, ['password:', 'Password:']) 
-            or die "Timeout waiting for password prompt on $device\n";
-        $exp->send("$pass\n");
-        
-        $exp->expect($timeout, ['#', '>']) 
-            or die "Failed to authenticate on $device\n";
-        
-        $exp->send("terminal length 0\n");
-        $exp->expect($timeout, ['#', '>']);
-        
-        $exp->send("show etherchannel summary\n");
-        $exp->expect($timeout, ['#', '>']);
-        my $etherchannel_output = $exp->before();
-        
-        my %po_status;
-        my $current_po = undef;
-        
-        foreach my $line (split /\n/, $etherchannel_output) {
-            if ($line =~ /^Group\s+(\d+)/) {
-                $current_po = $1;
-            }
-            if ($current_po && $line =~ /([A-Za-z0-9\/]+)\s+\(\s*([A-Z])\s*\)/) {
-                my $member = $1;
-                my $state = $2;
-                $po_status{$current_po}{$member} = $state;
-                
-                if ($state ne 'P' && $state ne 'p') {
-                    push @findings, "WARNING: [$device] Port-Channel $current_po member $member is not bundled (state=$state)";
-                }
-            }
-        }
-        
-        $exp->send("show interfaces status err-disabled\n");
-        $exp->expect($timeout, ['#', '>']);
-        my $errdiabled_output = $exp->before();
-        
-        foreach my $line (split /\n/, $errdiabled_output) {
-            if ($line =~ /([A-Za-z0-9\/]+)\s+/) {
-                my $iface = $1;
-                if ($etherchannel_output =~ /$iface/) {
-                    push @findings, "ERROR: [$device] Interface $iface (port-channel member) is err-disabled";
-                }
-            }
-        }
-        
-        $exp->send("show interfaces counters errors | include Gi|Fa|Et|Te\n");
-        $exp->expect($timeout, ['#', '>']);
-        my $errors_output = $exp->before();
-        
-        foreach my $line (split /\n/, $errors_output) {
-            if ($line =~ /([A-Za-z0-9\/]+)\s+(\d+)\s+(\d+)/) {
-                my ($iface, $in_err, $out_err) = ($1, $2, $3);
-                if (($in_err + $out_err) > 100 && $etherchannel_output =~ /$iface/) {
-                    push @findings, "ALERT: [$device] Port-Channel member $iface has high error count (in=$in_err, out=$out_err)";
-                }
-            }
-        }
-        
-        $exp->send("exit\n");
-        $exp->soft_close();
-        
-        push @findings, "OK: [$device] Port channel audit completed" unless @findings;
+        $ssh = Net::SSH::Expect->new(
+            host     => $device,
+            user     => $username,
+            password => $password,
+            raw_pty  => 1,
+            timeout  => $timeout,
+        );
+        $ssh->login();
     };
-    
     if ($@) {
-        push @findings, "ERROR: [$device] Failed to connect: $@";
+        (my $err = $@) =~ s/\n/ /g;
+        out("  ERROR: Connection failed: $err");
+        next;
     }
-    
-    return @findings;
+
+    eval { $ssh->exec("terminal length 0") };
+    collect($ssh, $device, 'cdp',  'show cdp neighbors detail');
+    collect($ssh, $device, 'lldp', 'show lldp neighbors detail');
+    $ssh->close();
 }
-```
+
+out("\n" . "=" x 70);
+out("Scan complete.");
+close($log_fh) if $log_fh;
+
+sub collect {
+    my ($ssh, $device, $proto, $cmd) = @_;
+
+    my $raw;
+    eval { $raw = $ssh->exec($cmd) };
+    if ($@ || !defined $raw || length($raw) < 20) {
+        out("  [$proto] Command failed or no output.");
+        return;
+    }
+    if ($raw =~ /% invalid|not enabled|not running/i) {
+        out("  [$proto] Not enabled on this device.");
+        return;
+    }
+
+    my @neighbors = ($proto eq 'cdp') ? parse_cdp($raw) : parse_lldp($raw);
+
+    if (!@neighbors) {
+        out("  [$proto] No neighbors found.");
+        return;
+    }
+
+    out(sprintf("  [$proto] %d neighbor(s):", scalar @neighbors));
+    out(sprintf("    %-32s %-18s %-18s %-16s %s",
+        "Device ID", "Local Port", "Remote Port", "Platform", "IP Address"));
+    out("    " . "-" x 88);
+    for my $n (@neighbors) {
+        out(sprintf("    %-32s %-18s %-18s %-16s %s",
+            substr($n->{device}  // 'unknown', 0, 31),
+            substr($n->{local}   // 'unknown', 0, 17),
+            substr($n->{remote}  // 'unknown', 0, 17),
+            substr($n->{platform}// 'unknown', 0, 15),
+            $n->{ip} // 'N/A'));
+    }
+}
+
+sub parse_cdp {
+    my ($raw) = @_;
+    my @out;
+    for my $block (split /[-]{10,}/, $raw) {
+        next unless $block =~ /Device ID/i;
+        my %n;
+        ($n{device})   = $block =~ /Device ID:\s*(\S+)/i;
+        ($n{ip})       = $block =~ /IP(?:v4)? [Aa]ddress:\s*(\d[\d.]+)/;
+        ($n{platform}) = $block =~ /Platform:\s*([^,\n]+)/i;
+        ($n{local})    = $block =~ /Interface:\s*(\S+)/i;
+        ($n{remote})   = $block =~ /Port ID \(outgoing port\):\s*(\S+)/i;
+        $n{platform} =~ s/\s+$// if $n{platform};
+        push @out, \%n if $n{device};
+    }
+    return @out;
+}
+
+sub parse_lldp {
+    my ($raw) = @_;
+    my @out;
+    for my $block (split /[-]{10,}/, $raw) {
+        next unless $block =~ /System Name|Chassis id/i;
+        my %n;
+        ($n{device})   = $block =~ /System Name:\s*(\S+)/i;
+        ($n{device}) //= do { my ($v) = $block =~ /Chassis id:\s*(\S+)/i; $v };
+        ($n{ip})       = $block =~ /(\d{1,3}(?:\.\d{1,3}){3})/;
+        ($n{platform}) = $block =~ /System Description:\s*([^\n]+)/i;
+        ($n{local})    = $block =~ /Local Intf:\s*(\S+)/i;
+        ($n{remote})   = $block =~ /Port id:\s*(\S+)/i;
+        $n{platform}   = substr($n{platform} // '', 0, 40) if $n{platform};
+        push @out, \%n if $n{device};
+    }
+    return @out;
+}
+
+sub out {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $log_fh "$msg\n" if $log_fh;
+}
