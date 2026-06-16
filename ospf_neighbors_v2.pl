@@ -1,95 +1,98 @@
 ```perl
 #!/usr/bin/perl
 #
-# ospf_flap_monitor.pl - OSPF Neighbor Flap Detection and State Change Tracker
+# ospf_neighbor_flap_monitor.pl
 #
 # Purpose:
-#   Polls a Cisco IOS/IOS-XE device repeatedly to detect OSPF neighbor state
-#   changes (flaps). Unlike a one-shot neighbor check, this script monitors
-#   adjacency stability over time — useful for diagnosing unstable links,
-#   MTU mismatches, or timer inconsistencies in production environments.
+#   Polls OSPF neighbor state on one or more Cisco IOS devices at a configurable
+#   interval and reports any state changes (flaps, down events, new adjacencies).
+#   Useful for catching transient OSPF instability that a one-shot check misses.
 #
 # Usage:
-#   ospf_flap_monitor.pl --host <IP> --user <user> --pass <password> [options]
-#   ospf_flap_monitor.pl --file devices.txt --user <user> --pass <password>
+#   ./ospf_neighbor_flap_monitor.pl --host 192.168.1.1 [options]
+#   ./ospf_neighbor_flap_monitor.pl --file devices.txt  [options]
 #
-# Options:
-#   --host     Single device IP or hostname
-#   --file     File with one device per line
-#   --user     SSH username
-#   --pass     SSH password
-#   --interval Poll interval in seconds (default: 30)
-#   --duration Total monitoring duration in seconds (default: 300)
-#   --log      Path to output log file (optional)
+#   Options:
+#     --host HOST      Single device IP or hostname
+#     --file FILE      Newline-separated list of host:user:pass entries
+#     --user USER      SSH username (default: admin)
+#     --pass PASS      SSH password (prompt if omitted)
+#     --interval N     Seconds between polls (default: 30)
+#     --count N        Number of poll cycles (default: 10; 0 = infinite)
+#     --log FILE       Append output to log file in addition to STDOUT
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
-#   SSH access to device with 'show ip ospf neighbor' privilege
+#   cpan Net::SSH::Expect Term::ReadKey
+#
+# Notes:
+#   Tested against Cisco IOS 15.x and IOS-XE 16.x.
+#   Expects an enable-mode prompt ending in '#'.
+#
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
-use POSIX qw(strftime);
+use Getopt::Long qw(:config no_ignore_case);
+use POSIX        qw(strftime);
+use Term::ReadKey;
 
-my ($host, $host_file, $user, $pass, $log_file);
-my $interval = 30;
-my $duration = 300;
+my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_log);
+my $opt_interval = 30;
+my $opt_count    = 10;
 
 GetOptions(
-    'host=s'     => \$host,
-    'file=s'     => \$host_file,
-    'user=s'     => \$user,
-    'pass=s'     => \$pass,
-    'interval=i' => \$interval,
-    'duration=i' => \$duration,
-    'log=s'      => \$log_file,
-) or die "Usage: $0 --host <IP> --user <u> --pass <p> [--interval 30] [--duration 300] [--log file]\n";
+    'host=s'     => \$opt_host,
+    'file=s'     => \$opt_file,
+    'user=s'     => \$opt_user,
+    'pass=s'     => \$opt_pass,
+    'interval=i' => \$opt_interval,
+    'count=i'    => \$opt_count,
+    'log=s'      => \$opt_log,
+) or die "Usage: $0 --host HOST | --file FILE [--user U] [--pass P] [--interval N] [--count N] [--log FILE]\n";
 
-die "Provide --host or --file\n" unless $host || $host_file;
-die "Provide --user and --pass\n" unless $user && $pass;
+die "ERROR: Provide --host or --file\n" unless $opt_host || $opt_file;
 
-my @devices;
-if ($host_file) {
-    open my $fh, '<', $host_file or die "Cannot open $host_file: $!\n";
-    @devices = grep { /\S/ } map { chomp; $_ } <$fh>;
-    close $fh;
-} else {
-    @devices = ($host);
+$opt_user //= 'admin';
+
+unless ($opt_pass) {
+    print "SSH password: ";
+    ReadMode('noecho');
+    chomp($opt_pass = <STDIN>);
+    ReadMode('restore');
+    print "\n";
 }
 
 my $log_fh;
-if ($log_file) {
-    open $log_fh, '>>', $log_file or warn "Cannot open log $log_file: $!\n";
+if ($opt_log) {
+    open $log_fh, '>>', $opt_log or die "Cannot open log $opt_log: $!";
+    $log_fh->autoflush(1);
 }
 
-sub ts { strftime('%Y-%m-%d %H:%M:%S', localtime) }
-
-sub log_msg {
+sub emit {
     my ($msg) = @_;
-    my $line = "[" . ts() . "] $msg\n";
+    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    my $line = "[$ts] $msg\n";
     print $line;
     print $log_fh $line if $log_fh;
 }
 
-sub get_neighbors {
-    my ($ssh) = @_;
+sub parse_neighbors {
+    my ($output) = @_;
     my %neighbors;
-    my $output = $ssh->exec('show ip ospf neighbor');
     for my $line (split /\n/, $output) {
-        # Match: NeighborID  Pri  State  DeadTime  Address  Interface
-        if ($line =~ /^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\S+)\s+\S+\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)/) {
-            $neighbors{$1} = { state => $2, address => $3, interface => $4 };
+        if ($line =~ /^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\S+)\s+\S+\s+(\S+)\s+(\S+)/) {
+            my ($router_id, $priority, $state, $iface) = ($1, $2, $3, $4);
+            $state =~ s|/.*||;  # strip DR/BDR qualifier
+            $neighbors{$router_id} = { state => $state, iface => $iface };
         }
     }
     return %neighbors;
 }
 
-for my $device (@devices) {
-    log_msg("=== Starting OSPF flap monitor on $device (${duration}s, ${interval}s interval) ===");
-
+sub poll_device {
+    my ($host, $user, $pass) = @_;
     my $ssh = Net::SSH::Expect->new(
-        host        => $device,
+        host        => $host,
         user        => $user,
         password    => $pass,
         raw_pty     => 1,
@@ -97,55 +100,84 @@ for my $device (@devices) {
         ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
     );
 
-    unless (eval { $ssh->login() }) {
-        log_msg("ERROR: Cannot connect to $device: $@");
-        next;
+    eval { $ssh->login() };
+    if ($@) {
+        emit("ERROR [$host]: SSH login failed — $@");
+        return undef;
     }
 
-    $ssh->exec('terminal length 0');
+    $ssh->send('terminal length 0');
+    $ssh->waitfor('#', 5);
+    $ssh->send('show ip ospf neighbor');
+    my $output = $ssh->waitfor('#', 15);
+    $ssh->send('exit');
 
-    my %prev;
-    my $flap_count  = 0;
-    my $start       = time;
-    my $polls       = 0;
-
-    while ((time - $start) < $duration) {
-        my %curr = eval { get_neighbors($ssh) };
-        if ($@) {
-            log_msg("ERROR: Lost connection to $device: $@");
-            last;
-        }
-        $polls++;
-
-        # Detect disappearances and state changes
-        for my $nbr (sort keys %prev) {
-            if (!exists $curr{$nbr}) {
-                log_msg("FLAP [$device] Neighbor $nbr ($prev{$nbr}{interface}) DROPPED from $prev{$nbr}{state}");
-                $flap_count++;
-            } elsif ($curr{$nbr}{state} ne $prev{$nbr}{state}) {
-                log_msg("STATE [$device] Neighbor $nbr ($prev{$nbr}{interface}): $prev{$nbr}{state} -> $curr{$nbr}{state}");
-                $flap_count++ if $curr{$nbr}{state} !~ /FULL/;
-            }
-        }
-        # Detect new adjacencies
-        for my $nbr (sort keys %curr) {
-            if (!exists $prev{$nbr}) {
-                log_msg("NEW [$device] Neighbor $nbr via $curr{$nbr}{interface} state=$curr{$nbr}{state}") if $polls > 1;
-            }
-        }
-
-        if ($polls == 1) {
-            log_msg("BASELINE [$device] " . scalar(keys %curr) . " neighbor(s): "
-                . join(', ', map { "$_ ($curr{$_}{state}/$curr{$_}{interface})" } sort keys %curr));
-        }
-
-        %prev = %curr;
-        sleep $interval if (time - $start) < $duration;
-    }
-
-    log_msg("=== DONE $device: $polls polls, $flap_count flap/change event(s) ===");
-    $ssh->close() if $ssh->can('close');
+    return $output;
 }
 
+my @devices;
+if ($opt_host) {
+    push @devices, { host => $opt_host, user => $opt_user, pass => $opt_pass };
+} else {
+    open my $fh, '<', $opt_file or die "Cannot open $opt_file: $!";
+    while (<$fh>) {
+        chomp; next if /^\s*#/ || /^\s*$/;
+        my ($h, $u, $p) = split /:/, $_, 3;
+        push @devices, { host => $h, user => $u // $opt_user, pass => $p // $opt_pass };
+    }
+    close $fh;
+}
+
+my %prev_state;
+my $cycle = 0;
+
+emit("Starting OSPF flap monitor — interval=${opt_interval}s, cycles=" . ($opt_count ? $opt_count : 'infinite'));
+
+while ($opt_count == 0 || $cycle < $opt_count) {
+    $cycle++;
+    for my $dev (@devices) {
+        my $host = $dev->{host};
+        my $raw  = poll_device($host, $dev->{user}, $dev->{pass});
+        next unless defined $raw;
+
+        my %curr = parse_neighbors($raw);
+
+        unless (%{$prev_state{$host} // {}}) {
+            # First poll — establish baseline
+            my $count = scalar keys %curr;
+            emit("BASELINE [$host]: $count neighbor(s) — " .
+                 join(', ', map { "$_ ($curr{$_}{state}/$curr{$_}{iface})" } sort keys %curr));
+            $prev_state{$host} = \%curr;
+            next;
+        }
+
+        my %prev = %{$prev_state{$host}};
+        my $changed = 0;
+
+        for my $rid (sort keys %curr) {
+            if (!exists $prev{$rid}) {
+                emit("NEW [$host]: neighbor $rid came UP — $curr{$rid}{state} on $curr{$rid}{iface}");
+                $changed++;
+            } elsif ($prev{$rid}{state} ne $curr{$rid}{state}) {
+                emit("FLAP [$host]: $rid $prev{$rid}{state} -> $curr{$rid}{state} on $curr{$rid}{iface}");
+                $changed++;
+            }
+        }
+        for my $rid (sort keys %prev) {
+            unless (exists $curr{$rid}) {
+                emit("DOWN [$host]: neighbor $rid ($prev{$rid}{state}/$prev{$rid}{iface}) disappeared");
+                $changed++;
+            }
+        }
+
+        emit("OK [$host]: cycle $cycle — no changes (" . scalar(keys %curr) . " neighbors stable)") unless $changed;
+        $prev_state{$host} = \%curr;
+    }
+
+    last if $opt_count && $cycle >= $opt_count;
+    sleep $opt_interval;
+}
+
+emit("Monitor complete after $cycle cycle(s).");
 close $log_fh if $log_fh;
 ```
