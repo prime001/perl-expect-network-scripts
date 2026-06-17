@@ -1,140 +1,176 @@
-The user wants the script content as direct output. Here it is:
-
+```perl
 #!/usr/bin/perl
 #
-# syslog_analyzer.pl - Cisco IOS Syslog Severity Analyzer
+# Device Syslog Monitor - Real-time critical syslog event capture and alerting
 #
 # Purpose:
-#   SSH into one or more Cisco IOS devices, retrieve the in-memory syslog
-#   buffer (show logging), categorize every message by RFC 5424 / Cisco
-#   severity level (0-EMERG through 7-DEBUG), and produce a structured
-#   report with per-severity counts plus a full listing of all events at
-#   ERROR level or above -- the entries most likely to warrant action.
+#   Connects to network devices via SSH and captures critical syslog events in real-time.
+#   Monitors for link state changes, errors, warnings, and other critical events.
+#   Useful for troubleshooting active issues and detecting problems as they occur.
 #
 # Usage:
-#   perl syslog_analyzer.pl <host|hostfile> <user> <pass> [--logfile=FILE]
-#
-# Arguments:
-#   host|hostfile  Single IP/hostname, or a file containing one per line
-#                  (lines starting with # are treated as comments)
-#   user           SSH username
-#   pass           SSH password
-#   --logfile      Optional path; output is written to both STDOUT and file
+#   ./device_syslog_monitor.pl <device_ip> [<device_ip2> ...] [--log alerts.log] [--timeout 120]
+#   ./device_syslog_monitor.pl --file devices.txt --log /tmp/syslog_alerts.txt
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
+#   - Perl modules: Expect
+#   - SSH access with valid credentials (SSH_USER and SSH_PASS env vars, or key-based auth)
+#   - Device supports terminal monitor and syslog output to SSH sessions
 #
-# Examples:
-#   perl syslog_analyzer.pl 192.168.1.1  admin cisco123
-#   perl syslog_analyzer.pl routers.txt  admin cisco123 --logfile=sev_report.txt
+# Environment Variables:
+#   SSH_USER - SSH username (default: admin)
+#   SSH_PASS - SSH password (leave unset for key-based auth)
 
 use strict;
 use warnings;
-use Net::SSH::Expect;
+use Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
+use File::Basename;
 
-my $logfile = '';
-GetOptions('logfile=s' => \$logfile);
+my ($device_file, $logfile, $timeout, $help);
+GetOptions(
+    'file=s'    => \$device_file,
+    'log=s'     => \$logfile,
+    'timeout=i' => \$timeout,
+    'help'      => \$help,
+) or die "Error in command line arguments\n";
 
-my ($target, $username, $password) = @ARGV;
-die "Usage: $0 <host|hostfile> <user> <pass> [--logfile=FILE]\n"
-    unless $target && $username && $password;
+$timeout ||= 120;
 
-my %SEV_NAME = (
-    0 => 'EMERGENCY', 1 => 'ALERT',  2 => 'CRITICAL', 3 => 'ERROR',
-    4 => 'WARNING',   5 => 'NOTICE', 6 => 'INFO',      7 => 'DEBUG',
-);
-
-my @hosts;
-if (-f $target) {
-    open(my $fh, '<', $target) or die "Cannot open '$target': $!\n";
-    @hosts = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
-    close $fh;
-} else {
-    @hosts = ($target);
+if ($help) {
+    print "Usage: " . basename($0) . " [--file devices.txt] [--log logfile] [--timeout N] [device1] [device2]\n";
+    exit 0;
 }
+
+my @devices;
+if ($device_file) {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^#/ || /^\s*$/;
+        push @devices, $_;
+    }
+    close $fh;
+}
+push @devices, @ARGV if @ARGV;
+
+die "No devices specified\n" unless @devices;
 
 my $log_fh;
 if ($logfile) {
-    open($log_fh, '>', $logfile) or die "Cannot open logfile '$logfile': $!\n";
+    open $log_fh, '>>', $logfile or die "Cannot open $logfile: $!\n";
+    $log_fh->autoflush(1);
 }
 
-sub out {
-    my $msg = shift;
-    print $msg;
-    print {$log_fh} $msg if $log_fh;
-}
+log_msg("Syslog monitor started for " . scalar(@devices) . " device(s)", $log_fh);
 
-my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-out("=" x 68 . "\n");
-out("Cisco Syslog Severity Report  --  $ts\n");
-out("=" x 68 . "\n\n");
-
-for my $host (@hosts) {
-    out("Host: $host\n");
-    out("-" x 52 . "\n");
-
-    my $ssh = eval {
-        Net::SSH::Expect->new(
-            host     => $host,
-            user     => $username,
-            password => $password,
-            raw_pty  => 1,
-            timeout  => 15,
-        );
-    };
-    if ($@ || !$ssh) {
-        out("  FAIL: Could not create SSH session -- $@\n\n");
-        next;
-    }
-
-    my $logged_in = eval { $ssh->login() };
-    if ($@ || !$logged_in) {
-        out("  FAIL: Authentication failed or connection refused\n\n");
-        next;
-    }
-
-    eval { $ssh->exec("terminal length 0") };
-
-    my $raw = eval { $ssh->exec("show logging") };
-    if ($@ || !$raw) {
-        out("  FAIL: 'show logging' returned no output -- $@\n\n");
-        $ssh->close();
-        next;
-    }
-
-    my (%counts, @flagged);
-    $counts{$_} = 0 for keys %SEV_NAME;
-
-    # Cisco syslog line: *timestamp: %FACILITY-SEVERITY-MNEMONIC: message
-    while ($raw =~ /^(.*%[A-Z0-9_]+-([0-7])-[A-Z0-9_]+:.+)$/mg) {
-        my ($line, $sev) = ($1, $2);
-        $counts{$sev}++;
-        push @flagged, "    $line" if $sev <= 3;
-    }
-
-    my $total = 0;
-    $total += ($counts{$_} // 0) for keys %SEV_NAME;
-
-    out(sprintf("  Parsed entries : %d\n\n  Per-severity breakdown:\n", $total));
-
-    for my $s (0 .. 7) {
-        my $n   = $counts{$s} // 0;
-        my $tag = ($s <= 3 && $n > 0) ? "  <<" : "";
-        out(sprintf("    [%d] %-13s  %4d%s\n", $s, $SEV_NAME{$s}, $n, $tag));
-    }
-
-    if (@flagged) {
-        out("\n  High-severity events (levels 0-3):\n");
-        out("$_\n") for @flagged;
-    } else {
-        out("\n  No high-severity events detected.\n");
-    }
-
-    $ssh->close();
-    out("\n");
+foreach my $device (@devices) {
+    monitor_device($device, $log_fh, $timeout);
 }
 
 close $log_fh if $log_fh;
-out("Report complete.\n");
+
+sub monitor_device {
+    my ($device, $log_fh, $timeout) = @_;
+    my $user = $ENV{SSH_USER} || 'admin';
+    my $pass = $ENV{SSH_PASS};
+    
+    log_msg("Connecting to $device...", $log_fh);
+    
+    my $exp = Expect->new();
+    $exp->timeout($timeout);
+    
+    eval {
+        $exp->spawn("ssh -o ConnectTimeout=10 -l $user $device")
+            or die "Cannot spawn SSH to $device: $!";
+    };
+    
+    if ($@) {
+        log_msg("ERROR: $device - $@", $log_fh);
+        return;
+    }
+    
+    if ($pass) {
+        my $matched = $exp->expect(10, 'assword:');
+        if (!$matched) {
+            log_msg("ERROR: $device - Password prompt timeout", $log_fh);
+            $exp->hard_close();
+            return;
+        }
+        $exp->send("$pass\n");
+    }
+    
+    my $connected = 0;
+    eval {
+        $exp->expect(10, qr/[#>]\s*$/);
+        $connected = 1;
+    };
+    
+    unless ($connected) {
+        log_msg("ERROR: $device - SSH authentication failed", $log_fh);
+        $exp->hard_close();
+        return;
+    }
+    
+    $exp->send("terminal monitor\n");
+    $exp->expect(2, qr/[#>]\s*$/);
+    
+    log_msg("CONNECTED: $device - capturing syslog events", $log_fh);
+    
+    my $start_time = time();
+    my $monitor_duration = 3600;
+    my %seen_alerts;
+    
+    while (time() - $start_time < $monitor_duration) {
+        my ($pos, $match, $before, $after);
+        
+        eval {
+            ($pos, $match, $before, $after) = $exp->expect(15, '-re', qr/.*[A-Za-z0-9]{2,}.*\n/);
+        };
+        
+        last if !defined $pos || $@;
+        next unless $match;
+        
+        if ($match =~ /^%?([A-Z]+)[_-](\d+)[_-]([A-Z]+)/ || $match =~ /%(.+?)$/) {
+            my $alert_sig = substr($match, 0, 80);
+            
+            if ($match =~ /LINK-[0-9]-UPDOWN|LINEPROTO-[0-9]-UPDOWN/i) {
+                my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime());
+                my $msg = "[$ts] $device LINK-STATUS: $match";
+                print "$msg\n";
+                print $log_fh "$msg\n" if $log_fh;
+                next;
+            }
+            
+            if ($match =~ /%(.{10,})/i) {
+                unless ($seen_alerts{$alert_sig}++) {
+                    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime());
+                    my $msg = "[$ts] $device: $match";
+                    
+                    if ($match =~ /ERROR|CRIT|FAIL|DOWN|INVALID/i) {
+                        print "*** ALERT: $msg\n";
+                        print $log_fh "*** ALERT: $msg\n" if $log_fh;
+                    } elsif ($match =~ /WARN|WARN/i) {
+                        print "** WARNING: $msg\n";
+                        print $log_fh "** WARNING: $msg\n" if $log_fh;
+                    }
+                }
+            }
+        }
+    }
+    
+    $exp->send("exit\n");
+    $exp->soft_close();
+    log_msg("DISCONNECTED: $device - monitoring complete", $log_fh);
+}
+
+sub log_msg {
+    my ($msg, $log_fh) = @_;
+    my $ts = strftime('[%Y-%m-%d %H:%M:%S]', localtime());
+    print STDOUT "$ts $msg\n";
+    if ($log_fh) {
+        print $log_fh "$ts $msg\n";
+    }
+}
+```
