@@ -1,30 +1,28 @@
-```perl
 #!/usr/bin/perl
 # =============================================================================
-# bgp_peer_policy_audit.pl - BGP Neighbor Route Policy Auditor
+# bgp_prefix_monitor.pl - BGP Neighbor Prefix Count Monitor
 #
 # Purpose:
-#   Connects to Cisco IOS/IOS-XE routers and audits BGP neighbor route
-#   policies: inbound/outbound route-maps, prefix-lists, distribute-lists,
-#   and filter-lists applied per peer. Useful for validating policy
-#   consistency across a fleet before/after routing changes.
+#   Connects to IOS/IOS-XE routers via SSH and audits BGP IPv4 unicast prefix
+#   counts per neighbor. Flags sessions that are established but receiving zero
+#   prefixes, counts below a minimum threshold (e.g. partial table leak), or
+#   counts exceeding a maximum threshold (e.g. route table explosion). Useful
+#   for NOC dashboards and post-maintenance validation.
 #
 # Usage:
-#   Single device:  ./bgp_peer_policy_audit.pl -h 10.0.0.1
-#   Device list:    ./bgp_peer_policy_audit.pl -f devices.txt
-#   With logging:   ./bgp_peer_policy_audit.pl -h 10.0.0.1 -l /tmp/bgp_audit.log
-#   Custom creds:   ./bgp_peer_policy_audit.pl -h 10.0.0.1 -u admin -p secret
-#
-# Output:
-#   Per-peer table showing applied inbound/outbound policies for each
-#   BGP neighbor. Flags peers with NO policy applied (potential leak risk).
+#   Single device:   perl bgp_prefix_monitor.pl -h 192.168.1.1
+#   Device file:     perl bgp_prefix_monitor.pl -f routers.txt
+#   With thresholds: perl bgp_prefix_monitor.pl -f routers.txt -m 800000 -x 1000000
+#   With log:        perl bgp_prefix_monitor.pl -h 10.0.0.1 -l /var/log/bgp_pfx.log
 #
 # Prerequisites:
-#   cpan install Expect
-#   SSH key auth or plaintext credentials (--password flag)
-#   Device must support: show bgp neighbors (IOS/IOS-XE syntax)
+#   cpan Expect
+#   SSH key auth recommended. Password via env var BGP_MON_PASS.
+#   Account requires privilege level 1 (show access) on target devices.
 #
-# Tested on: Cisco IOS 15.x, IOS-XE 16.x/17.x
+# Device file format: one IP/hostname per line; lines starting with # ignored.
+#
+# Exit: 0 = all peers within thresholds, 1 = issues found or errors
 # =============================================================================
 
 use strict;
@@ -33,168 +31,144 @@ use Expect;
 use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $file, $user, $pass, $enable, $logfile, $timeout, $help);
-$user    = $ENV{NET_USER} // 'admin';
-$pass    = $ENV{NET_PASS} // '';
-$enable  = $ENV{NET_ENABLE} // '';
-$timeout = 30;
+my ($opt_host, $opt_file, $opt_log, $opt_min, $opt_max);
+my $opt_user    = $ENV{BGP_MON_USER} || $ENV{USER} || 'admin';
+my $opt_pass    = $ENV{BGP_MON_PASS} || '';
+my $opt_timeout = 30;
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'f|file=s'     => \$file,
-    'u|user=s'     => \$user,
-    'p|password=s' => \$pass,
-    'e|enable=s'   => \$enable,
-    'l|log=s'      => \$logfile,
-    't|timeout=i'  => \$timeout,
-    'help'         => \$help,
-) or die "Error in arguments. Use --help for usage.\n";
+    'h|host=s'    => \$opt_host,
+    'f|file=s'    => \$opt_file,
+    'l|log=s'     => \$opt_log,
+    'u|user=s'    => \$opt_user,
+    'm|min=i'     => \$opt_min,
+    'x|max=i'     => \$opt_max,
+    't|timeout=i' => \$opt_timeout,
+) or die "Usage: $0 -h <host>|-f <file> [-l log] [-u user] [-m min] [-x max]\n";
 
-if ($help) {
-    system("grep '^#' $0 | head -25");
-    exit 0;
+die "Specify -h <host> or -f <file>\n" unless $opt_host || $opt_file;
+
+my @devices;
+if ($opt_host) {
+    push @devices, $opt_host;
+} else {
+    open(my $fh, '<', $opt_file) or die "Cannot open $opt_file: $!\n";
+    while (<$fh>) { chomp; next if /^\s*[#\s]/; push @devices, $_; }
+    close $fh;
 }
-
-die "Specify -h <host> or -f <file>\n" unless $host || $file;
-
-my @devices = $host ? ($host) : do {
-    open my $fh, '<', $file or die "Cannot open $file: $!\n";
-    map { chomp; $_ } grep { /\S/ && !/^#/ } <$fh>;
-};
+die "No devices to process\n" unless @devices;
 
 my $log_fh;
-if ($logfile) {
-    open $log_fh, '>', $logfile or die "Cannot open log $logfile: $!\n";
+if ($opt_log) {
+    open($log_fh, '>>', $opt_log) or die "Cannot open log $opt_log: $!\n";
 }
 
 my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-output("# BGP Peer Policy Audit - $ts\n");
+emit("=" x 62);
+emit("BGP Prefix Monitor  |  $ts");
+emit(sprintf("Thresholds: min=%s  max=%s",
+    defined $opt_min ? $opt_min : 'none',
+    defined $opt_max ? $opt_max : 'none'));
+emit("=" x 62);
 
-for my $device (@devices) {
-    output("\n=== $device ===");
-    audit_device($device);
+my $total_issues = 0;
+
+for my $dev (@devices) {
+    emit("\n[Device: $dev]");
+    $total_issues += audit_device($dev);
 }
 
+emit("\n" . "=" x 62);
+emit($total_issues
+    ? "RESULT: $total_issues device(s) with issues -- review warnings above"
+    : "RESULT: All peers within thresholds -- no action required");
+emit("=" x 62);
 close $log_fh if $log_fh;
+exit($total_issues ? 1 : 0);
+
+# ---------------------------------------------------------------------------
 
 sub audit_device {
-    my ($ip) = @_;
+    my ($dev) = @_;
 
     my $exp = Expect->new();
     $exp->raw_pty(1);
     $exp->log_stdout(0);
 
-    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${user}\@${ip}")) {
-        output("ERROR: Failed to spawn SSH for $ip");
-        return;
+    unless ($exp->spawn('ssh', '-o', 'StrictHostKeyChecking=no',
+                               '-o', 'ConnectTimeout=10',
+                               '-l', $opt_user, $dev)) {
+        emit("  ERROR: spawn failed: $!");
+        return 1;
     }
 
-    my $logged_in = 0;
-    $exp->expect($timeout,
-        [ qr/[Pp]assword:/ => sub {
-            $exp->send("$pass\n");
-            exp_continue;
-        }],
-        [ qr/[>#]/ => sub { $logged_in = 1 }],
-        [ qr/[Cc]onnection (refused|timed out)/ => sub {
-            output("ERROR: Connection failed to $ip");
-        }],
-        [ qr/[Aa]uth(entication)? (failed|error)/ => sub {
-            output("ERROR: Authentication failed on $ip");
-        }],
-        [ timeout => sub { output("ERROR: Timeout connecting to $ip") }],
+    my $ready = 0;
+    $exp->expect($opt_timeout,
+        [ qr/[Pp]assword:/         => sub { $exp->send("$opt_pass\n"); exp_continue; } ],
+        [ qr/yes\/no/i             => sub { $exp->send("yes\n");        exp_continue; } ],
+        [ qr/Connection refused/i  => sub { emit("  ERROR: connection refused"); } ],
+        [ qr/[>#]\s*$/             => sub { $ready = 1; } ],
+        [ timeout                  => sub { emit("  ERROR: connect timeout"); } ],
     );
-    return unless $logged_in;
 
-    # Enter enable mode if needed
-    if ($enable) {
-        $exp->send("enable\n");
-        $exp->expect($timeout, [ qr/[Pp]assword:/ => sub { $exp->send("$enable\n") }]);
-        $exp->expect($timeout, '#');
-    }
+    unless ($ready) { $exp->soft_close(); return 1; }
 
-    # Disable paging
     $exp->send("terminal length 0\n");
-    $exp->expect($timeout, qr/[>#]/);
+    $exp->expect($opt_timeout, qr/[>#]\s*$/);
 
-    # Collect BGP neighbor detail
-    $exp->send("show bgp neighbors\n");
+    $exp->send("show bgp ipv4 unicast summary\n");
     my $raw = '';
-    $exp->expect(60,
-        [ qr/[>#]/ => sub { $raw = $exp->before(); exp_continue if length($raw) < 100 }],
-        [ timeout => sub { output("ERROR: Command timed out on $ip") }],
+    $exp->expect($opt_timeout,
+        [ qr/[>#]\s*$/ => sub { $raw = $exp->before(); } ],
+        [ timeout      => sub { emit("  ERROR: command timeout"); } ],
     );
 
     $exp->send("exit\n");
     $exp->soft_close();
 
-    parse_and_display($ip, $raw);
+    unless ($raw) { emit("  ERROR: no output from device"); return 1; }
+
+    # Parse neighbor table: Neighbor V AS MsgRcvd MsgSent TblVer InQ OutQ Up/Down State/PfxRcd
+    my @peers;
+    for (split /\n/, $raw) {
+        if (/^\s*(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\S+)\s+(\S+)/) {
+            push @peers, { ip => $1, asn => $2, updown => $3, state => $4 };
+        }
+    }
+
+    if (!@peers) {
+        emit("  WARNING: no peers parsed -- BGP may not be configured or output format differs");
+        return 1;
+    }
+
+    my ($ok, $warn) = (0, 0);
+    for my $p (@peers) {
+        my ($ip, $asn, $updown, $st) = @{$p}{qw(ip asn updown state)};
+        my $note;
+
+        if ($st =~ /^\d+$/) {
+            if    ($st == 0)                              { $note = "ZERO prefixes received"; }
+            elsif (defined $opt_min && $st < $opt_min)   { $note = "BELOW min ($st < $opt_min)"; }
+            elsif (defined $opt_max && $st > $opt_max)   { $note = "EXCEEDS max ($st > $opt_max)"; }
+        } else {
+            $note = "SESSION $st";
+        }
+
+        if ($note) {
+            emit(sprintf("  [WARN] %-16s AS%-8s up/dn:%-12s %s", $ip, $asn, $updown, $note));
+            $warn++;
+        } else {
+            emit(sprintf("  [OK]   %-16s AS%-8s up/dn:%-12s prefixes:%s", $ip, $asn, $updown, $st));
+            $ok++;
+        }
+    }
+
+    emit("  Peers: " . scalar(@peers) . " total  |  $ok OK  |  $warn flagged");
+    return $warn > 0 ? 1 : 0;
 }
 
-sub parse_and_display {
-    my ($ip, $raw) = @_;
-
-    my @neighbors;
-    my $current;
-
-    for my $line (split /\n/, $raw) {
-        if ($line =~ /^BGP neighbor is (\S+)/) {
-            push @neighbors, $current if $current;
-            $current = { peer => $1, inbound => [], outbound => [] };
-        }
-        next unless $current;
-
-        # Route-maps
-        if ($line =~ /Route map for (incoming|outgoing) advertisements is (\S+)/) {
-            my ($dir, $map) = ($1, $2);
-            push @{$current->{inbound}},  "route-map:$map" if $dir eq 'incoming';
-            push @{$current->{outbound}}, "route-map:$map" if $dir eq 'outgoing';
-        }
-        # Prefix-lists
-        if ($line =~ /Route map for (incoming|outgoing).*prefix-list (\S+)/i) {
-            my ($dir, $pl) = ($1, $2);
-            push @{$current->{inbound}},  "prefix-list:$pl" if $dir =~ /in/i;
-            push @{$current->{outbound}}, "prefix-list:$pl" if $dir =~ /out/i;
-        }
-        # Distribute-lists
-        if ($line =~ /Incoming (update|filter-list) (\S+)/) {
-            push @{$current->{inbound}}, "dist-list:$2";
-        }
-        if ($line =~ /Outgoing (update|filter-list) (\S+)/) {
-            push @{$current->{outbound}}, "dist-list:$2";
-        }
-        # AS-path filter
-        if ($line =~ /AS path filter.*(\d+), (\w+)/) {
-            my $dir = $2 eq 'in' ? 'inbound' : 'outbound';
-            push @{$current->{$dir}}, "as-path-acl:$1";
-        }
-    }
-    push @neighbors, $current if $current;
-
-    if (!@neighbors) {
-        output("  No BGP neighbors found (or BGP not configured)");
-        return;
-    }
-
-    output(sprintf("  %-20s  %-35s  %-35s  %s",
-        "Peer", "Inbound Policy", "Outbound Policy", "Flag"));
-    output("  " . "-" x 100);
-
-    for my $n (@neighbors) {
-        my $in  = @{$n->{inbound}}  ? join(', ', @{$n->{inbound}})  : 'NONE';
-        my $out = @{$n->{outbound}} ? join(', ', @{$n->{outbound}}) : 'NONE';
-        my $flag = ($in eq 'NONE' || $out eq 'NONE') ? '*** NO POLICY ***' : '';
-        output(sprintf("  %-20s  %-35s  %-35s  %s",
-            $n->{peer}, $in, $out, $flag));
-    }
-
-    my $unfiltered = grep { !@{$_->{inbound}} || !@{$_->{outbound}} } @neighbors;
-    output("  Summary: " . scalar(@neighbors) . " peers, $unfiltered with missing policy") if $unfiltered;
-}
-
-sub output {
+sub emit {
     my ($msg) = @_;
     print "$msg\n";
     print $log_fh "$msg\n" if $log_fh;
 }
-```
