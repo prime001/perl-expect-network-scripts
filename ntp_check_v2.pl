@@ -1,166 +1,171 @@
-```perl
 #!/usr/bin/perl
-=head1 stp_audit.pl - Spanning Tree Status Auditor
-
-=head1 SYNOPSIS
-  stp_audit.pl --host <device_ip> [--user <name>] [--pass <pw>] [--log <file>]
-  stp_audit.pl --file <devices.txt> [options]
-
-=head1 DESCRIPTION
-Audits Spanning Tree Protocol (STP) configuration and topology on Cisco devices
-via SSH. Collects root bridge info, topology changes, and port states. Useful
-for validating STP stability and detecting topology flaps or suboptimal root
-bridge placement.
-
-=head1 PREREQUISITES
-  - Perl modules: Expect
-  - SSH access to network devices with enable mode
-  - STP/RSTP enabled on device VLAN(s)
-  - Valid SSH credentials
-
-=head1 OPTIONS
-  --host <ip>       Device IP or hostname to audit
-  --file <file>     File with device list (one per line)
-  --user <name>     SSH username (prompts if not provided)
-  --pass <password> SSH password (prompts if not provided)
-  --log <file>      Append results to log file (optional)
-  --timeout <sec>   SSH command timeout (default: 30 seconds)
-
-=cut
+# =============================================================================
+# arp_audit.pl - ARP Table Collector and Duplicate IP/MAC Detector
+# =============================================================================
+# Purpose:
+#   Connects to Cisco IOS/IOS-XE devices via SSH and collects the ARP table.
+#   Flags duplicate IP addresses and MAC addresses that may indicate IP
+#   conflicts, ARP spoofing, or misconfigured devices on the network.
+#
+# Usage:
+#   Single device:  ./arp_audit.pl -h 192.168.1.1 -u admin -p password
+#   Device file:    ./arp_audit.pl -f devices.txt -u admin -p password
+#   With log file:  ./arp_audit.pl -h 192.168.1.1 -u admin -p password -l audit.log
+#
+# Prerequisites:
+#   - Perl modules: Net::SSH::Expect, Getopt::Long
+#   - Install: cpan Net::SSH::Expect
+#   - SSH access with privilege exec level on target devices
+#
+# Device file format (one IP/hostname per line; lines starting with # ignored):
+#   10.0.0.1
+#   10.0.0.2   # core-sw-01
+# =============================================================================
 
 use strict;
 use warnings;
-use Expect;
+use Net::SSH::Expect;
 use Getopt::Long;
-use Time::HiRes qw(time);
+use POSIX qw(strftime);
 
-my %opts = (timeout => 30);
+my ($host, $device_file, $username, $password, $log_file);
+my $timeout = 30;
+
 GetOptions(
-    'host=s'    => \$opts{host},
-    'file=s'    => \$opts{file},
-    'user=s'    => \$opts{user},
-    'pass=s'    => \$opts{pass},
-    'log=s'     => \$opts{log},
-    'timeout=i' => \$opts{timeout},
-) or die "Option parsing failed\n";
+    'h|host=s'     => \$host,
+    'f|file=s'     => \$device_file,
+    'u|user=s'     => \$username,
+    'p|password=s' => \$password,
+    'l|log=s'      => \$log_file,
+    't|timeout=i'  => \$timeout,
+) or die usage();
 
-die "Specify --host or --file\n" unless $opts{host} || $opts{file};
+die usage() unless ($host || $device_file) && $username && $password;
 
 my @devices;
-if ($opts{file}) {
-    open my $fh, '<', $opts{file} or die "Cannot read $opts{file}: $!\n";
-    @devices = map { chomp; $_ } <$fh>;
-    close $fh;
+if ($host) {
+    push @devices, $host;
 } else {
-    @devices = ($opts{host});
+    open(my $fh, '<', $device_file) or die "Cannot open device file '$device_file': $!\n";
+    while (<$fh>) {
+        chomp; s/#.*//; s/\s+$//;
+        push @devices, $_ if $_;
+    }
+    close $fh;
 }
 
-my $logfh;
-open $logfh, '>>', $opts{log} if $opts{log};
+die "No devices to process.\n" unless @devices;
 
-sub log_msg {
-    my $msg = shift;
-    print "$msg\n";
-    print $logfh "$msg\n" if $logfh;
+my $log_fh;
+if ($log_file) {
+    open($log_fh, '>', $log_file) or die "Cannot open log file '$log_file': $!\n";
 }
 
-sub audit_stp_device {
-    my $device = shift;
-    my $start = time();
-    
-    log_msg("\n" . "="x65);
-    log_msg("STP Audit: $device @ " . scalar(localtime));
-    
-    my $exp = Expect->new();
-    $exp->log_stdout(0);
-    $exp->debug(0);
-    
+my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+out("=" x 62);
+out("ARP Audit Report - $ts");
+out("=" x 62);
+
+for my $device (@devices) {
+    audit_device($device);
+}
+
+close $log_fh if $log_fh;
+
+sub audit_device {
+    my ($device) = @_;
+    out("\n[*] Connecting to $device ...");
+
+    my $ssh;
     eval {
-        $exp->spawn("ssh", "-o", "StrictHostKeyChecking=no",
-                   "-o", "ConnectTimeout=10",
-                   "$opts{user}\@$device")
-            or die "SSH spawn failed: $!\n";
-        
-        $exp->expect($opts{timeout},
-            ['password:', sub { $_[0]->send("$opts{pass}\r"); exp_continue; }],
-            [qr/[#>]/, sub { }]
-        ) or die "SSH auth timeout\n";
-        
-        $exp->send("enable\r");
-        $exp->expect(2,
-            ['password:', sub { $_[0]->send("$opts{pass}\r"); exp_continue; }],
-            [timeout => sub { }]
+        $ssh = Net::SSH::Expect->new(
+            host       => $device,
+            user       => $username,
+            password   => $password,
+            ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+            timeout    => $timeout,
+            raw_pty    => 1,
         );
-        
-        log_msg("\n[ROOT BRIDGE INFO]");
-        $exp->send("show spanning-tree root\r");
-        $exp->expect($opts{timeout}, qr/[#>]/);
-        for (split /\n/, $exp->before) {
-            log_msg($_) if /Root ID|Bridge ID|Root Port|Cost/i && !/^show/i;
-        }
-        
-        log_msg("\n[VLAN TOPOLOGY SUMMARY]");
-        $exp->send("show spanning-tree vlan 1\r");
-        $exp->expect($opts{timeout}, qr/[#>]/);
-        for (split /\n/, $exp->before) {
-            log_msg($_) if /VLAN|Root|Bridge|Designated|Priority/i && !/^show/i;
-        }
-        
-        log_msg("\n[TOPOLOGY CHANGE COUNTER]");
-        $exp->send("show spanning-tree summary\r");
-        $exp->expect($opts{timeout}, qr/[#>]/);
-        for (split /\n/, $exp->before) {
-            log_msg($_) if /Topology Changes|Forwarding|Blocking|Disabled/i;
-        }
-        
-        log_msg("\n[INTERFACE STATES]");
-        $exp->send("show spanning-tree interface brief\r");
-        $exp->expect($opts{timeout}, qr/[#>]/);
-        my $port_count = 0;
-        for (split /\n/, $exp->before) {
-            if (/\s+(Gi|Fa|Et|Po|Te)\S+\s+\d+\s+(forw|block|disabl|root|desg)/i) {
-                log_msg($_);
-                $port_count++;
-            }
-        }
-        log_msg("Ports analyzed: $port_count");
-        
-        $exp->send("exit\r");
-        $exp->soft_close();
-        
-        my $elapsed = sprintf("%.2f", time() - $start);
-        log_msg("\nStatus: SUCCESS (${elapsed}s)");
-        
-    } or do {
-        log_msg("Status: FAILED - $@");
+        $ssh->login();
     };
-    
-    $exp->hard_close() if $exp;
+    if ($@) {
+        out("[ERROR] $device: connection failed - $@");
+        return;
+    }
+
+    eval { $ssh->send("terminal length 0\n"); $ssh->waitfor('\S+[#>]', 5); };
+
+    my $arp_output = '';
+    eval {
+        $ssh->send("show ip arp\n");
+        $arp_output = $ssh->waitfor('\S+[#>]', $timeout);
+    };
+    if ($@) {
+        out("[ERROR] $device: failed to run 'show ip arp' - $@");
+        $ssh->close();
+        return;
+    }
+
+    eval { $ssh->send("exit\n"); $ssh->close(); };
+
+    parse_arp($device, $arp_output);
 }
 
-unless ($opts{user}) {
-    print "SSH Username: ";
-    chomp($opts{user} = <STDIN>);
+sub parse_arp {
+    my ($device, $output) = @_;
+
+    my (%ip_to_macs, %mac_to_ips, @entries);
+
+    for my $line (split /\n/, $output) {
+        next unless $line =~ /^Internet\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+\S+\s+(\S+)/;
+        my ($ip, $age, $mac, $iface) = ($1, $2, lc($3), $4);
+        push @entries, { ip => $ip, age => $age, mac => $mac, iface => $iface };
+        push @{ $ip_to_macs{$ip}  }, $mac;
+        push @{ $mac_to_ips{$mac} }, $ip;
+    }
+
+    out(sprintf("[%s] %d ARP entries collected.", $device, scalar @entries));
+
+    my @dup_ips  = sort grep { @{ $ip_to_macs{$_} } > 1 } keys %ip_to_macs;
+    my @dup_macs = sort grep { @{ $mac_to_ips{$_} } > 1 } keys %mac_to_ips;
+
+    if (@dup_ips) {
+        out("[WARN] Duplicate IPs (IP conflict or ARP spoofing):");
+        out(sprintf("  %-18s -> %s", $_, join(", ", @{ $ip_to_macs{$_} }))) for @dup_ips;
+    }
+    if (@dup_macs) {
+        out("[WARN] Duplicate MACs (multi-IP host or MAC spoofing):");
+        out(sprintf("  %-20s -> %s", $_, join(", ", @{ $mac_to_ips{$_} }))) for @dup_macs;
+    }
+    unless (@dup_ips || @dup_macs) {
+        out("[OK]   No duplicate IPs or MACs detected.");
+    }
+
+    out(sprintf("\n  %-18s %-5s %-20s %s", "IP Address", "Age", "MAC Address", "Interface"));
+    out("  " . "-" x 58);
+    for my $e (sort { $a->{ip} cmp $b->{ip} } @entries) {
+        out(sprintf("  %-18s %-5s %-20s %s", $e->{ip}, $e->{age}, $e->{mac}, $e->{iface}));
+    }
 }
 
-unless ($opts{pass}) {
-    print "SSH Password: ";
-    system("stty -echo");
-    chomp($opts{pass} = <STDIN>);
-    system("stty echo");
-    print "\n";
+sub out {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $log_fh "$msg\n" if $log_fh;
 }
 
-log_msg("STP Spanning Tree Auditor");
-log_msg("Start: " . scalar(localtime()));
-log_msg("Device count: " . scalar(@devices));
+sub usage {
+    return <<'END';
+Usage:
+  arp_audit.pl -h <host>   -u <user> -p <pass> [-l <logfile>] [-t <secs>]
+  arp_audit.pl -f <file>   -u <user> -p <pass> [-l <logfile>] [-t <secs>]
 
-foreach my $dev (@devices) {
-    next unless $dev;
-    audit_stp_device($dev);
+Options:
+  -h, --host      Single device IP or hostname
+  -f, --file      File with list of devices (one per line)
+  -u, --user      SSH username
+  -p, --password  SSH password
+  -l, --log       Optional output log file
+  -t, --timeout   SSH timeout in seconds (default: 30)
+END
 }
-
-log_msg("\n" . "="x65);
-log_msg("All audits completed: " . scalar(localtime()));
-close $logfh if $logfh;
-```
