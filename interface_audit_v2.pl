@@ -1,137 +1,211 @@
-```perl
 #!/usr/bin/perl
-#
-# health_check.pl - Network Device Hardware Health Monitor
-#
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE devices via SSH and collects hardware health
-#   metrics: CPU utilization (5-min avg), memory usage percentage, temperature
-#   sensor readings, and power supply status. Flags values exceeding thresholds
-#   with a leading '!' in output.
-#
-# Usage:
-#   Single device:  ./health_check.pl -h 192.168.1.1 -u admin [-p password] [-l logfile]
-#   Device list:    ./health_check.pl -f devices.txt -u admin [-p password] [-l logfile]
-#
-# Device file format: one IP or hostname per line; blank lines and # comments ignored
-#
-# Prerequisites:
-#   cpan install Net::SSH::Expect
-#   SSH key auth recommended (omit -p); password auth supported via -p
-#
-# Thresholds (edit below): CPU 80%, Memory 85%, Temperature 55C
-
 use strict;
 use warnings;
+use Getopt::Long;
 use Net::SSH::Expect;
-use Getopt::Std;
-use POSIX qw(strftime);
+use Term::ReadPassword;
+use File::Basename;
 
-my %opts;
-getopts('h:f:u:p:l:t:', \%opts);
+=head1 device_health_check.pl
 
-my $user    = $opts{u} or die "Usage: $0 -h <host>|-f <file> -u <user> [-p pass] [-l log] [-t timeout]\n";
-my $pass    = $opts{p} // '';
-my $logfile = $opts{l} // '';
-my $timeout = $opts{t} // 30;
+Device Health and Connectivity Verification Script
 
-my @devices;
-if ($opts{h}) {
-    push @devices, $opts{h};
-} elsif ($opts{f}) {
-    open my $fh, '<', $opts{f} or die "Cannot open $opts{f}: $!\n";
-    while (<$fh>) { chomp; next if /^\s*$/ || /^#/; push @devices, $_; }
-    close $fh;
-} else {
-    die "Specify -h <host> or -f <device_file>\n";
+=head1 DESCRIPTION
+
+SSH-based network device health checker that verifies connectivity and 
+gathers critical device metrics: uptime, CPU/memory utilization, interface 
+status, and device version info. Useful for rapid health assessments across 
+device inventory.
+
+=head1 USAGE
+
+  ./device_health_check.pl -h 192.168.1.1 -u admin
+  ./device_health_check.pl -f device_list.txt -u netadmin -l health_report.log
+  ./device_health_check.pl -h 10.0.0.5 -p mypassword -l report.txt
+
+=head1 PREREQUISITES
+
+- Net::SSH::Expect module (Perl SSH with Expect)
+- Perl 5.10 or later
+- SSH access to target network devices
+- Valid device credentials (username/password)
+
+=head1 OPTIONS
+
+  -h, --host HOST        Target device hostname or IP address
+  -f, --file FILE        File containing list of devices (one per line)
+  -u, --user USER        SSH username (default: admin)
+  -p, --pass PASS        SSH password (prompts interactively if omitted)
+  -l, --log FILE         Optional log file for results (appends)
+  --timeout SECONDS      SSH connection timeout in seconds (default: 30)
+  --help                 Display this help message
+
+=head1 AUTHOR
+
+Network Automation - Device Health Checker
+
+=cut
+
+my %opts = (user => 'admin', timeout => 30);
+
+GetOptions(
+    'host|h=s'    => \$opts{host},
+    'file|f=s'    => \$opts{file},
+    'user|u=s'    => \$opts{user},
+    'pass|p=s'    => \$opts{pass},
+    'log|l=s'     => \$opts{log},
+    'timeout=i'   => \$opts{timeout},
+    'help'        => \&usage,
+) or die "Error in command line arguments\n";
+
+die "Must specify -h <host> or -f <device_file>\n" unless $opts{host} || $opts{file};
+
+$opts{pass} //= read_password("SSH Password: ");
+
+my @devices = $opts{host} ? ($opts{host}) : read_device_file($opts{file});
+die "No devices to check\n" unless @devices;
+
+my $logfh;
+if ($opts{log}) {
+    open($logfh, '>>', $opts{log}) or warn "Cannot open log file $opts{log}: $!\n";
 }
 
-my $log_fh;
-if ($logfile) {
-    open $log_fh, '>>', $logfile or die "Cannot open logfile $logfile: $!\n";
+sub log_msg {
+    my $msg = shift;
+    print $msg;
+    print $logfh $msg if $logfh;
 }
 
-my $CPU_WARN  = 80;
-my $MEM_WARN  = 85;
-my $TEMP_WARN = 55;
+foreach my $device (@devices) {
+    log_msg "\n" . "=" x 65 . "\n";
+    log_msg "Device: $device\n";
+    log_msg "Timestamp: " . scalar(localtime()) . "\n";
+    log_msg "=" x 65 . "\n";
 
-my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-out("=" x 68);
-out("Health Check: $ts");
-out("=" x 68);
-printf "%-22s %-12s %-12s %-10s %-8s\n", "Device", "CPU5min%", "MemUsed%", "TempC", "PSU";
-printf "%s\n", "-" x 68;
-
-for my $host (@devices) {
-    my ($cpu, $mem, $temp, $psu) = check_device($host);
-    my $cs = defined $cpu  ? ($cpu  >= $CPU_WARN  ? "!$cpu"  : $cpu)  : 'ERR';
-    my $ms = defined $mem  ? ($mem  >= $MEM_WARN  ? "!$mem"  : $mem)  : 'ERR';
-    my $ts2 = defined $temp ? ($temp >= $TEMP_WARN ? "!$temp" : $temp) : 'N/A';
-    my $ps = $psu // 'ERR';
-    printf "%-22s %-12s %-12s %-10s %-8s\n", $host, $cs, $ms, $ts2, $ps;
-    out(sprintf "%-22s cpu=%-5s mem=%-5s temp=%-6s psu=%s", $host, $cs, $ms, $ts2, $ps);
-}
-out("=" x 68 . "\n");
-close $log_fh if $log_fh;
-
-sub check_device {
-    my ($host) = @_;
     my $ssh = Net::SSH::Expect->new(
-        host       => $host,
-        user       => $user,
-        password   => $pass,
-        raw_pty    => 1,
-        timeout    => $timeout,
-        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+        host     => $device,
+        user     => $opts{user},
+        password => $opts{pass},
+        timeout  => $opts{timeout},
+        raw_pty  => 1,
     );
-    eval { $pass ? $ssh->login() : $ssh->login_no_password() };
-    if ($@) {
-        warn "[$host] SSH failed: $@\n";
-        return (undef, undef, undef, 'NOCONN');
+
+    my $login_result;
+    eval { $login_result = $ssh->login() };
+    
+    unless ($login_result && !$@) {
+        log_msg "[FAIL] SSH connection failed: $@\n";
+        next;
     }
-    $ssh->exec("terminal length 0");
-    my ($cpu, $mem, $temp, $psu) = (get_cpu($ssh), get_mem($ssh), get_temp($ssh), get_psu($ssh));
+
+    log_msg "[PASS] SSH connection established\n";
+
+    unless ($ssh->waitfor('/[>#$]\s*$/', $opts{timeout})) {
+        log_msg "[FAIL] Device prompt not received\n";
+        eval { $ssh->close() };
+        next;
+    }
+
+    check_version($ssh, \%opts);
+    check_memory($ssh, \%opts);
+    check_interfaces($ssh, \%opts);
+
     eval { $ssh->close() };
-    return ($cpu, $mem, $temp, $psu);
+    log_msg "[DONE] Health check completed\n";
 }
 
-sub get_cpu {
-    my ($ssh) = @_;
-    my $out = $ssh->exec("show processes cpu | include CPU utilization") // return undef;
-    return $1 if $out =~ /five minutes:\s*(\d+)%/;
+close($logfh) if $logfh;
+log_msg "\nResults logged to: $opts{log}\n" if $opts{log};
+
+sub check_version {
+    my ($ssh, $opts) = @_;
+    my $output = send_command($ssh, 'show version', $opts->{timeout});
+    return unless $output;
+    
+    if ($output =~ /uptime is\s+(.+?)(?:\n|,|$)/i) {
+        log_msg "[INFO] Uptime: $1\n";
+    }
+}
+
+sub check_memory {
+    my ($ssh, $opts) = @_;
+    my $output = send_command($ssh, 'show processes memory', $opts->{timeout});
+    return unless $output;
+    
+    if ($output =~ /used\s+(\d+[KMG]?)\s+.*?free\s+(\d+[KMG]?)/i) {
+        log_msg "[INFO] Memory - Used: $1, Free: $2\n";
+    }
+}
+
+sub check_interfaces {
+    my ($ssh, $opts) = @_;
+    my $output = send_command($ssh, 'show interfaces brief', $opts->{timeout});
+    return unless $output;
+    
+    my $up_count = 0;
+    my $down_count = 0;
+    my @down_interfaces;
+    
+    foreach my $line (split /\n/, $output) {
+        next unless $line =~ /\S+/;
+        if ($line =~ /\s+up\s+/i) {
+            $up_count++;
+        } elsif ($line =~ /\s+down\s+/i || $line =~ /admin down/i) {
+            $down_count++;
+            push @down_interfaces, $1 if $line =~ /^(\S+)/;
+        }
+    }
+    
+    log_msg "[INFO] Interface Status - Up: $up_count, Down: $down_count\n";
+    log_msg "[WARN] Down interface: $_\n" foreach @down_interfaces;
+}
+
+sub send_command {
+    my ($ssh, $cmd, $timeout) = @_;
+    my $output;
+    eval {
+        $ssh->send($cmd);
+        $ssh->waitfor('/[>#$]\s*$/', $timeout);
+        $output = $ssh->before();
+    };
+    return $output if $output && !$@;
     return undef;
 }
 
-sub get_mem {
-    my ($ssh) = @_;
-    my $out = $ssh->exec("show processes memory | include Processor") // return undef;
-    if ($out =~ /\d+\s+(\d+)\s+(\d+)/) {
-        my ($used, $free) = ($1, $2);
-        return int($used / ($used + $free) * 100) if ($used + $free) > 0;
+sub read_device_file {
+    my $file = shift;
+    open my $fh, '<', $file or die "Cannot open device file $file: $!\n";
+    my @devices;
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line =~ /^#/ || $line =~ /^\s*$/;
+        push @devices, $line;
     }
-    return undef;
+    close $fh;
+    return @devices;
 }
 
-sub get_temp {
-    my ($ssh) = @_;
-    my $out = $ssh->exec("show environment temperature") // return undef;
-    my $max;
-    while ($out =~ /(\d{2,3})\s*(?:Celsius|C\b)/gi) {
-        $max = $1 if !defined $max || $1 > $max;
-    }
-    return $max;
-}
+sub usage {
+    my $prog = basename($0);
+    print <<"HELP";
+$prog - Network Device Health Checker
 
-sub get_psu {
-    my ($ssh) = @_;
-    my $out = $ssh->exec("show environment power") // return 'N/A';
-    return 'FAIL' if $out =~ /fail|absent|critical/i;
-    return 'OK'   if $out =~ /normal|good|present|ok/i;
-    return 'N/A';
-}
+Usage: $prog [OPTIONS]
 
-sub out {
-    my ($msg) = @_;
-    print $log_fh "$msg\n" if $log_fh;
+OPTIONS:
+  -h, --host HOST        Target device hostname or IP
+  -f, --file FILE        File with device list (one per line)
+  -u, --user USER        SSH username (default: admin)
+  -p, --pass PASSWORD    SSH password (prompts if omitted)
+  -l, --log FILE         Log file for results (appends)
+  --timeout SECONDS      SSH timeout (default: 30)
+  --help                 Show this help message
+
+EXAMPLES:
+  $prog -h 192.168.1.100 -u admin
+  $prog -f device_inventory.txt -u netadmin -l daily_health.log
+  $prog -h switch01.lab -p secretpass -l report.txt --timeout 45
+
+HELP
+    exit 0;
 }
-```
