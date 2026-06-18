@@ -1,162 +1,156 @@
-```perl
+The prompt asks for script content only — no file to write here. Here is the script:
+
+```
 #!/usr/bin/perl
-# =============================================================================
-# vlan_orphan_check.pl - Orphaned VLAN and Trunk Mismatch Detector
-# =============================================================================
-# Purpose : Identifies VLANs defined in the database but not active on any
-#           access or trunk port, and trunk ports missing expected VLANs.
-#           Complements vlan_audit.pl (basic inventory) and vlan_audit_v2.pl
-#           (extended stats) with consistency/hygiene analysis.
 #
-# Usage   : perl vlan_orphan_check.pl -h <host> [-u <user>] [-p <pass>]
-#                                     [-f <device_file>] [-o <logfile>]
-#           Device file: one IP or hostname per line, comments (#) ignored.
+# vlan_svi_audit.pl - VLAN SVI Layer 3 Health Auditor
 #
-# Output  : Per-device report: orphaned VLANs, access-only VLANs, trunk gaps.
+# Purpose:
+#   Audits Layer 3 SVI health for all active VLANs on Cisco IOS/IOS-XE switches.
+#   Reports VLANs missing SVIs, SVIs in down state, SVIs lacking IP addresses,
+#   and provides a summary of L2-only vs routed VLANs. Useful for detecting
+#   silent L3 failures invisible to basic VLAN table audits.
 #
-# Prereqs : Net::SSH::Expect  (cpanm Net::SSH::Expect)
-#           Tested against Cisco IOS / IOS-XE; adapt regexes for NX-OS/EOS.
-# =============================================================================
+# Usage:
+#   ./vlan_svi_audit.pl -h <host> [-u user] [-p pass] [-l logfile]
+#   ./vlan_svi_audit.pl -f devices.txt [-u user] [-p pass] [-l logfile]
+#   NET_USER=admin NET_PASS=secret ./vlan_svi_audit.pl -f core-switches.txt
+#
+# Prerequisites:
+#   cpan install Net::SSH::Expect
+#   SSH access with 'show' privilege; device prompt must match hostname#
 
 use strict;
 use warnings;
-use Getopt::Long;
 use Net::SSH::Expect;
+use Getopt::Long;
+use POSIX qw(strftime);
 
-my ($host, $user, $pass, $device_file, $logfile);
-$user = $ENV{NET_USER} // 'admin';
-$pass = $ENV{NET_PASS} // '';
+my ($host, $user, $password, $device_file, $logfile, $help);
+$user     = $ENV{NET_USER} // 'admin';
+$password = $ENV{NET_PASS} // '';
 
 GetOptions(
-    'h|host=s'   => \$host,
-    'u|user=s'   => \$user,
-    'p|pass=s'   => \$pass,
-    'f|file=s'   => \$device_file,
-    'o|log=s'    => \$logfile,
-) or die "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-o logfile]\n";
+    'h|host=s'     => \$host,
+    'u|user=s'     => \$user,
+    'p|password=s' => \$password,
+    'f|file=s'     => \$device_file,
+    'l|log=s'      => \$logfile,
+    'help'         => \$help,
+) or die "Option error. Use --help for usage.\n";
 
-die "Provide -h <host> or -f <file>\n" unless $host || $device_file;
+if ($help || (!$host && !$device_file)) {
+    print "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-l logfile]\n";
+    exit 0;
+}
 
 my @devices;
-push @devices, $host if $host;
-if ($device_file) {
-    open my $fh, '<', $device_file or die "Cannot open $device_file: $!";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if length }
+if ($host) {
+    push @devices, $host;
+} else {
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+    while (<$fh>) { chomp; next if /^\s*[#;]/ || /^\s*$/; push @devices, $_; }
     close $fh;
 }
+die "No devices specified.\n" unless @devices;
 
 my $log_fh;
 if ($logfile) {
-    open $log_fh, '>', $logfile or die "Cannot open $logfile: $!";
+    open($log_fh, '>', $logfile) or die "Cannot open $logfile: $!\n";
 }
 
-sub emit {
+sub out {
     my $msg = shift;
     print $msg;
     print $log_fh $msg if $log_fh;
 }
 
-sub audit_device {
-    my ($dev) = @_;
-    emit("\n=== $dev ===\n");
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+out("=" x 60 . "\nVLAN SVI Health Audit  -  $ts\n" . "=" x 60 . "\n\n");
+
+for my $device (@devices) {
+    out("Device: $device\n" . "-" x 40 . "\n");
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $dev,
-        user        => $user,
-        password    => $pass,
-        raw_pty     => 1,
-        timeout     => 20,
+        host       => $device,
+        user       => $user,
+        password   => $password,
+        raw_pty    => 1,
+        timeout    => 15,
+        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
     );
 
     eval {
-        my $login = $ssh->login();
-        die "Auth failed" unless $login =~ /[>#]/;
+        my $banner = $ssh->login();
+        die "Unexpected prompt (auth failed?)\n" unless $banner =~ /[>#]/;
     };
     if ($@) {
-        emit("  [ERROR] Connection/auth failed: $@\n");
-        return;
+        out("  ERROR: $@\n\n");
+        next;
     }
 
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('[>#]', 10);
+    $ssh->send('terminal length 0');
+    $ssh->waitfor('\#', 5);
 
-    # Collect VLAN database
-    $ssh->send("show vlan brief\n");
-    my $vlan_brief = $ssh->waitfor('[>#]', 15) // '';
+    $ssh->send('show vlan brief');
+    my $vlan_out = $ssh->waitfor('\#', 15) // '';
 
-    # Collect trunk status
-    $ssh->send("show interfaces trunk\n");
-    my $trunk_out = $ssh->waitfor('[>#]', 15) // '';
+    $ssh->send('show ip interface brief | include Vlan');
+    my $ip_out = $ssh->waitfor('\#', 15) // '';
 
-    $ssh->send("exit\n");
-    $ssh->close();
+    eval { $ssh->close() };
 
-    # Parse VLANs from database (skip 1 and reserved 1002-1005)
-    my %vlan_db;
-    for my $line (split /\n/, $vlan_brief) {
-        if ($line =~ /^(\d+)\s+(\S+)\s+(active|act\/lshut)\s+(.*)/) {
-            my ($id, $name, $state, $ports) = ($1, $2, $3, $4);
-            next if $id == 1 || ($id >= 1002 && $id <= 1005);
-            my @port_list = grep { length } split /[\s,]+/, $ports;
-            $vlan_db{$id} = { name => $name, ports => \@port_list };
+    # Parse active VLANs (id + name, status=active)
+    my %vlans;
+    for (split /\n/, $vlan_out) {
+        $vlans{$1} = $2 if /^\s*(\d+)\s+(\S+)\s+active/i;
+    }
+
+    # Parse SVI entries from ip interface brief
+    my (%svi_ip, %svi_state);
+    for (split /\n/, $ip_out) {
+        if (/Vlan(\d+)\s+(\S+)\s+(\S+)\s+(\S+)/i) {
+            $svi_ip{$1}    = $2;
+            $svi_state{$1} = "$3/$4";
         }
     }
 
-    if (!%vlan_db) {
-        emit("  No user VLANs found (or parse failed).\n");
-        return;
-    }
-
-    # Parse trunk allowed VLANs
-    my %trunked_vlans;
-    my $in_allowed = 0;
-    for my $line (split /\n/, $trunk_out) {
-        $in_allowed = 1 if $line =~ /VLANs allowed and active in management domain/;
-        if ($in_allowed && $line =~ /^\S+\s+([\d,\-]+)/) {
-            for my $part (split /,/, $1) {
-                if ($part =~ /(\d+)-(\d+)/) { $trunked_vlans{$_}++ for $1..$2 }
-                elsif ($part =~ /(\d+)/)    { $trunked_vlans{$1}++ }
-            }
+    my (@down, @no_ip, @no_svi, @ok);
+    for my $vid (sort { $a <=> $b } keys %vlans) {
+        next if $vid == 1;
+        if (!exists $svi_state{$vid}) {
+            push @no_svi, $vid;
+        } elsif ($svi_state{$vid} !~ m{up/up}i) {
+            push @down, { vid => $vid, st => $svi_state{$vid},
+                          ip  => ($svi_ip{$vid} // 'unassigned') };
+        } elsif (($svi_ip{$vid} // '') =~ /unassigned|^\s*$/) {
+            push @no_ip, $vid;
+        } else {
+            push @ok, "$vid ($svi_ip{$vid})";
         }
     }
 
-    # Classify
-    my (@orphaned, @access_only, @trunked_not_db);
-    for my $id (sort { $a <=> $b } keys %vlan_db) {
-        my $has_access = @{ $vlan_db{$id}{ports} } > 0;
-        my $has_trunk  = exists $trunked_vlans{$id};
-        push @orphaned,    $id unless $has_access || $has_trunk;
-        push @access_only, $id if $has_access && !$has_trunk;
-    }
-    for my $id (sort { $a <=> $b } keys %trunked_vlans) {
-        push @trunked_not_db, $id unless exists $vlan_db{$id} || $id == 1;
-    }
+    my $total = scalar keys %vlans;
+    out(sprintf("  VLANs active: %-4d  SVI OK: %-4d  Down: %-4d  No IP: %-4d  L2-only: %d\n\n",
+        $total, scalar @ok, scalar @down, scalar @no_ip, scalar @no_svi));
 
-    my $total = scalar keys %vlan_db;
-    emit(sprintf "  DB VLANs: %d  |  Orphaned: %d  |  Access-only: %d  |  Trunk-not-in-DB: %d\n",
-        $total, scalar @orphaned, scalar @access_only, scalar @trunked_not_db);
-
-    if (@orphaned) {
-        emit("  [WARN] Orphaned (no ports, not trunked): " . join(', ', @orphaned) . "\n");
-        for my $id (@orphaned) {
-            emit(sprintf "         VLAN %-5d  %s\n", $id, $vlan_db{$id}{name});
-        }
+    if (@down) {
+        out("  [WARN] SVIs not up/up:\n");
+        out(sprintf("    VLAN %-5d  %-12s  %s\n",
+            $_->{vid}, $_->{st}, $_->{ip})) for @down;
+        out("\n");
     }
-    if (@trunked_not_db) {
-        emit("  [WARN] Trunked VLANs not in local DB (pruned or missing): "
-            . join(', ', @trunked_not_db) . "\n");
+    if (@no_ip) {
+        out("  [WARN] SVIs up but no IP assigned: " . join(', ', @no_ip) . "\n\n");
     }
-    unless (@orphaned || @trunked_not_db) {
-        emit("  [OK] No orphaned VLANs or trunk inconsistencies detected.\n");
+    if (@no_svi) {
+        out("  [INFO] L2-only VLANs (no SVI): " . join(', ', @no_svi) . "\n\n");
     }
+    out("  [OK] Routed SVIs: " . join(', ', @ok) . "\n\n") if @ok;
 }
 
-my $ts = localtime;
-emit("VLAN Orphan/Consistency Check  $ts\n");
-emit("Devices: " . scalar(@devices) . "\n");
-
-audit_device($_) for @devices;
-
-emit("\nDone.\n");
+out("Audit complete.\n");
 close $log_fh if $log_fh;
 ```
+
+This is `vlan_svi_audit.pl` — it audits Layer 3 SVI health rather than the VLAN table itself, making it complementary to the existing `vlan_audit.pl`/`vlan_audit_v2.pl`. Key differentiators: correlates `show vlan brief` against `show ip interface brief` to classify each active VLAN as routed-healthy, SVI-down, SVI-missing-IP, or L2-only. Accepts a device list file, reads credentials from env vars, and supports optional log output. ~115 lines.
