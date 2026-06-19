@@ -1,146 +1,165 @@
 #!/usr/bin/perl
+# =============================================================================
+# health_check.pl - Network Device CPU/Memory/Environment Health Monitor
+# =============================================================================
+# PURPOSE:
+#   Polls Cisco IOS/IOS-XE devices for CPU utilization, memory usage, and
+#   environmental status (temperature, fans, power supplies). Flags values
+#   that exceed warning thresholds. Useful for capacity planning, incident
+#   triage, and routine operational health audits.
+#
+# USAGE:
+#   health_check.pl <host> [--user USER] [--pass PASS] [--log FILE]
+#   health_check.pl --file <device_list.txt> [--log FILE]
+#
+# PREREQUISITES:
+#   cpan Net::SSH::Expect Getopt::Long
+#   SSH enabled on target device; credentials via args or env vars
+#   NET_USER / NET_PASS environment variables used as fallback
+#
+# THRESHOLDS:
+#   CPU 1-minute > 80%  => WARN
+#   Memory used  > 85%  => WARN
+#   Any env FAIL/CRITICAL line => ALERT
+#
+# TESTED AGAINST:
+#   Cisco IOS 15.x, IOS-XE 16.x/17.x
+#
+# EXAMPLES:
+#   health_check.pl 192.168.1.1 --user admin --pass s3cr3t
+#   health_check.pl --file routers.txt --log /var/log/health.log
+# =============================================================================
+
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Long qw(:config pass_through);
 use POSIX qw(strftime);
 
-# stp_audit.pl - Spanning Tree Protocol topology auditor
-#
-# PURPOSE:
-#   Connects to one or more Cisco IOS/IOS-XE devices and audits the STP
-#   topology: root bridge identity, port roles/states, TC counters, and
-#   any ports in BLOCKING or LISTENING state that may indicate instability.
-#
-# USAGE:
-#   Single device:  perl stp_audit.pl -H 192.168.1.1 -u admin -p secret
-#   Device file:    perl stp_audit.pl -f devices.txt -u admin -p secret -l stp_report.log
-#   With VLAN:      perl stp_audit.pl -H 10.0.0.1 -u admin -p secret -v 100
-#
-# PREREQUISITES:
-#   cpanm Net::SSH::Expect
-#   SSH must be enabled on target device; enable password optional (-e flag)
-#   Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x
-
-my ($host, $file, $user, $pass, $enable, $logfile, $vlan, $timeout);
-$timeout = 15;
+my ($device_file, $log_file, $help);
+my $username = $ENV{NET_USER} // 'admin';
+my $password = $ENV{NET_PASS} // '';
+my $timeout  = 30;
 
 GetOptions(
-    'H|host=s'    => \$host,
-    'f|file=s'    => \$file,
-    'u|user=s'    => \$user,
-    'p|pass=s'    => \$pass,
-    'e|enable=s'  => \$enable,
-    'l|log=s'     => \$logfile,
-    'v|vlan=s'    => \$vlan,
-    't|timeout=i' => \$timeout,
-) or die "Usage: $0 -H host | -f file -u user -p pass [-e enable] [-l logfile] [-v vlan]\n";
+    'file=s' => \$device_file,
+    'log=s'  => \$log_file,
+    'user=s' => \$username,
+    'pass=s' => \$password,
+    'help'   => \$help,
+) or die "Invalid options. Run with --help for usage.\n";
 
-die "Specify -H <host> or -f <file>\n" unless $host || $file;
-die "Specify -u <user> and -p <pass>\n" unless $user && $pass;
+if ($help) {
+    print "Usage: $0 <host> [--user USER] [--pass PASS] [--log FILE]\n";
+    print "       $0 --file device_list.txt [--log FILE]\n";
+    exit 0;
+}
 
-my @devices = $host ? ($host) : do {
-    open my $fh, '<', $file or die "Cannot open $file: $!";
-    grep { /\S/ && !/^#/ } map { chomp; $_ } <$fh>;
-};
+my @devices;
+if ($device_file) {
+    open(my $fh, '<', $device_file) or die "Cannot open '$device_file': $!\n";
+    @devices = grep { /\S/ && !/^\s*#/ } map { chomp; $_ } <$fh>;
+    close $fh;
+    die "No hosts found in '$device_file'\n" unless @devices;
+} elsif (@ARGV) {
+    @devices = ($ARGV[0]);
+} else {
+    die "No host specified. Use: $0 <host> or $0 --file <list>\n";
+}
 
 my $log_fh;
-if ($logfile) {
-    open $log_fh, '>', $logfile or die "Cannot open log $logfile: $!";
+if ($log_file) {
+    open($log_fh, '>>', $log_file) or die "Cannot open log '$log_file': $!\n";
 }
 
-sub output {
-    print @_;
-    print $log_fh @_ if $log_fh;
+sub emit {
+    my $msg = shift;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
 
-sub audit_device {
-    my ($device) = @_;
-    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-    output("\n" . "=" x 60 . "\n");
-    output("Host: $device  Time: $ts\n");
-    output("=" x 60 . "\n");
+sub check_device {
+    my $host = shift;
+    my $ts   = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    emit("\n[$ts] === $host ===\n");
 
     my $ssh = Net::SSH::Expect->new(
-        host        => $device,
-        user        => $user,
-        password    => $pass,
+        host        => $host,
+        user        => $username,
+        password    => $password,
         raw_pty     => 1,
         timeout     => $timeout,
+        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
     );
 
-    my $login_out = eval { $ssh->login() };
-    if ($@ || !defined $login_out) {
-        output("ERROR: SSH login failed to $device: $@\n");
+    eval {
+        my $login = $ssh->login();
+        die "Auth failed or unexpected banner on $host\n"
+            unless defined $login && $login =~ /[>#]/;
+    };
+    if ($@) {
+        emit("  [ERROR] $@");
         return;
     }
 
-    $ssh->send("terminal length 0\n");
-    $ssh->waitfor('.*[>#]\s*$', 5);
+    $ssh->exec("terminal length 0");
 
-    if ($enable) {
-        $ssh->send("enable\n");
-        my $result = $ssh->waitfor('Password:|[>#]\s*$', 5);
-        if ($result && $result =~ /Password:/) {
-            $ssh->send("$enable\n");
-            $ssh->waitfor('.*#\s*$', 5);
-        }
-    }
-
-    my $cmd = $vlan ? "show spanning-tree vlan $vlan" : "show spanning-tree";
-    $ssh->send("$cmd\n");
-    my $output = $ssh->waitfor('.*[>#]\s*$', $timeout) // '';
-
-    my $root_found = 0;
-    my (@blocked, @desg, @root_ports);
-    my $tc_count = 0;
-
-    for my $line (split /\n/, $output) {
-        if ($line =~ /This bridge is the root/i) {
-            output("  [ROOT] This device IS the root bridge\n");
-            $root_found = 1;
-        }
-        if ($line =~ /Root ID.*Priority\s+(\d+)/i || $line =~ /^\s+Priority\s+(\d+)\s+Address\s+(\S+)/i) {
-            output("  Root Priority: $1" . ($2 ? "  MAC: $2" : "") . "\n") if $1;
-        }
-        if ($line =~ /^\s+Address\s+([0-9a-f.:]+)/i && !$root_found) {
-            output("  Root MAC: $1\n");
-        }
-        if ($line =~ /Number of topology changes\s+(\d+)/i) {
-            $tc_count = $1;
-            my $warn = $tc_count > 10 ? " <== HIGH" : "";
-            output("  Topology Changes: $tc_count$warn\n");
-        }
-        if ($line =~ /^\s*(\S+)\s+(\S+)\s+(\S+)\s+(BLK|BLOCK)\s*/i) {
-            push @blocked, $1;
-        }
-        if ($line =~ /^\s*(\S+)\s+\S+\s+\S+\s+FWD\s+Desg/i) {
-            push @desg, $1;
-        }
-        if ($line =~ /^\s*(\S+)\s+\S+\s+\S+\s+FWD\s+Root/i) {
-            push @root_ports, $1;
-        }
-    }
-
-    output("  Root ports:       " . (@root_ports ? join(', ', @root_ports) : 'none') . "\n");
-    output("  Designated ports: " . scalar(@desg) . " total\n");
-    if (@blocked) {
-        output("  BLOCKED ports:    " . join(', ', @blocked) . "\n");
+    # --- CPU ---
+    my $cpu = $ssh->exec("show processes cpu | include CPU utilization");
+    if ($cpu && $cpu =~ /CPU utilization[^:]*:\s*(\d+)%.*?(\d+)%.*?(\d+)%/) {
+        my ($s5, $m1, $m5) = ($1, $2, $3);
+        my $warn = $m1 > 80 ? '  <<WARN: HIGH CPU>>' : '';
+        emit(sprintf("  CPU   : 5s=%-3s%%  1m=%-3s%%  5m=%-3s%%%s\n",
+            $s5, $m1, $m5, $warn));
     } else {
-        output("  Blocked ports:    none\n");
+        emit("  CPU   : [parse error -- output: " . ($cpu // 'none') . "]\n");
     }
 
-    $ssh->send("exit\n");
-    $ssh->close();
+    # --- Memory ---
+    my $mem = $ssh->exec("show processes memory | include Processor Pool Total");
+    if ($mem && $mem =~ /Total:\s*(\d+)\s+Used:\s*(\d+)\s+Free:\s*(\d+)/) {
+        my ($tot, $used, $free) = ($1, $2, $3);
+        my $pct  = $tot > 0 ? int($used / $tot * 100) : 0;
+        my $warn = $pct > 85 ? '  <<WARN: LOW MEMORY>>' : '';
+        emit(sprintf("  MEM   : used=%dMB  free=%dMB  (%d%% utilized)%s\n",
+            $used/1024/1024, $free/1024/1024, $pct, $warn));
+    } else {
+        emit("  MEM   : [parse error]\n");
+    }
+
+    # --- Environment ---
+    my $env = $ssh->exec("show environment all 2>/dev/null");
+    if ($env && length($env) > 20) {
+        my @alerts;
+        push @alerts, 'TEMP-CRITICAL' if $env =~ /temperature.*critical/i;
+        push @alerts, 'TEMP-WARNING'  if $env =~ /temperature.*warning/i;
+        push @alerts, 'FAN-FAILURE'   if $env =~ /fan\s+\S+.*(?:fail|shutdown)/i;
+        push @alerts, 'PSU-FAILURE'   if $env =~ /power.*(?:fail|absent|down)/i;
+        if (@alerts) {
+            emit("  ENV   : [ALERT] " . join(', ', @alerts) . "\n");
+        } else {
+            emit("  ENV   : OK\n");
+        }
+    } else {
+        emit("  ENV   : [not supported on this platform]\n");
+    }
+
+    # --- Uptime (bonus context) ---
+    my $ver = $ssh->exec("show version | include uptime");
+    if ($ver && $ver =~ /^(.+uptime.+?)[\r\n]/m) {
+        (my $uptime = $1) =~ s/^\s+//;
+        emit("  UPTIME: $uptime\n");
+    }
+
+    eval { $ssh->close() };
 }
 
-output("STP Audit Report\n");
-output("Devices: " . scalar(@devices) . "  VLAN filter: " . ($vlan // 'all') . "\n");
+emit("Network Health Check | " . strftime('%Y-%m-%d %H:%M:%S', localtime) . "\n");
+emit("Devices: " . scalar(@devices) . "\n");
 
-for my $dev (@devices) {
-    eval { audit_device($dev) };
-    output("ERROR: $dev: $@\n") if $@;
+for my $host (@devices) {
+    check_device($host);
 }
 
-output("\nAudit complete.\n");
-close $log_fh if $log_fh;
+emit("\nComplete. " . scalar(@devices) . " device(s) polled.\n");
+close($log_fh) if $log_fh;
