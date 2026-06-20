@@ -1,171 +1,167 @@
+No skills apply to this direct content generation task. Writing the script now.
+
 #!/usr/bin/perl
-# =============================================================================
-# arp_audit.pl - ARP Table Collector and Duplicate IP/MAC Detector
-# =============================================================================
-# Purpose:
-#   Connects to Cisco IOS/IOS-XE devices via SSH and collects the ARP table.
-#   Flags duplicate IP addresses and MAC addresses that may indicate IP
-#   conflicts, ARP spoofing, or misconfigured devices on the network.
 #
-# Usage:
-#   Single device:  ./arp_audit.pl -h 192.168.1.1 -u admin -p password
-#   Device file:    ./arp_audit.pl -f devices.txt -u admin -p password
-#   With log file:  ./arp_audit.pl -h 192.168.1.1 -u admin -p password -l audit.log
+# ntp_compliance_audit.pl - NTP Policy Compliance Auditor
 #
-# Prerequisites:
-#   - Perl modules: Net::SSH::Expect, Getopt::Long
-#   - Install: cpan Net::SSH::Expect
-#   - SSH access with privilege exec level on target devices
+# PURPOSE:
+#   Audits network devices to verify NTP configuration meets policy.
+#   Checks that devices synchronize only to approved NTP servers,
+#   verifies stratum levels are within acceptable range, and flags
+#   devices with excessive clock offset or no synchronization.
+#   Produces a per-device PASS/FAIL compliance report.
 #
-# Device file format (one IP/hostname per line; lines starting with # ignored):
-#   10.0.0.1
-#   10.0.0.2   # core-sw-01
-# =============================================================================
+# USAGE:
+#   ./ntp_compliance_audit.pl -f devices.txt [-l audit.log] [-u admin] [-p secret]
+#   ./ntp_compliance_audit.pl -h 192.168.1.1  [-l audit.log] [-u admin] [-p secret]
+#
+#   Credentials default to env vars NET_USER / NET_PASS if not supplied.
+#
+# PREREQUISITES:
+#   cpanm Net::SSH::Expect Getopt::Long
+#
+# DEVICE FILE FORMAT:
+#   One IP or hostname per line; lines starting with # are skipped.
+#
+# POLICY (edit to match your environment):
+#   @APPROVED_SERVERS  - only these may be the active reference
+#   $MAX_STRATUM       - stratum higher than this value triggers a violation
+#   $MAX_OFFSET_MS     - absolute offset (ms) above this triggers a violation
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case);
 use POSIX qw(strftime);
 
-my ($host, $device_file, $username, $password, $log_file);
-my $timeout = 30;
+# ── Policy ────────────────────────────────────────────────────────────────────
+my @APPROVED_SERVERS = ('10.0.1.10', '10.0.1.11', 'ntp1.corp.example.com');
+my $MAX_STRATUM      = 5;
+my $MAX_OFFSET_MS    = 500;
+my $SSH_TIMEOUT      = 15;
+# ─────────────────────────────────────────────────────────────────────────────
+
+my ($opt_host, $opt_file, $opt_log, $opt_user, $opt_pass, $opt_help);
+$opt_user = $ENV{NET_USER} // 'admin';
+$opt_pass = $ENV{NET_PASS} // '';
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'f|file=s'     => \$device_file,
-    'u|user=s'     => \$username,
-    'p|password=s' => \$password,
-    'l|log=s'      => \$log_file,
-    't|timeout=i'  => \$timeout,
-) or die usage();
+    'h|host=s' => \$opt_host,
+    'f|file=s' => \$opt_file,
+    'l|log=s'  => \$opt_log,
+    'u|user=s' => \$opt_user,
+    'p|pass=s' => \$opt_pass,
+    'help'     => \$opt_help,
+) or die "Option error. Try --help.\n";
 
-die usage() unless ($host || $device_file) && $username && $password;
+if ($opt_help || (!$opt_host && !$opt_file)) {
+    print "Usage: $0 -f devices.txt|-h host [-l logfile] [-u user] [-p pass]\n";
+    exit 0;
+}
+
+my $LOG;
+if ($opt_log) {
+    open($LOG, '>>', $opt_log) or die "Cannot open log '$opt_log': $!\n";
+}
+
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+emit("=" x 68);
+emit("NTP Compliance Audit  $ts");
+emit("Approved NTP: " . join('  ', @APPROVED_SERVERS));
+emit("Policy: stratum <= $MAX_STRATUM | offset <= ${MAX_OFFSET_MS} ms");
+emit("=" x 68);
 
 my @devices;
-if ($host) {
-    push @devices, $host;
+if ($opt_host) {
+    push @devices, $opt_host;
 } else {
-    open(my $fh, '<', $device_file) or die "Cannot open device file '$device_file': $!\n";
-    while (<$fh>) {
-        chomp; s/#.*//; s/\s+$//;
-        push @devices, $_ if $_;
-    }
+    open(my $fh, '<', $opt_file) or die "Cannot open '$opt_file': $!\n";
+    while (<$fh>) { chomp; next if /^\s*#/ || /^\s*$/; push @devices, $_; }
     close $fh;
 }
+die "No devices to audit.\n" unless @devices;
 
-die "No devices to process.\n" unless @devices;
+my ($n_pass, $n_fail) = (0, 0);
+audit($_) for @devices;
 
-my $log_fh;
-if ($log_file) {
-    open($log_fh, '>', $log_file) or die "Cannot open log file '$log_file': $!\n";
-}
+emit("");
+emit("=" x 68);
+emit(sprintf("Result: %d device(s)  PASS: %d  FAIL: %d",
+    scalar @devices, $n_pass, $n_fail));
+close $LOG if $LOG;
+exit($n_fail ? 1 : 0);
 
-my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
-out("=" x 62);
-out("ARP Audit Report - $ts");
-out("=" x 62);
+# ── Subroutines ───────────────────────────────────────────────────────────────
 
-for my $device (@devices) {
-    audit_device($device);
-}
-
-close $log_fh if $log_fh;
-
-sub audit_device {
+sub audit {
     my ($device) = @_;
-    out("\n[*] Connecting to $device ...");
+    emit("\n[Device: $device]");
 
     my $ssh;
     eval {
         $ssh = Net::SSH::Expect->new(
             host       => $device,
-            user       => $username,
-            password   => $password,
-            ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
-            timeout    => $timeout,
+            user       => $opt_user,
+            password   => $opt_pass,
             raw_pty    => 1,
+            timeout    => $SSH_TIMEOUT,
+            ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
         );
         $ssh->login();
     };
     if ($@) {
-        out("[ERROR] $device: connection failed - $@");
+        (my $err = $@) =~ s/\n.*//s;
+        emit("  ERROR: SSH failed - $err");
+        $n_fail++;
         return;
     }
 
-    eval { $ssh->send("terminal length 0\n"); $ssh->waitfor('\S+[#>]', 5); };
+    $ssh->exec("terminal length 0");
+    my $ntp_status = $ssh->exec("show ntp status")       // '';
+    my $ntp_assoc  = $ssh->exec("show ntp associations")  // '';
+    $ssh->close();
 
-    my $arp_output = '';
-    eval {
-        $ssh->send("show ip arp\n");
-        $arp_output = $ssh->waitfor('\S+[#>]', $timeout);
-    };
-    if ($@) {
-        out("[ERROR] $device: failed to run 'show ip arp' - $@");
-        $ssh->close();
-        return;
+    # Parse NTP status output
+    my $synced     = ($ntp_status =~ /Clock is synchronized/i)      ? 1    : 0;
+    my $ref_server = ($ntp_status =~ /reference is (\S+)/i)         ? $1   : 'none';
+    my $stratum    = ($ntp_status =~ /stratum\s+(\d+)/i)            ? $1   : 0;
+    my $offset     = ($ntp_status =~ /offset\s+([\-\d\.]+)\s*msec/i)? $1   : undef;
+
+    # Parse configured peer IPs from associations table (lines with * or +)
+    my @peers;
+    for (split /\n/, $ntp_assoc) {
+        push @peers, $1 if /^[*+~]\S*\s+([\d]{1,3}(?:\.[\d]{1,3}){3}|\S+\.\S+)/;
     }
 
-    eval { $ssh->send("exit\n"); $ssh->close(); };
+    # Compliance evaluation
+    my @violations;
+    push @violations, "Clock NOT synchronized"
+        unless $synced;
+    push @violations, "Stratum $stratum exceeds policy maximum ($MAX_STRATUM)"
+        if $synced && $stratum > $MAX_STRATUM;
+    push @violations, "Reference '$ref_server' not in approved server list"
+        if $synced && !grep { $_ eq $ref_server } @APPROVED_SERVERS;
+    push @violations, sprintf("Offset %.1f ms exceeds threshold (%d ms)", $offset, $MAX_OFFSET_MS)
+        if $synced && defined $offset && abs($offset) > $MAX_OFFSET_MS;
 
-    parse_arp($device, $arp_output);
-}
+    emit(sprintf("  Synchronized : %s",   $synced ? "yes" : "NO"));
+    emit(sprintf("  Reference    : %s",   $ref_server));
+    emit(sprintf("  Stratum      : %s",   $stratum || 'N/A'));
+    emit(sprintf("  Offset       : %s",   defined $offset ? "${offset} ms" : 'N/A'));
+    emit(sprintf("  Active peers : %s",   @peers ? join(', ', @peers) : 'none detected'));
 
-sub parse_arp {
-    my ($device, $output) = @_;
-
-    my (%ip_to_macs, %mac_to_ips, @entries);
-
-    for my $line (split /\n/, $output) {
-        next unless $line =~ /^Internet\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+\S+\s+(\S+)/;
-        my ($ip, $age, $mac, $iface) = ($1, $2, lc($3), $4);
-        push @entries, { ip => $ip, age => $age, mac => $mac, iface => $iface };
-        push @{ $ip_to_macs{$ip}  }, $mac;
-        push @{ $mac_to_ips{$mac} }, $ip;
-    }
-
-    out(sprintf("[%s] %d ARP entries collected.", $device, scalar @entries));
-
-    my @dup_ips  = sort grep { @{ $ip_to_macs{$_} } > 1 } keys %ip_to_macs;
-    my @dup_macs = sort grep { @{ $mac_to_ips{$_} } > 1 } keys %mac_to_ips;
-
-    if (@dup_ips) {
-        out("[WARN] Duplicate IPs (IP conflict or ARP spoofing):");
-        out(sprintf("  %-18s -> %s", $_, join(", ", @{ $ip_to_macs{$_} }))) for @dup_ips;
-    }
-    if (@dup_macs) {
-        out("[WARN] Duplicate MACs (multi-IP host or MAC spoofing):");
-        out(sprintf("  %-20s -> %s", $_, join(", ", @{ $mac_to_ips{$_} }))) for @dup_macs;
-    }
-    unless (@dup_ips || @dup_macs) {
-        out("[OK]   No duplicate IPs or MACs detected.");
-    }
-
-    out(sprintf("\n  %-18s %-5s %-20s %s", "IP Address", "Age", "MAC Address", "Interface"));
-    out("  " . "-" x 58);
-    for my $e (sort { $a->{ip} cmp $b->{ip} } @entries) {
-        out(sprintf("  %-18s %-5s %-20s %s", $e->{ip}, $e->{age}, $e->{mac}, $e->{iface}));
+    if (@violations) {
+        emit("  STATUS       : FAIL");
+        emit("    - $_") for @violations;
+        $n_fail++;
+    } else {
+        emit("  STATUS       : PASS");
+        $n_pass++;
     }
 }
 
-sub out {
-    my ($msg) = @_;
-    print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
-}
-
-sub usage {
-    return <<'END';
-Usage:
-  arp_audit.pl -h <host>   -u <user> -p <pass> [-l <logfile>] [-t <secs>]
-  arp_audit.pl -f <file>   -u <user> -p <pass> [-l <logfile>] [-t <secs>]
-
-Options:
-  -h, --host      Single device IP or hostname
-  -f, --file      File with list of devices (one per line)
-  -u, --user      SSH username
-  -p, --password  SSH password
-  -l, --log       Optional output log file
-  -t, --timeout   SSH timeout in seconds (default: 30)
-END
+sub emit {
+    my ($line) = @_;
+    print  "$line\n";
+    print $LOG "$line\n" if $LOG;
 }
