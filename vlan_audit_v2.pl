@@ -1,156 +1,207 @@
-The prompt asks for script content only — no file to write here. Here is the script:
+No specific skills apply to this code generation task. Writing the Perl trunk VLAN audit script now.
 
-```
 #!/usr/bin/perl
 #
-# vlan_svi_audit.pl - VLAN SVI Layer 3 Health Auditor
+# vlan_trunk_audit.pl - Cisco VLAN Trunk Pruning and Consistency Audit
 #
-# Purpose:
-#   Audits Layer 3 SVI health for all active VLANs on Cisco IOS/IOS-XE switches.
-#   Reports VLANs missing SVIs, SVIs in down state, SVIs lacking IP addresses,
-#   and provides a summary of L2-only vs routed VLANs. Useful for detecting
-#   silent L3 failures invisible to basic VLAN table audits.
+# PURPOSE:
+#   Audits trunk interfaces for VLAN inconsistencies on Cisco IOS devices.
+#   Cross-references allowed, active, and STP-forwarding VLAN sets to surface:
+#     - Ghost VLANs: allowed on trunk but absent from the VLAN database
+#     - Stranded VLANs: in the VLAN database but pruned from every trunk
+#     - Blocked ports: trunks with no VLANs in STP forwarding state
+#   Complements vlan_audit.pl (database listing) and vlan_audit_v2.pl (detail
+#   report) by focusing on trunk-layer pruning and cross-device consistency.
 #
-# Usage:
-#   ./vlan_svi_audit.pl -h <host> [-u user] [-p pass] [-l logfile]
-#   ./vlan_svi_audit.pl -f devices.txt [-u user] [-p pass] [-l logfile]
-#   NET_USER=admin NET_PASS=secret ./vlan_svi_audit.pl -f core-switches.txt
+# USAGE:
+#   Single device:  perl vlan_trunk_audit.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:    perl vlan_trunk_audit.pl -f devices.txt -u admin -p secret
+#   With log file:  perl vlan_trunk_audit.pl -h 192.168.1.1 -u admin -p secret -l audit.log
+#   Custom timeout: perl vlan_trunk_audit.pl -h 192.168.1.1 -u admin -p secret -t 45
 #
-# Prerequisites:
-#   cpan install Net::SSH::Expect
-#   SSH access with 'show' privilege; device prompt must match hostname#
+# PREREQUISITES:
+#   cpan Net::SSH::Expect
+#   SSH enabled on target device (crypto key generate rsa; ip ssh version 2)
+#   Account requires at minimum privilege 1 (show commands only)
+#
+# DEVICE FILE FORMAT (one entry per line; inline # comments ignored):
+#   192.168.1.1
+#   sw-core-01.example.com   # aggregation layer
+#
+# EXIT CODES:
+#   0 = clean audit (no issues found on any device)
+#   1 = issues found or connection errors
+#
 
 use strict;
 use warnings;
+use Getopt::Long qw(:config no_ignore_case);
 use Net::SSH::Expect;
-use Getopt::Long;
 use POSIX qw(strftime);
 
-my ($host, $user, $password, $device_file, $logfile, $help);
-$user     = $ENV{NET_USER} // 'admin';
-$password = $ENV{NET_PASS} // '';
+my ($opt_host, $opt_file, $opt_user, $opt_pass, $opt_log, $opt_timeout);
+$opt_timeout = 30;
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'u|user=s'     => \$user,
-    'p|password=s' => \$password,
-    'f|file=s'     => \$device_file,
-    'l|log=s'      => \$logfile,
-    'help'         => \$help,
-) or die "Option error. Use --help for usage.\n";
+    'h|host=s'    => \$opt_host,
+    'f|file=s'    => \$opt_file,
+    'u|user=s'    => \$opt_user,
+    'p|pass=s'    => \$opt_pass,
+    'l|log=s'     => \$opt_log,
+    't|timeout=i' => \$opt_timeout,
+) or die "Usage: $0 -h host|-f file -u user -p pass [-l logfile] [-t timeout]\n";
 
-if ($help || (!$host && !$device_file)) {
-    print "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-l logfile]\n";
-    exit 0;
-}
+die "Specify -h host or -f file\n"  unless $opt_host || $opt_file;
+die "Username required (-u)\n"      unless $opt_user;
+die "Password required (-p)\n"      unless $opt_pass;
 
 my @devices;
-if ($host) {
-    push @devices, $host;
+if ($opt_host) {
+    push @devices, $opt_host;
 } else {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; next if /^\s*[#;]/ || /^\s*$/; push @devices, $_; }
+    open my $fh, '<', $opt_file or die "Cannot open $opt_file: $!\n";
+    while (<$fh>) {
+        chomp; s/#.*//; s/^\s+|\s+$//g;
+        push @devices, $_ if length $_;
+    }
     close $fh;
 }
-die "No devices specified.\n" unless @devices;
+die "No devices to process\n" unless @devices;
 
 my $log_fh;
-if ($logfile) {
-    open($log_fh, '>', $logfile) or die "Cannot open $logfile: $!\n";
+if ($opt_log) {
+    open $log_fh, '>', $opt_log or die "Cannot open $opt_log: $!\n";
 }
 
-sub out {
-    my $msg = shift;
+my $issues_found = 0;
+
+sub say_out {
+    my ($msg) = @_;
     print $msg;
     print $log_fh $msg if $log_fh;
 }
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-out("=" x 60 . "\nVLAN SVI Health Audit  -  $ts\n" . "=" x 60 . "\n\n");
+sub expand_range {
+    my ($str) = @_;
+    my @out;
+    for my $tok (split /,/, $str // '') {
+        if ($tok =~ /^(\d+)-(\d+)$/) { push @out, ($1..$2) }
+        elsif ($tok =~ /^\d+$/)      { push @out, $tok }
+    }
+    return @out;
+}
 
-for my $device (@devices) {
-    out("Device: $device\n" . "-" x 40 . "\n");
+sub audit_device {
+    my ($dev) = @_;
+    say_out("\n" . "=" x 62 . "\n");
+    say_out(sprintf "Device : %s\n", $dev);
+    say_out(sprintf "Time   : %s\n", strftime("%Y-%m-%d %H:%M:%S", localtime));
+    say_out("=" x 62 . "\n");
 
     my $ssh = Net::SSH::Expect->new(
-        host       => $device,
-        user       => $user,
-        password   => $password,
-        raw_pty    => 1,
-        timeout    => 15,
-        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
+        host     => $dev,
+        user     => $opt_user,
+        password => $opt_pass,
+        raw_pty  => 1,
+        timeout  => $opt_timeout,
     );
 
     eval {
         my $banner = $ssh->login();
-        die "Unexpected prompt (auth failed?)\n" unless $banner =~ /[>#]/;
+        die "unexpected prompt after login\n" unless $banner =~ /[>#]/;
     };
     if ($@) {
-        out("  ERROR: $@\n\n");
-        next;
+        chomp(my $err = $@);
+        say_out("  ERROR: Cannot connect - $err\n");
+        $issues_found = 1;
+        return;
     }
 
-    $ssh->send('terminal length 0');
-    $ssh->waitfor('\#', 5);
+    $ssh->exec("terminal length 0");
 
-    $ssh->send('show vlan brief');
-    my $vlan_out = $ssh->waitfor('\#', 15) // '';
+    my $vlan_raw  = $ssh->exec("show vlan brief");
+    my $trunk_raw = $ssh->exec("show interfaces trunk");
+    $ssh->close();
 
-    $ssh->send('show ip interface brief | include Vlan');
-    my $ip_out = $ssh->waitfor('\#', 15) // '';
-
-    eval { $ssh->close() };
-
-    # Parse active VLANs (id + name, status=active)
-    my %vlans;
-    for (split /\n/, $vlan_out) {
-        $vlans{$1} = $2 if /^\s*(\d+)\s+(\S+)\s+active/i;
+    # Parse VLAN database
+    my %vlan_db;
+    for (split /\n/, $vlan_raw) {
+        $vlan_db{$1} = $2 if /^(\d+)\s+(\S+)\s+active/;
     }
 
-    # Parse SVI entries from ip interface brief
-    my (%svi_ip, %svi_state);
-    for (split /\n/, $ip_out) {
-        if (/Vlan(\d+)\s+(\S+)\s+(\S+)\s+(\S+)/i) {
-            $svi_ip{$1}    = $2;
-            $svi_state{$1} = "$3/$4";
+    # Parse trunk sections
+    my (%allowed, %active, %forwarding, @iface_order);
+    my ($section, $iface) = ('', '');
+    for (split /\n/, $trunk_raw) {
+        if    (/^Port\s+Mode\s+Encapsulation/i)                          { $section = 'hdr' }
+        elsif (/^Port\s+Vlans allowed on trunk/i)                        { $section = 'allowed' }
+        elsif (/^Port\s+Vlans allowed and active/i)                      { $section = 'active' }
+        elsif (/^Port\s+Vlans in spanning tree forwarding/i)             { $section = 'fwd' }
+        elsif ($section eq 'hdr'     && /^(\S+)\s+\S+\s+\S+/)           { $iface = $1; push @iface_order, $iface; $allowed{$iface} = []; $forwarding{$iface} = [] }
+        elsif ($section eq 'allowed' && /^(\S+)\s+([\d,\-]+)/)          { $allowed{$1}     = [expand_range($2)] }
+        elsif ($section eq 'active'  && /^(\S+)\s+([\d,\-]+)/)          { $active{$1}      = [expand_range($2)] }
+        elsif ($section eq 'fwd'     && /^(\S+)\s+([\d,\-]+)/)          { $forwarding{$1}  = [expand_range($2)] }
+    }
+
+    unless (@iface_order) {
+        say_out("  No trunk interfaces found\n");
+        return;
+    }
+
+    my %carried_on_any;
+    my $device_clean = 1;
+
+    for my $intf (@iface_order) {
+        my @alw = @{ $allowed{$intf}    // [] };
+        my @fwd = @{ $forwarding{$intf} // [] };
+        my %fwd_set = map { $_ => 1 } @fwd;
+        $carried_on_any{$_}++ for @alw;
+
+        my @ghosts  = grep { !exists $vlan_db{$_} } @alw;
+        my @pruned  = grep { !$fwd_set{$_} && exists $vlan_db{$_} && $_ != 1 } @alw;
+        my $blocked = (@alw && !@fwd) ? 1 : 0;
+
+        say_out(sprintf "\n  %-28s  allowed=%-4d  forwarding=%-4d\n",
+                $intf, scalar @alw, scalar @fwd);
+
+        if (@ghosts) {
+            say_out("    [WARN] Ghost VLANs (allowed, not in DB): "
+                    . join(',', sort { $a<=>$b } @ghosts) . "\n");
+            $issues_found = $device_clean = 1;
+        }
+        if ($blocked) {
+            say_out("    [WARN] Trunk has no VLANs in STP forwarding state\n");
+            $issues_found = $device_clean = 1;
+        }
+        if (@pruned > 20) {
+            say_out(sprintf "    [INFO] %d VLANs pruned/blocked by STP\n", scalar @pruned);
+        } elsif (@pruned) {
+            say_out("    [INFO] Pruned/STP-blocked: " . join(',', sort { $a<=>$b } @pruned) . "\n");
         }
     }
 
-    my (@down, @no_ip, @no_svi, @ok);
-    for my $vid (sort { $a <=> $b } keys %vlans) {
-        next if $vid == 1;
-        if (!exists $svi_state{$vid}) {
-            push @no_svi, $vid;
-        } elsif ($svi_state{$vid} !~ m{up/up}i) {
-            push @down, { vid => $vid, st => $svi_state{$vid},
-                          ip  => ($svi_ip{$vid} // 'unassigned') };
-        } elsif (($svi_ip{$vid} // '') =~ /unassigned|^\s*$/) {
-            push @no_ip, $vid;
-        } else {
-            push @ok, "$vid ($svi_ip{$vid})";
-        }
-    }
+    # Stranded: in DB but not allowed on any trunk (skip VLAN 1)
+    my @stranded = sort { $a<=>$b }
+                   grep { $_ > 1 && !$carried_on_any{$_} }
+                   keys %vlan_db;
 
-    my $total = scalar keys %vlans;
-    out(sprintf("  VLANs active: %-4d  SVI OK: %-4d  Down: %-4d  No IP: %-4d  L2-only: %d\n\n",
-        $total, scalar @ok, scalar @down, scalar @no_ip, scalar @no_svi));
-
-    if (@down) {
-        out("  [WARN] SVIs not up/up:\n");
-        out(sprintf("    VLAN %-5d  %-12s  %s\n",
-            $_->{vid}, $_->{st}, $_->{ip})) for @down;
-        out("\n");
+    say_out(sprintf "\n  DB VLANs: %d   Trunks: %d\n",
+            scalar keys %vlan_db, scalar @iface_order);
+    if (@stranded) {
+        say_out("  [WARN] Stranded VLANs (in DB, not on any trunk): "
+                . join(',', @stranded) . "\n");
+        $issues_found = 1;
+    } else {
+        say_out("  [OK]   No stranded VLANs\n");
     }
-    if (@no_ip) {
-        out("  [WARN] SVIs up but no IP assigned: " . join(', ', @no_ip) . "\n\n");
-    }
-    if (@no_svi) {
-        out("  [INFO] L2-only VLANs (no SVI): " . join(', ', @no_svi) . "\n\n");
-    }
-    out("  [OK] Routed SVIs: " . join(', ', @ok) . "\n\n") if @ok;
+    say_out($device_clean ? "  [OK]   No per-trunk issues\n" : "");
 }
 
-out("Audit complete.\n");
-close $log_fh if $log_fh;
-```
+say_out("VLAN Trunk Pruning Audit\n");
+say_out("Generated: " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n");
 
-This is `vlan_svi_audit.pl` — it audits Layer 3 SVI health rather than the VLAN table itself, making it complementary to the existing `vlan_audit.pl`/`vlan_audit_v2.pl`. Key differentiators: correlates `show vlan brief` against `show ip interface brief` to classify each active VLAN as routed-healthy, SVI-down, SVI-missing-IP, or L2-only. Accepts a device list file, reads credentials from env vars, and supports optional log output. ~115 lines.
+audit_device($_) for @devices;
+
+say_out("\nAudit complete. " . scalar(@devices) . " device(s) processed.\n");
+close $log_fh if $log_fh;
+exit $issues_found;
