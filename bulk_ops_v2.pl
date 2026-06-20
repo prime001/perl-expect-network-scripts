@@ -1,143 +1,163 @@
+The output should be just the script — here it is:
+
 #!/usr/bin/perl
 # =============================================================================
-# acl_audit.pl - Cisco IOS Access Control List Audit Tool
-#
+# qos_audit.pl - QoS Policy Audit for Cisco IOS/IOS-XE Devices
+# =============================================================================
 # Purpose:
-#   Connects to one or more Cisco IOS devices via SSH and audits ACL
-#   configuration: enumerates all named/numbered ACLs, their rule counts,
-#   cumulative hit counters, and interface bindings. Flags empty, zero-hit,
-#   and unbound ACLs for security review and cleanup.
+#   Audits Quality of Service configurations across network devices via SSH.
+#   Collects applied service-policies per interface, policy-map/class-map
+#   definitions, and DSCP/CoS marking criteria. Useful for validating QoS
+#   consistency before and after network changes or during compliance checks.
 #
 # Usage:
-#   Single device:  ./acl_audit.pl -h 192.168.1.1 -u admin [-p pass] [-l out.log]
-#   Device file:    ./acl_audit.pl -f devices.txt  -u admin [-p pass] [-l out.log]
-#
-#   devices.txt: one IP/hostname per line; lines beginning with # are ignored
+#   Single device:  perl qos_audit.pl -h 192.168.1.1
+#   Device list:    perl qos_audit.pl -f devices.txt
+#   With logging:   perl qos_audit.pl -f devices.txt -l /tmp/qos_$(date +%F).log
+#   Override creds: perl qos_audit.pl -f devices.txt -u netops -p s3cr3t -e en4ble
 #
 # Prerequisites:
-#   cpan Net::SSH::Expect
-#   Tested against Cisco IOS 12.4+, IOS-XE 16.x+
-#   SSH key auth preferred; -p enables password auth
+#   cpan Net::SSH::Expect Getopt::Long
+#   SSH reachability; read-only ('show') privilege sufficient
+#   devices.txt: one IP or hostname per line; lines starting with # are skipped
 #
-# Output:
-#   Per-device table: ACL name, rule count, total hits, binding flags
-#   UNUSED  = ACL has rules but zero hits since last counter clear
-#   UNBOUND = ACL not referenced by any 'ip access-group' statement
+# Environment:
+#   NET_USER, NET_PASS, NET_ENABLE  — credential defaults (avoids CLI exposure)
 # =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case);
 use POSIX qw(strftime);
 
-my ($host, $device_file, $username, $password, $logfile);
-my $timeout = 30;
+my $username    = $ENV{NET_USER}   // 'admin';
+my $password    = $ENV{NET_PASS}   // '';
+my $enable_pw   = $ENV{NET_ENABLE} // '';
+my $timeout     = 25;
+my ($opt_host, $opt_file, $opt_log, $opt_user, $opt_pass, $opt_enable, $opt_help);
 
 GetOptions(
-    'h|host=s'    => \$host,
-    'f|file=s'    => \$device_file,
-    'u|user=s'    => \$username,
-    'p|pass=s'    => \$password,
-    'l|log=s'     => \$logfile,
-    't|timeout=i' => \$timeout,
-) or die "Usage: $0 -h HOST|-f FILE -u USER [-p PASS] [-l LOG] [-t SECS]\n";
+    'h|host=s'   => \$opt_host,
+    'f|file=s'   => \$opt_file,
+    'l|log=s'    => \$opt_log,
+    'u|user=s'   => \$opt_user,
+    'p|pass=s'   => \$opt_pass,
+    'e|enable=s' => \$opt_enable,
+    'help'       => \$opt_help,
+) or die "Argument error. Run with --help for usage.\n";
 
-die "Specify -h HOST or -f FILE\n" unless $host || $device_file;
-die "Specify -u USER\n"            unless $username;
+if ($opt_help || (!$opt_host && !$opt_file)) {
+    print "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-e enable] [-l logfile]\n";
+    exit 0;
+}
+
+$username  = $opt_user   if $opt_user;
+$password  = $opt_pass   if $opt_pass;
+$enable_pw = $opt_enable if $opt_enable;
 
 my @devices;
-if ($device_file) {
-    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
-    while (<$fh>) { chomp; next if /^\s*[#]/ || /^\s*$/; push @devices, $_; }
-    close $fh;
+if ($opt_host) {
+    push @devices, $opt_host;
 } else {
-    @devices = ($host);
+    open my $fh, '<', $opt_file or die "Cannot open $opt_file: $!\n";
+    while (<$fh>) { chomp; next if /^\s*$/ || /^\s*#/; push @devices, $_; }
+    close $fh;
 }
 
 my $LOG;
-if ($logfile) {
-    open($LOG, '>>', $logfile) or die "Cannot open $logfile: $!\n";
+if ($opt_log) {
+    open $LOG, '>>', $opt_log or die "Cannot open log $opt_log: $!\n";
 }
 
-my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-out("=" x 62);
-out("ACL Audit Report  --  $ts");
-out("Devices: " . scalar(@devices));
-out("=" x 62);
+my $stamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
 
-for my $dev (@devices) {
-    out("\n[+] $dev");
-    audit_device($dev);
+sub emit {
+    my ($msg) = @_;
+    print $msg;
+    print $LOG $msg if $LOG;
 }
-
-close $LOG if $LOG;
 
 sub audit_device {
     my ($dev) = @_;
+    emit("\n" . "=" x 62 . "\n");
+    emit("HOST: $dev    STARTED: $stamp\n");
+    emit("=" x 62 . "\n");
+
     my $ssh = Net::SSH::Expect->new(
-        host     => $dev,
-        user     => $username,
-        ($password ? (password => $password) : ()),
-        raw_pty  => 1,
-        timeout  => $timeout,
+        host       => $dev,
+        user       => $username,
+        password   => $password,
+        raw_pty    => 1,
+        timeout    => $timeout,
+        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=no',
     );
 
-    eval { my $r = $ssh->login(); die "bad prompt\n" unless $r =~ /[>#]/; };
+    eval {
+        my $banner = $ssh->login();
+        die "Auth failed or unexpected prompt\n" unless $banner =~ /[>#]/;
+    };
     if ($@) {
-        out("    ERROR: Login failed -- " . ($@ =~ s/\n/ /gr));
+        chomp(my $err = $@);
+        emit("  [ERROR] $err\n");
         return;
     }
 
-    $ssh->send("terminal length 0\n");  $ssh->waitfor('[>#]', 5);
+    $ssh->send("terminal length 0");
+    $ssh->waitfor('[>#]', 5);
 
-    $ssh->send("show ip access-lists\n");
-    my $acl_out = eval { $ssh->waitfor('[>#]', $timeout) } // '';
-    if ($@) { out("    ERROR: Timeout on show ip access-lists"); $ssh->close(); return; }
-
-    $ssh->send("show running-config | include ip access-group\n");
-    my $bind_out = eval { $ssh->waitfor('[>#]', $timeout) } // '';
-
-    $ssh->close();
-    parse_report($acl_out, $bind_out);
-}
-
-sub parse_report {
-    my ($acl_text, $bind_text) = @_;
-    my (%acls, $cur);
-
-    for my $line (split /\n/, $acl_text) {
-        if ($line =~ /^(?:Standard|Extended) IP access list (\S+)/) {
-            $cur = $1;
-            $acls{$cur} //= { rules => 0, hits => 0 };
-        } elsif ($cur) {
-            $acls{$cur}{rules}++ if $line =~ /(?:permit|deny)/i;
-            $acls{$cur}{hits}   += $1 if $line =~ /(\d+) matches/;
+    if ($enable_pw) {
+        $ssh->send("enable");
+        my $r = $ssh->waitfor('assword:|[>#]', 5);
+        if ($r && $r =~ /assword:/) {
+            $ssh->send($enable_pw);
+            $ssh->waitfor('[>#]', 5);
         }
     }
 
-    my %bound;
-    $bound{$1} = 1 while $bind_text =~ /ip access-group (\S+)/g;
+    # --- Policy-maps defined ---
+    emit("\n  [Defined Policy Maps]\n");
+    $ssh->send("show policy-map");
+    my $pm_out = $ssh->waitfor('[>#]', 20) // '';
+    my @pmaps = ($pm_out =~ /^\s*Policy Map\s+(\S+)/mg);
+    emit(@pmaps ? "  " . join(', ', @pmaps) . "\n" : "  None configured\n");
 
-    if (!%acls) { out("    No ACLs configured."); return; }
+    # --- Interface service-policy bindings ---
+    emit("\n  [Interface Service-Policy Bindings]\n");
+    $ssh->send("show policy-map interface");
+    my $ipm_out = $ssh->waitfor('[>#]', 25) // '';
 
-    my $fmt = "    %-28s %5s %10s  %s";
-    out(sprintf($fmt, 'ACL Name', 'Rules', 'Hits', 'Flags'));
-    out("    " . "-" x 54);
-
-    for my $name (sort keys %acls) {
-        my @flags;
-        push @flags, 'UNUSED'  if $acls{$name}{rules} > 0 && $acls{$name}{hits} == 0;
-        push @flags, 'UNBOUND' unless $bound{$name};
-        out(sprintf($fmt, $name, $acls{$name}{rules}, $acls{$name}{hits},
-            @flags ? join(' ', @flags) : 'ok'));
+    my $cur_iface = '';
+    my $binding_count = 0;
+    for my $line (split /\n/, $ipm_out) {
+        if ($line =~ /^\s{0,2}(\S+(?:Ethernet|Serial|Tunnel|Port|Vlan)\S*)/i) {
+            $cur_iface = $1;
+        } elsif ($line =~ /Service-policy\s+(input|output):\s+(\S+)/i) {
+            emit(sprintf("  %-35s %s: %s\n", $cur_iface, $1, $2));
+            $binding_count++;
+        }
     }
-    out(sprintf("    Summary: %d ACL(s), %d bound to interfaces",
-        scalar keys %acls, scalar keys %bound));
+    emit("  No service policies applied to interfaces\n") unless $binding_count;
+
+    # --- DSCP/CoS/precedence match criteria ---
+    emit("\n  [QoS Match Criteria (DSCP / CoS / Precedence)]\n");
+    $ssh->send("show class-map");
+    my $cm_out = $ssh->waitfor('[>#]', 15) // '';
+    my @matches = grep { /match.*(?:dscp|cos|precedence|protocol)/i } split /\n/, $cm_out;
+    if (@matches) {
+        for my $m (@matches) {
+            $m =~ s/^\s+//;
+            emit("  $m\n") if length($m) > 3;
+        }
+    } else {
+        emit("  No DSCP/CoS/precedence match entries found\n");
+    }
+
+    $ssh->close();
+    emit("\n  [OK] Audit complete for $dev\n");
 }
 
-sub out {
-    my ($msg) = @_;
-    print "$msg\n";
-    print $LOG "$msg\n" if $LOG;
-}
+emit("QoS Audit Report — $stamp\n");
+audit_device($_) for @devices;
+emit("\n--- Finished. Devices processed: " . scalar(@devices) . " ---\n");
+close $LOG if $LOG;
