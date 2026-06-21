@@ -1,65 +1,68 @@
-The user wants the script content as output only. Here it is:
-
 #!/usr/bin/perl
 #
-# cdp_lldp_neighbors.pl — CDP/LLDP Neighbor Discovery
+# hardware_health.pl - Network Device Hardware Health Check
 #
-# Purpose:
-#   Collects CDP and LLDP neighbor information from Cisco IOS/IOS-XE devices
-#   to map physical topology, verify cabling, and audit adjacency relationships.
-#   Useful for validating network diagrams or discovering unknown attachments
-#   before/after a change window.
+# PURPOSE:
+#   Polls Cisco IOS/IOS-XE devices for hardware environmental status:
+#   CPU utilization, memory usage, power supply and fan status, and
+#   temperature sensor readings. Flags any readings outside acceptable
+#   thresholds with a WARN or CRIT label.
 #
-# Usage:
-#   perl cdp_lldp_neighbors.pl -h <host> [-u <user>] [-p <pass>] [-o <file>] [-t <sec>]
-#   perl cdp_lldp_neighbors.pl -f <device_list> [-u <user>] [-p <pass>] [-o <file>]
+# USAGE:
+#   Single device:   ./hardware_health.pl -h 192.168.1.1 -u admin -p secret
+#   Device file:     ./hardware_health.pl -f devices.txt -u admin -p secret
+#   With log:        ./hardware_health.pl -h 10.0.0.1 -u admin -p secret -l /var/log/hw_health.log
 #
-#   -h  Single device IP or hostname
-#   -f  File containing one device per line (blank lines and # comments ignored)
-#   -u  SSH username  (default: $NET_USER env var)
-#   -p  SSH password  (default: $NET_PASS env var)
-#   -o  Optional output log file (appends run timestamp header)
-#   -t  SSH/expect timeout in seconds (default: 30)
+# PREREQUISITES:
+#   cpan Expect Getopt::Long
 #
-# Prerequisites:
-#   cpan Net::SSH::Expect Getopt::Std
-#   SSH key-based auth or password via env vars NET_USER / NET_PASS
+# DEVICE FILE FORMAT (devices.txt):
+#   One IP or hostname per line; lines starting with # are ignored.
 #
-# Notes:
-#   Requires IOS "terminal length 0" to disable paging.
-#   LLDP section is skipped silently if LLDP is not enabled on the device.
-#   StrictHostKeyChecking is disabled — suitable for lab/private networks only.
+# EXIT CODES:
+#   0 = all devices OK
+#   1 = one or more warnings or criticals detected
+#   2 = one or more connection failures
+#
 
 use strict;
 use warnings;
-use Net::SSH::Expect;
-use Getopt::Std;
+use Expect;
+use Getopt::Long;
 use POSIX qw(strftime);
 
-$Getopt::Std::STANDARD_HELP_VERSION = 1;
+my ($host, $file, $user, $pass, $logfile, $timeout);
+$timeout = 30;
 
-my %opts;
-getopts('h:f:u:p:o:t:', \%opts) or die usage();
+GetOptions(
+    'h|host=s'     => \$host,
+    'f|file=s'     => \$file,
+    'u|user=s'     => \$user,
+    'p|pass=s'     => \$pass,
+    'l|log=s'      => \$logfile,
+    't|timeout=i'  => \$timeout,
+) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOGFILE] [-t TIMEOUT]\n";
 
-my $username = $opts{u} // $ENV{NET_USER} // die "No username: supply -u or set NET_USER\n";
-my $password = $opts{p} // $ENV{NET_PASS} // die "No password: supply -p or set NET_PASS\n";
-my $timeout  = $opts{t} // 30;
-
-die usage() unless $opts{h} || $opts{f};
+die "Provide -h HOST or -f FILE\n"      unless $host || $file;
+die "Username (-u) required\n"          unless $user;
+die "Password (-p) required\n"          unless $pass;
 
 my @devices;
-push @devices, $opts{h} if $opts{h};
-if ($opts{f}) {
-    open my $fh, '<', $opts{f} or die "Cannot open device file '$opts{f}': $!\n";
-    while (<$fh>) { chomp; s/#.*//; s/^\s+|\s+$//g; push @devices, $_ if $_; }
+if ($file) {
+    open my $fh, '<', $file or die "Cannot open $file: $!\n";
+    while (<$fh>) { chomp; next if /^\s*#/ || /^\s*$/; push @devices, $_; }
     close $fh;
+} else {
+    @devices = ($host);
 }
-die "No devices found to poll.\n" unless @devices;
 
 my $log_fh;
-if ($opts{o}) {
-    open $log_fh, '>', $opts{o} or die "Cannot open log file '$opts{o}': $!\n";
+if ($logfile) {
+    open $log_fh, '>>', $logfile or die "Cannot open log $logfile: $!\n";
 }
+
+my $ts        = strftime('%Y-%m-%d %H:%M:%S', localtime);
+my $exit_code = 0;
 
 sub out {
     my ($msg) = @_;
@@ -67,104 +70,104 @@ sub out {
     print $log_fh $msg if $log_fh;
 }
 
-sub usage { "Usage: $0 -h <host>|-f <file> [-u user] [-p pass] [-o logfile] [-t secs]\n" }
+sub check_device {
+    my ($device) = @_;
 
-sub poll_device {
-    my ($host) = @_;
+    out("\n=== $device  [$ts] ===\n");
 
-    my $ssh = Net::SSH::Expect->new(
-        host       => $host,
-        user       => $username,
-        password   => $password,
-        timeout    => $timeout,
-        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=15 -o BatchMode=no',
+    my $exp = Expect->new;
+    $exp->raw_pty(1);
+    $exp->log_stdout(0);
+
+    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=$timeout $user\@$device")) {
+        out("  [ERROR] Failed to spawn SSH for $device\n");
+        return 2;
+    }
+
+    my $result = $exp->expect($timeout,
+        [ qr/[Pp]assword:/         => sub { $exp->send("$pass\n"); exp_continue; } ],
+        [ qr/yes\/no/              => sub { $exp->send("yes\n");   exp_continue; } ],
+        [ qr/[>#]\s*$/             => sub { } ],
+        [ timeout                  => sub { out("  [ERROR] Timeout connecting to $device\n"); return 2; } ],
+        [ qr/[Pp]ermission denied/ => sub { out("  [ERROR] Auth failed for $device\n");      return 2; } ],
     );
 
-    eval { $ssh->login() };
-    if ($@) {
-        out("ERROR [$host]: login failed — $@\n");
-        return;
+    unless (defined $result) {
+        out("  [ERROR] Connection failed: $device\n");
+        return 2;
     }
 
-    $ssh->exec("terminal length 0");
+    $exp->send("terminal length 0\n");
+    $exp->expect($timeout, qr/[>#]\s*$/);
 
-    out("\n" . "=" x 72 . "\n");
-    out(sprintf("Host: %-40s  Polled: %s\n", $host, strftime("%Y-%m-%d %H:%M:%S", localtime)));
-    out("=" x 72 . "\n");
+    my $device_exit = 0;
 
-    my $cdp  = $ssh->exec("show cdp neighbors detail");
-    parse_cdp($cdp)   if $cdp  && $cdp  !~ /not enabled|CDP is not/i;
+    my %commands = (
+        cpu    => 'show processes cpu | include CPU utilization',
+        mem    => 'show processes memory | include Processor',
+        env    => 'show environment all',
+    );
 
-    my $lldp = $ssh->exec("show lldp neighbors detail");
-    parse_lldp($lldp) if $lldp && $lldp !~ /not enabled|LLDP is not/i;
+    for my $key (qw(cpu mem env)) {
+        $exp->send("$commands{$key}\n");
+        $exp->expect($timeout, qr/[>#]\s*$/);
+        my $out = $exp->before();
 
-    $ssh->close();
-}
+        if ($key eq 'cpu') {
+            if ($out =~ /CPU utilization for five seconds:\s*(\d+)%.*one minute:\s*(\d+)%.*five minutes:\s*(\d+)%/) {
+                my ($s5, $m1, $m5) = ($1, $2, $3);
+                my $status = ($m5 >= 80) ? 'CRIT' : ($m5 >= 60) ? 'WARN' : 'OK';
+                $device_exit = 1 if $status ne 'OK';
+                out(sprintf("  CPU  [%s] 5s:%d%% 1m:%d%% 5m:%d%%\n", $status, $s5, $m1, $m5));
+            } else {
+                out("  CPU  [UNKNOWN] Could not parse CPU output\n");
+            }
+        }
 
-sub parse_cdp {
-    my ($raw) = @_;
-    out("\n  -- CDP Neighbors --\n");
-    out(sprintf("  %-28s %-18s %-18s %-22s %-15s\n",
-        "Neighbor", "Local Intf", "Remote Intf", "Platform", "Mgmt IP"));
-    out("  " . "-" x 103 . "\n");
+        if ($key eq 'mem') {
+            if ($out =~ /Processor\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)/) {
+                my ($total, $used, $free) = ($1, $2, $3);
+                my $pct = ($total > 0) ? int($used / $total * 100) : 0;
+                my $status = ($pct >= 85) ? 'CRIT' : ($pct >= 70) ? 'WARN' : 'OK';
+                $device_exit = 1 if $status ne 'OK';
+                out(sprintf("  MEM  [%s] Used:%dKB Free:%dKB (%d%%)\n",
+                    $status, $used/1024, $free/1024, $pct));
+            } else {
+                out("  MEM  [UNKNOWN] Could not parse memory output\n");
+            }
+        }
 
-    my $count = 0;
-    for my $block (split /---+/, $raw) {
-        next unless $block =~ /Device ID/i;
-        my ($nbr)      = $block =~ /Device ID:\s*(\S+)/i;
-        my ($local_if) = $block =~ /Interface:\s*(\S+)/i;
-        my ($rem_if)   = $block =~ /Port ID[^:]*:\s*(\S+)/i;
-        my ($platform) = $block =~ /Platform:\s*([^,\n]+)/i;
-        my ($mgmt_ip)  = $block =~ /IP(?:v4)? [Aa]ddress:\s*([\d.]+)/;
-
-        $platform = substr($platform // 'unknown', 0, 20);
-        $platform =~ s/\s+$//;
-        out(sprintf("  %-28s %-18s %-18s %-22s %-15s\n",
-            substr($nbr // 'unknown', 0, 27),
-            $local_if // 'unknown',
-            $rem_if   // 'unknown',
-            $platform,
-            $mgmt_ip  // 'N/A'));
-        $count++;
+        if ($key eq 'env') {
+            my @lines = split /\n/, $out;
+            for my $line (@lines) {
+                if ($line =~ /FAIL|Critical|Absent|Shutdown/i && $line !~ /^\s*$/) {
+                    (my $clean = $line) =~ s/^\s+|\s+$//g;
+                    out("  ENV  [CRIT] $clean\n");
+                    $device_exit = 1;
+                } elsif ($line =~ /Warning/i) {
+                    (my $clean = $line) =~ s/^\s+|\s+$//g;
+                    out("  ENV  [WARN] $clean\n");
+                    $device_exit = 1 if $device_exit == 0;
+                } elsif ($line =~ /Temperature|Fan|Power/i && $line =~ /OK|Normal|Present/i) {
+                    (my $clean = $line) =~ s/^\s+|\s+$//g;
+                    out("  ENV  [OK]   $clean\n");
+                }
+            }
+        }
     }
-    out("  (no CDP neighbors)\n") unless $count;
+
+    $exp->send("exit\n");
+    $exp->soft_close();
+
+    out("  --- " . ($device_exit == 0 ? "ALL OK" : "ISSUES DETECTED") . " ---\n");
+    return $device_exit;
 }
 
-sub parse_lldp {
-    my ($raw) = @_;
-    return unless $raw =~ /System Name|Chassis id|Port Description/i;
-
-    out("\n  -- LLDP Neighbors --\n");
-    out(sprintf("  %-28s %-18s %-22s %-15s\n",
-        "System Name", "Local Intf", "Remote Port", "Mgmt IP"));
-    out("  " . "-" x 85 . "\n");
-
-    my $count = 0;
-    for my $block (split /Local Intf:/i, $raw) {
-        next unless $block =~ /System Name/i;
-        my ($local_if) = $block =~ /^\s*(\S+)/;
-        my ($sys_name) = $block =~ /System Name:\s*(\S+)/i;
-        my ($port_id)  = $block =~ /Port id:\s*(\S+)/i;
-        my ($mgmt_ip)  = $block =~ /(?:IP|IPv4):\s*([\d.]+)/i;
-
-        out(sprintf("  %-28s %-18s %-22s %-15s\n",
-            substr($sys_name // 'unknown', 0, 27),
-            $local_if // 'unknown',
-            $port_id  // 'unknown',
-            $mgmt_ip  // 'N/A'));
-        $count++;
-    }
-    out("  (no LLDP neighbors)\n") unless $count;
+for my $dev (@devices) {
+    my $rc = check_device($dev);
+    $exit_code = $rc if $rc > $exit_code;
 }
 
-my $started = time();
-out("CDP/LLDP Neighbor Discovery — " . strftime("%Y-%m-%d %H:%M:%S", localtime) . "\n");
-out("Devices: " . scalar(@devices) . ($opts{o} ? "  |  Log: $opts{o}" : "") . "\n");
-
-poll_device($_) for @devices;
-
-out("\n" . "=" x 72 . "\n");
-out(sprintf("Done. %d device(s) polled in %ds.\n", scalar(@devices), time() - $started));
-out("Results written to: $opts{o}\n") if $opts{o};
-
+out("\n[Done] Checked " . scalar(@devices) . " device(s) at $ts\n");
 close $log_fh if $log_fh;
+exit $exit_code;
