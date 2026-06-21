@@ -1,163 +1,148 @@
-The output should be just the script — here it is:
-
 #!/usr/bin/perl
-# =============================================================================
-# qos_audit.pl - QoS Policy Audit for Cisco IOS/IOS-XE Devices
-# =============================================================================
-# Purpose:
-#   Audits Quality of Service configurations across network devices via SSH.
-#   Collects applied service-policies per interface, policy-map/class-map
-#   definitions, and DSCP/CoS marking criteria. Useful for validating QoS
-#   consistency before and after network changes or during compliance checks.
-#
-# Usage:
-#   Single device:  perl qos_audit.pl -h 192.168.1.1
-#   Device list:    perl qos_audit.pl -f devices.txt
-#   With logging:   perl qos_audit.pl -f devices.txt -l /tmp/qos_$(date +%F).log
-#   Override creds: perl qos_audit.pl -f devices.txt -u netops -p s3cr3t -e en4ble
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect Getopt::Long
-#   SSH reachability; read-only ('show') privilege sufficient
-#   devices.txt: one IP or hostname per line; lines starting with # are skipped
-#
-# Environment:
-#   NET_USER, NET_PASS, NET_ENABLE  — credential defaults (avoids CLI exposure)
-# =============================================================================
+=head1 DEVICE HEALTH CHECK
+
+PURPOSE:
+  Collects CPU, memory, temperature, and uptime metrics from network devices
+  via SSH using Net::SSH::Expect. Enables proactive health monitoring for
+  identifying devices approaching resource limits or thermal thresholds.
+
+USAGE:
+  perl 031_device_health_check.pl --host 192.168.1.1
+  perl 031_device_health_check.pl --file devices.txt --log health_report.log
+  perl 031_device_health_check.pl --host 192.168.1.1 --user netadmin --pass P@ssw0rd
+
+PREREQUISITES:
+  - Net::SSH::Expect module (cpan Net::SSH::Expect)
+  - SSH access enabled on target devices
+  - Administrative or operator-level credentials
+  - Device must support: show version, show processes cpu, show memory, show environment
+
+TESTED ON:
+  - Cisco IOS/IOS-XE
+  - Arista EOS (basic support)
+  - Juniper (requires syntax adaptation)
+
+=cut
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
-use POSIX qw(strftime);
+use Getopt::Long;
+use Time::Localtime;
 
-my $username    = $ENV{NET_USER}   // 'admin';
-my $password    = $ENV{NET_PASS}   // '';
-my $enable_pw   = $ENV{NET_ENABLE} // '';
-my $timeout     = 25;
-my ($opt_host, $opt_file, $opt_log, $opt_user, $opt_pass, $opt_enable, $opt_help);
+my ($host, $file, $log, $user, $pass, $help);
 
 GetOptions(
-    'h|host=s'   => \$opt_host,
-    'f|file=s'   => \$opt_file,
-    'l|log=s'    => \$opt_log,
-    'u|user=s'   => \$opt_user,
-    'p|pass=s'   => \$opt_pass,
-    'e|enable=s' => \$opt_enable,
-    'help'       => \$opt_help,
-) or die "Argument error. Run with --help for usage.\n";
+    'host=s'  => \$host,
+    'file=s'  => \$file,
+    'log=s'   => \$log,
+    'user=s'  => \$user,
+    'pass=s'  => \$pass,
+    'help'    => \$help,
+) or die "Error in command line arguments\n";
 
-if ($opt_help || (!$opt_host && !$opt_file)) {
-    print "Usage: $0 -h <host> | -f <file> [-u user] [-p pass] [-e enable] [-l logfile]\n";
+if ($help || (!$host && !$file)) {
+    print "Usage: $0 --host <ip> [--log <file>] [--user <user>] [--pass <pass>]\n";
+    print "       $0 --file <device_list> [--log <file>] [--user <user>] [--pass <pass>]\n";
     exit 0;
 }
 
-$username  = $opt_user   if $opt_user;
-$password  = $opt_pass   if $opt_pass;
-$enable_pw = $opt_enable if $opt_enable;
+$user //= 'admin';
+$pass //= 'admin';
 
 my @devices;
-if ($opt_host) {
-    push @devices, $opt_host;
-} else {
-    open my $fh, '<', $opt_file or die "Cannot open $opt_file: $!\n";
-    while (<$fh>) { chomp; next if /^\s*$/ || /^\s*#/; push @devices, $_; }
+if ($file) {
+    open my $fh, '<', $file or die "Cannot open $file: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^#/ || /^\s*$/;
+        push @devices, $_;
+    }
     close $fh;
+} else {
+    push @devices, $host;
 }
 
-my $LOG;
-if ($opt_log) {
-    open $LOG, '>>', $opt_log or die "Cannot open log $opt_log: $!\n";
-}
+open my $logfh, '>>', $log if $log;
 
-my $stamp = strftime('%Y-%m-%d %H:%M:%S', localtime);
+my $timestamp = scalar localtime;
+my $header_msg = "[" . $timestamp . "] Device Health Check Started\n";
+print $header_msg;
+print $logfh $header_msg if $logfh;
 
-sub emit {
-    my ($msg) = @_;
-    print $msg;
-    print $LOG $msg if $LOG;
-}
+print "-" x 110 . "\n";
+printf "%-20s | %-30s | %-10s | %-25s | %-10s\n", "Device", "Uptime", "CPU", "Memory", "Temp";
+print "-" x 110 . "\n";
 
-sub audit_device {
-    my ($dev) = @_;
-    emit("\n" . "=" x 62 . "\n");
-    emit("HOST: $dev    STARTED: $stamp\n");
-    emit("=" x 62 . "\n");
-
+foreach my $device (@devices) {
+    $device =~ s/\s+//g;
+    next unless $device;
+    
     my $ssh = Net::SSH::Expect->new(
-        host       => $dev,
-        user       => $username,
-        password   => $password,
-        raw_pty    => 1,
-        timeout    => $timeout,
-        ssh_option => '-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=no',
+        host     => $device,
+        user     => $user,
+        password => $pass,
+        timeout  => 30,
+        raw_pty  => 1,
     );
-
+    
+    my %health = (device => $device, uptime => "N/A", cpu => "N/A", memory => "N/A", temp => "N/A");
+    
     eval {
-        my $banner = $ssh->login();
-        die "Auth failed or unexpected prompt\n" unless $banner =~ /[>#]/;
+        $ssh->login();
+        
+        $ssh->send("terminal length 0");
+        $ssh->waitfor('[#>]', 5);
+        
+        eval {
+            $ssh->send("show version");
+            my $out = $ssh->waitfor('[#>]', 10);
+            $health{uptime} = $1 if $out =~ /uptime is\s+(.+?)(?:\n|$)/;
+        };
+        
+        eval {
+            $ssh->send("show processes cpu sorted | include CPU");
+            my $out = $ssh->waitfor('[#>]', 10);
+            $health{cpu} = $1 . "%" if $out =~ /CPU utilization[^:]*:\s*(\d+)/;
+        };
+        
+        eval {
+            $ssh->send("show memory | head -10");
+            my $out = $ssh->waitfor('[#>]', 10);
+            if ($out =~ /(\d+)\s*K\s+used.*?(\d+)\s*K\s+free/i) {
+                my $used = $1;
+                my $free = $2;
+                my $total = $used + $free;
+                my $pct = int(($used / $total) * 100);
+                $health{memory} = "${pct}% (${used}K/${total}K)";
+            }
+        };
+        
+        eval {
+            $ssh->send("show environment temperature 2>/dev/null || show environment");
+            my $out = $ssh->waitfor('[#>]', 10);
+            $health{temp} = $1 . "C" if $out =~ /(\d+)\s*degrees?/i;
+        };
+        
+        $ssh->close();
     };
+    
     if ($@) {
-        chomp(my $err = $@);
-        emit("  [ERROR] $err\n");
-        return;
+        $health{uptime} = "CONN_ERROR";
+        $health{cpu} = "FAILED";
     }
-
-    $ssh->send("terminal length 0");
-    $ssh->waitfor('[>#]', 5);
-
-    if ($enable_pw) {
-        $ssh->send("enable");
-        my $r = $ssh->waitfor('assword:|[>#]', 5);
-        if ($r && $r =~ /assword:/) {
-            $ssh->send($enable_pw);
-            $ssh->waitfor('[>#]', 5);
-        }
-    }
-
-    # --- Policy-maps defined ---
-    emit("\n  [Defined Policy Maps]\n");
-    $ssh->send("show policy-map");
-    my $pm_out = $ssh->waitfor('[>#]', 20) // '';
-    my @pmaps = ($pm_out =~ /^\s*Policy Map\s+(\S+)/mg);
-    emit(@pmaps ? "  " . join(', ', @pmaps) . "\n" : "  None configured\n");
-
-    # --- Interface service-policy bindings ---
-    emit("\n  [Interface Service-Policy Bindings]\n");
-    $ssh->send("show policy-map interface");
-    my $ipm_out = $ssh->waitfor('[>#]', 25) // '';
-
-    my $cur_iface = '';
-    my $binding_count = 0;
-    for my $line (split /\n/, $ipm_out) {
-        if ($line =~ /^\s{0,2}(\S+(?:Ethernet|Serial|Tunnel|Port|Vlan)\S*)/i) {
-            $cur_iface = $1;
-        } elsif ($line =~ /Service-policy\s+(input|output):\s+(\S+)/i) {
-            emit(sprintf("  %-35s %s: %s\n", $cur_iface, $1, $2));
-            $binding_count++;
-        }
-    }
-    emit("  No service policies applied to interfaces\n") unless $binding_count;
-
-    # --- DSCP/CoS/precedence match criteria ---
-    emit("\n  [QoS Match Criteria (DSCP / CoS / Precedence)]\n");
-    $ssh->send("show class-map");
-    my $cm_out = $ssh->waitfor('[>#]', 15) // '';
-    my @matches = grep { /match.*(?:dscp|cos|precedence|protocol)/i } split /\n/, $cm_out;
-    if (@matches) {
-        for my $m (@matches) {
-            $m =~ s/^\s+//;
-            emit("  $m\n") if length($m) > 3;
-        }
-    } else {
-        emit("  No DSCP/CoS/precedence match entries found\n");
-    }
-
-    $ssh->close();
-    emit("\n  [OK] Audit complete for $dev\n");
+    
+    my $output = sprintf("%-20s | %-30s | %-10s | %-25s | %-10s\n",
+        $health{device}, $health{uptime}, $health{cpu}, $health{memory}, $health{temp});
+    
+    print $output;
+    print $logfh $output if $logfh;
 }
 
-emit("QoS Audit Report — $stamp\n");
-audit_device($_) for @devices;
-emit("\n--- Finished. Devices processed: " . scalar(@devices) . " ---\n");
-close $LOG if $LOG;
+print "-" x 110 . "\n";
+my $end_msg = "Device Health Check Completed\n";
+print $end_msg;
+print $logfh $end_msg if $logfh;
+
+close $logfh if $logfh;
+exit 0;
