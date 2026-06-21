@@ -1,139 +1,154 @@
 ```perl
 #!/usr/bin/perl
-# Configuration Compliance Checker - Verify network device config policies
-# Purpose: SSH into Cisco IOS devices and verify configuration compliance
-# Usage: ./config_compliance_checker.pl 192.168.1.1 --user admin --pass secret
-#        ./config_compliance_checker.pl --file devices.txt --user admin --pass secret --log results.txt
-# Prerequisites: Net::SSH::Expect module, SSH access to devices with username/password auth
+# =============================================================================
+# Device CPU/Memory Health Monitor
+# Purpose: Monitor CPU and memory utilization on network devices via SSH
+# Usage: device_cpu_memory_monitor.pl --device <host> [--user user] [--pass pass] [--logfile file]
+#        or: device_cpu_memory_monitor.pl --file devices.txt
+# Device file format: hostname|username|password (one per line, # for comments)
+# Prerequisites: Net::SSH::Expect perl module
+# Example: perl device_cpu_memory_monitor.pl --file devices.txt --threshold 80 --logfile health.log
+# =============================================================================
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use Time::Localtime;
+use Time::HiRes qw(time);
 
-my ($device, $file, $logfile, $username, $password);
+my ($device, $file, $user, $pass, $logfile, $timeout, $threshold);
 
 GetOptions(
-    'device=s'  => \$device,
-    'file=s'    => \$file,
-    'log=s'     => \$logfile,
-    'user=s'    => \$username,
-    'pass=s'    => \$password,
-) or die "Invalid command line arguments\n";
+    'device=s'    => \$device,
+    'file=s'      => \$file,
+    'user=s'      => \$user,
+    'pass=s'      => \$pass,
+    'logfile=s'   => \$logfile,
+    'timeout=i'   => \$timeout,
+    'threshold=i' => \$threshold,
+    'help'        => sub { usage(); exit(0); }
+) or die "Error parsing command line options\n";
 
-die "Username and password required\n" unless $username && $password;
-die "Specify --device or --file\n" unless $device || $file;
+$timeout   //= 12;
+$user      //= 'admin';
+$pass      //= 'admin';
+$threshold //= 80;
 
-my @devices = $device ? ($device) : read_device_list($file);
-my $log;
+sub usage {
+    print "Usage: device_cpu_memory_monitor.pl [OPTIONS]\n\n";
+    print "Options:\n";
+    print "  --device <host>       Target device hostname/IP\n";
+    print "  --file <path>         File with device list (host|user|pass format)\n";
+    print "  --user <username>     SSH username (default: admin)\n";
+    print "  --pass <password>     SSH password (default: admin)\n";
+    print "  --logfile <path>      Log file path (optional)\n";
+    print "  --timeout <seconds>   SSH timeout in seconds (default: 12)\n";
+    print "  --threshold <percent> Alert threshold for CPU/mem (default: 80)\n";
+    print "  --help                Show this help message\n";
+}
 
+die "Error: Specify either --device or --file\n" unless $device || $file;
+
+my @targets = ();
+
+if ($device) {
+    push @targets, [$device, $user, $pass];
+} elsif ($file) {
+    open my $fh, '<', $file or die "Cannot open file $file: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^#/ || /^\s*$/;
+        my ($h, $u, $p) = split /\|/;
+        die "Invalid line format: $_\n" unless $h;
+        push @targets, [$h, $u || $user, $p || $pass];
+    }
+    close $fh;
+    die "No valid targets in $file\n" unless @targets;
+}
+
+my $logfh;
 if ($logfile) {
-    open($log, '>>', $logfile) or die "Cannot open logfile: $!\n";
-    print $log "\n=== Compliance Check " . scalar(localtime()) . " ===\n";
+    open $logfh, '>>', $logfile or warn "Cannot open logfile $logfile: $!\n";
 }
 
-foreach my $host (@devices) {
-    verify_device($host, $log);
+sub log_output {
+    my ($msg) = @_;
+    print "$msg\n";
+    print $logfh "$msg\n" if $logfh;
 }
 
-close $log if $log;
-print "\nCompliance check completed.\n";
-exit 0;
+my $timestamp = scalar(localtime);
+log_output("================== Device Health Monitor ==================");
+log_output("[$timestamp] Started - Threshold: ${threshold}%");
+log_output("Targets: " . scalar(@targets));
+log_output("============================================================");
 
-sub verify_device {
-    my ($host, $logfh) = @_;
-    my $ssh;
+my ($checked, $alerts, $failed) = (0, 0, 0);
+
+foreach my $target (@targets) {
+    my ($host, $user, $pass) = @$target;
+    my $start = time();
     
-    eval {
-        $ssh = Net::SSH::Expect->new(
+    my $ssh = eval {
+        my $s = Net::SSH::Expect->new(
             host     => $host,
-            user     => $username,
-            password => $password,
-            timeout  => 15,
+            user     => $user,
+            password => $pass,
+            timeout  => $timeout,
+            raw_pty  => 1
         );
-        $ssh->login() or die "Login failed";
+        $s->login() or die "Authentication failed\n";
+        return $s;
     };
     
-    if ($@) {
-        output("ERROR: Cannot connect to $host", $logfh);
-        return;
+    if (!$ssh) {
+        log_output("[$host] FAIL - Connection error: $@");
+        $failed++;
+        next;
     }
     
-    output("\n=== Device: $host ===", $logfh);
-    
+    $checked++;
     eval {
-        my $version = get_command($ssh, "show version | include Version");
-        output("  Version: $version", $logfh) if $version;
+        $ssh->send("show processes cpu | include CPU");
+        $ssh->waitfor('\$|#|>', 2);
+        my $cpu_buf = $ssh->get_buffer();
+        my $cpu_util = 0;
+        if ($cpu_buf =~ /CPU utilization.*?(\d+)%/) {
+            $cpu_util = $1;
+        }
         
-        my $hostname = get_command($ssh, "show run | include hostname");
-        output("  Hostname: $hostname", $logfh) if $hostname;
+        $ssh->send("show memory | include Processor");
+        $ssh->waitfor('\$|#|>', 2);
+        my $mem_buf = $ssh->get_buffer();
+        my $mem_util = 0;
+        if ($mem_buf =~ /(\d+)\s*K\s*free.*?(\d+)\s*K\s*total/) {
+            my ($free, $total) = ($1, $2);
+            $mem_util = int(100 * ($total - $free) / $total) if $total > 0;
+        }
         
-        check_ntp($ssh, $logfh);
-        check_snmp($ssh, $logfh);
-        check_ssh($ssh, $logfh);
+        my $elapsed = sprintf("%.2f", time() - $start);
+        my $cpu_status = $cpu_util >= $threshold ? "ALERT" : "GOOD";
+        my $mem_status = $mem_util >= $threshold ? "ALERT" : "GOOD";
         
+        if ($cpu_status eq "ALERT" || $mem_status eq "ALERT") {
+            $alerts++;
+        }
+        
+        log_output("[$host] CPU:$cpu_util% [$cpu_status] | MEM:$mem_util% [$mem_status] (${elapsed}s)");
+        
+        $ssh->send("exit");
         $ssh->close();
     };
     
     if ($@) {
-        output("ERROR: Command execution failed on $host: $@", $logfh);
+        log_output("[$host] WARN - Command execution error: $@");
     }
 }
 
-sub check_ntp {
-    my ($ssh, $logfh) = @_;
-    my $status = get_command($ssh, "show ntp status | include Clock");
-    
-    if ($status && $status =~ /synchronized/) {
-        output("  NTP: PASS (synchronized)", $logfh);
-    } else {
-        output("  NTP: FAIL (not synchronized or unconfigured)", $logfh);
-    }
-}
+log_output("============================================================");
+log_output("[" . scalar(localtime) . "] Completed - Checked:$checked Failed:$failed Alerts:$alerts");
+log_output("============================================================");
 
-sub check_snmp {
-    my ($ssh, $logfh) = @_;
-    my $config = get_command($ssh, "show run | include snmp-server");
-    
-    if ($config && length($config) > 1) {
-        output("  SNMP: PASS (configured)", $logfh);
-    } else {
-        output("  SNMP: FAIL (not configured)", $logfh);
-    }
-}
-
-sub check_ssh {
-    my ($ssh, $logfh) = @_;
-    my $config = get_command($ssh, "show run | include ip ssh");
-    
-    if ($config && length($config) > 1) {
-        output("  SSH: PASS (configured)", $logfh);
-    } else {
-        output("  SSH: FAIL (not configured or disabled)", $logfh);
-    }
-}
-
-sub get_command {
-    my ($ssh, $cmd) = @_;
-    $ssh->exec($cmd);
-    my $output = $ssh->read_all();
-    my @lines = split /\n/, $output;
-    return $lines[0] if @lines;
-    return "";
-}
-
-sub output {
-    my ($message, $logfh) = @_;
-    print "$message\n";
-    print $logfh "$message\n" if $logfh;
-}
-
-sub read_device_list {
-    my ($filename) = @_;
-    open my $fh, '<', $filename or die "Cannot open device file: $!\n";
-    my @devices = grep { chomp; $_ && !/^#/ } <$fh>;
-    close $fh;
-    return @devices;
-}
+close $logfh if $logfh;
+exit($failed > 0 ? 1 : 0);
 ```
