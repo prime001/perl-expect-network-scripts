@@ -1,145 +1,184 @@
-```perl
 #!/usr/bin/perl
-#
-# device_connectivity_validator.pl - Validate SSH connectivity and basic device health
-#
-# DESCRIPTION:
-#   This script verifies SSH connectivity to network devices and validates basic
-#   operational health. It retrieves device hostname, OS version, uptime, and model
-#   information to confirm devices are reachable and responsive. Useful for
-#   pre-maintenance validation and network readiness checks.
-#
-# USAGE:
-#   perl device_connectivity_validator.pl --device 10.1.1.1 --user admin --pass secret
-#   perl device_connectivity_validator.pl --file devices.txt --user admin --pass secret --log results.log
-#
-# ARGUMENTS:
-#   --device <ip/hostname>   Single device to check
-#   --file <filename>        File with one device per line
-#   --user <username>        SSH username (default: admin)
-#   --pass <password>        SSH password (required)
-#   --log <filename>         Optional output log file
-#   --timeout <seconds>      SSH timeout (default: 10)
-#
-# PREREQUISITES:
-#   - Net::SSH::Expect Perl module
-#   - SSH access enabled on devices
-#   - IOS/IOS-XE or similar CLI interface
-#
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use Time::HiRes qw(time);
+use POSIX qw(strftime);
 
-my ($device, $file, $user, $pass, $logfile, $timeout);
+# =============================================================================
+# bgp_peers_v3.pl — BGP Prefix Count Monitor with Threshold Alerting
+#
+# PURPOSE:
+#   Connects to Cisco IOS/IOS-XE routers via SSH and collects per-peer BGP
+#   prefix counts (received, accepted, advertised). Compares accepted prefix
+#   counts against configurable warn/crit thresholds to detect route leaks,
+#   peer misconfigurations, or abnormal withdrawal events.
+#
+# USAGE:
+#   bgp_peers_v3.pl --host <ip>   [--user <u>] [--pass <p>] [--log <file>]
+#   bgp_peers_v3.pl --file <list> [--user <u>] [--pass <p>] [--log <file>]
+#
+# OPTIONS:
+#   --host     Single device IP or hostname
+#   --file     File containing one device IP/hostname per line
+#   --user     SSH username (default: admin)
+#   --pass     SSH password (prompted if omitted)
+#   --log      Append results to this log file
+#   --warn     Accepted-prefix count warn threshold (default: 1000)
+#   --crit     Accepted-prefix count crit threshold (default: 5000)
+#   --timeout  SSH command timeout in seconds (default: 30)
+#
+# PREREQUISITES:
+#   cpan Net::SSH::Expect
+#   SSH key or password auth to device; 'terminal length 0' must be settable.
+#
+# OUTPUT:
+#   Tabular per-peer prefix summary with WARN/CRIT flags; exits 0 if clean.
+# =============================================================================
+
+my ($opt_host, $opt_file, $opt_log);
+my $opt_user    = 'admin';
+my $opt_pass    = '';
+my $opt_warn    = 1000;
+my $opt_crit    = 5000;
+my $opt_timeout = 30;
 
 GetOptions(
-    'device=s'  => \$device,
-    'file=s'    => \$file,
-    'user=s'    => \$user,
-    'pass=s'    => \$pass,
-    'log=s'     => \$logfile,
-    'timeout=i' => \$timeout,
-) or die "Usage error\n";
+    'host=s'    => \$opt_host,
+    'file=s'    => \$opt_file,
+    'user=s'    => \$opt_user,
+    'pass=s'    => \$opt_pass,
+    'log=s'     => \$opt_log,
+    'warn=i'    => \$opt_warn,
+    'crit=i'    => \$opt_crit,
+    'timeout=i' => \$opt_timeout,
+) or die "Usage: $0 --host <ip>|--file <list> [options]\n";
 
-$timeout //= 10;
-$user //= 'admin';
-die "ERROR: Password required (--pass)\n" unless $pass;
-die "ERROR: Specify --device or --file\n" unless ($device || $file);
+die "Specify --host or --file\n" unless $opt_host || $opt_file;
 
-my @devices = $device ? ($device) : do {
-    open my $fh, '<', $file or die "ERROR: Cannot open $file: $!\n";
-    my @list = grep { chomp; $_ && !/^#/ } <$fh>;
+unless ($opt_pass) {
+    print "SSH password: ";
+    system('stty', '-echo');
+    chomp($opt_pass = <STDIN>);
+    system('stty', 'echo');
+    print "\n";
+}
+
+my @devices;
+if ($opt_host) {
+    push @devices, $opt_host;
+} else {
+    open my $fh, '<', $opt_file or die "Cannot open $opt_file: $!\n";
+    while (<$fh>) { chomp; push @devices, $_ if /\S/ && !/^#/; }
     close $fh;
-    @list;
-};
-
-die "ERROR: No devices to validate\n" unless @devices;
+}
 
 my $log_fh;
-if ($logfile) {
-    open $log_fh, '>', $logfile or die "ERROR: Cannot open log $logfile: $!\n";
+if ($opt_log) {
+    open $log_fh, '>>', $opt_log or die "Cannot open log $opt_log: $!\n";
 }
+
+my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
+output("=== BGP Prefix Count Report — $ts ===\n");
+output(sprintf "%-18s %-18s %-10s %-10s %-10s %s\n",
+    'Device', 'Peer', 'Received', 'Accepted', 'Advertised', 'Status');
+output('-' x 80 . "\n");
+
+my $exit_code = 0;
+
+for my $device (@devices) {
+    my $ssh = eval {
+        Net::SSH::Expect->new(
+            host        => $device,
+            user        => $opt_user,
+            password    => $opt_pass,
+            raw_pty     => 1,
+            timeout     => $opt_timeout,
+        );
+    };
+    if ($@ || !$ssh) {
+        output(sprintf "%-18s  ERROR: cannot create SSH session: %s\n", $device, $@ // '');
+        $exit_code = 2;
+        next;
+    }
+
+    my $login_ok = eval { $ssh->login() };
+    if ($@ || !$login_ok) {
+        output(sprintf "%-18s  ERROR: authentication failed\n", $device);
+        $exit_code = 2;
+        next;
+    }
+
+    $ssh->exec('terminal length 0');
+
+    my $output = $ssh->exec('show ip bgp summary');
+    unless (defined $output && $output =~ /\d+\.\d+\.\d+\.\d+/) {
+        output(sprintf "%-18s  ERROR: no BGP summary output (BGP not running?)\n", $device);
+        $exit_code = 1;
+        $ssh->close();
+        next;
+    }
+
+    my @peers;
+    for my $line (split /\n/, $output) {
+        # Cisco IOS BGP summary peer lines: IP, V, AS, MsgRcvd, MsgSent, TblVer, InQ, OutQ, Up/Down, State/PfxRcd
+        next unless $line =~ /^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\S+\s+(\S+)/;
+        my ($peer, $pfx_rcd) = ($1, $2);
+        next if $pfx_rcd =~ /[A-Za-z]/;  # skip peers not in Established state
+
+        my $detail = $ssh->exec("show ip bgp neighbors $peer advertised-routes | include ^Total");
+        my $advertised = 0;
+        $advertised = $1 if defined $detail && $detail =~ /Total number of prefixes (\d+)/;
+
+        my $detail2 = $ssh->exec("show ip bgp neighbors $peer | include ^  Prefixes Current");
+        my ($accepted) = (0);
+        if (defined $detail2 && $detail2 =~ /Prefixes Current:\s+(\d+)\s+(\d+)/) {
+            $accepted = $1;
+        } else {
+            $accepted = $pfx_rcd;
+        }
+
+        push @peers, {
+            peer       => $peer,
+            received   => $pfx_rcd,
+            accepted   => $accepted,
+            advertised => $advertised,
+        };
+    }
+
+    if (!@peers) {
+        output(sprintf "%-18s  No established BGP peers found\n", $device);
+        next;
+    }
+
+    for my $p (@peers) {
+        my $status = 'OK';
+        if ($p->{accepted} >= $opt_crit) {
+            $status = 'CRIT';
+            $exit_code = 2 if $exit_code < 2;
+        } elsif ($p->{accepted} >= $opt_warn) {
+            $status = 'WARN';
+            $exit_code = 1 if $exit_code < 1;
+        }
+
+        output(sprintf "%-18s %-18s %-10s %-10s %-10s %s\n",
+            $device, $p->{peer},
+            $p->{received}, $p->{accepted}, $p->{advertised},
+            $status);
+    }
+
+    $ssh->close();
+}
+
+output('-' x 80 . "\n");
+output("Thresholds: WARN >= $opt_warn prefixes, CRIT >= $opt_crit prefixes\n");
+output("Exit code: $exit_code\n");
+
+close $log_fh if $log_fh;
+exit $exit_code;
 
 sub output {
     my ($msg) = @_;
-    print "$msg\n";
-    print $log_fh "$msg\n" if $log_fh;
+    print $msg;
+    print $log_fh $msg if $log_fh;
 }
-
-sub log_msg {
-    my ($msg) = @_;
-    print STDERR "$msg\n";
-}
-
-output("=" x 80);
-output("DEVICE CONNECTIVITY VALIDATION REPORT");
-output("Start Time: " . scalar localtime());
-output("=" x 80);
-output(sprintf("%-20s %-15s %-30s %s", "DEVICE", "STATUS", "HOSTNAME", "VERSION"));
-output("-" x 80);
-
-my ($success, $failed) = (0, 0);
-
-foreach my $dev (sort @devices) {
-    $dev =~ s/\s+//g;
-    next unless $dev;
-    
-    my $status = "UNREACHABLE";
-    my $hostname = "";
-    my $version = "";
-    my $start = time();
-    
-    eval {
-        my $ssh = Net::SSH::Expect->new(
-            host     => $dev,
-            user     => $user,
-            password => $pass,
-            timeout  => $timeout,
-            raw_pty  => 1,
-        );
-        
-        $ssh->login() or die "Login failed";
-        
-        $ssh->send("terminal length 0");
-        $ssh->waitfor('>', 2);
-        
-        $ssh->send("show version | include Device|IOS");
-        my $ver_out = $ssh->waitfor('>', 3);
-        if ($ver_out =~ /Version\s+([\d\.]+)/i) {
-            $version = $1;
-        }
-        
-        $ssh->send("show run | include hostname");
-        my $host_out = $ssh->waitfor('>', 3);
-        if ($host_out =~ /hostname\s+(\S+)/i) {
-            $hostname = $1;
-        }
-        
-        $ssh->send("exit");
-        $ssh->close();
-        
-        $status = "OK";
-        $success++;
-    } or do {
-        my $err = $@;
-        $status = "FAIL";
-        $failed++;
-        log_msg("DEBUG: $dev - $err") if $err;
-    };
-    
-    my $elapsed = sprintf("%.2fs", time() - $start);
-    output(sprintf("%-20s %-15s %-30s %s (%s)", 
-        $dev, $status, $hostname || "unknown", $version || "unknown", $elapsed));
-}
-
-output("-" x 80);
-output(sprintf("Results: %d OK, %d FAILED (Total: %d)", $success, $failed, scalar @devices));
-output("End Time: " . scalar localtime());
-output("=" x 80);
-
-close $log_fh if $log_fh;
-exit($failed > 0 ? 1 : 0);
-```
