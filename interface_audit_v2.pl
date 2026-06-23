@@ -1,208 +1,194 @@
 ```perl
 #!/usr/bin/perl
-#
-# Device Health Monitor - Uptime, CPU, and Memory Tracker
-#
-# Purpose:
-#   Collects system health metrics (uptime, CPU utilization, memory usage)
-#   from network devices via SSH. Useful for capacity planning, trend analysis,
-#   and device health monitoring.
-#
-# Usage:
-#   ./device_health_monitor.pl 192.168.1.1
-#   ./device_health_monitor.pl --file device_list.txt --log health.log
-#   ./device_health_monitor.pl router1 router2 router3 --log metrics.log
-#
-# Device List Format:
-#   One hostname or IP address per line (blank lines and comments with # ignored)
-#
-# Prerequisites:
-#   - Net::SSH::Expect module (cpan install Net::SSH::Expect)
-#   - SSH key-based authentication pre-configured
-#   - Read permissions on device configurations
-#
-# Output Format:
-#   Timestamp, device, uptime, CPU usage, available memory, connection status
-#
-# Author: Network Operations Team
-#
+=head1 INTERFACE ERROR AUDIT SCRIPT
+Purpose: SSH into network devices and audit interface error counters
+Usage:   ./interface_error_audit.pl <device_host> [--user <user>] [--pass <pass>] [--log <file>] [--threshold <count>]
+         ./interface_error_audit.pl --file <device_list> [--user <user>] [--pass <pass>] [--log <file>]
+Prerequisites: Net::SSH::Expect module installed
+Description:
+  Connects to Cisco IOS/IOS-XE devices and collects interface error statistics:
+  - CRC errors, runts, giants, fragments, collisions
+  - Input/output errors, overruns, underruns
+  - Identifies interfaces exceeding error thresholds for investigation
+  
+  Results output to STDOUT and optionally to a log file.
+  Supports individual device or batch processing from file.
+=cut
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use File::Spec;
-use Time::HiRes qw(time);
 
-my ($device_file, $logfile, $username, $timeout) = ('', '', 'admin', 15);
-my $help = 0;
+my ($device_file, $username, $password, $logfile, $error_threshold);
+my $device = $ARGV[0] if @ARGV && $ARGV[0] !~ /^-/;
 
 GetOptions(
-    'file=s'   => \$device_file,
-    'log=s'    => \$logfile,
-    'user=s'   => \$username,
-    'timeout=i' => \$timeout,
-    'help'     => \$help,
-) or die "Error in command line arguments\n";
+    'file=s'      => \$device_file,
+    'log=s'       => \$logfile,
+    'user=s'      => \$username,
+    'pass=s'      => \$password,
+    'threshold=i' => \$error_threshold,
+) or die "Error in command line options\n";
 
-if ($help || (!@ARGV && !$device_file)) {
-    print "Usage: $0 [hostname|ip] ... [options]\n";
-    print "   or: $0 --file devices.txt [--log output.log] [--user admin] [--timeout 15]\n";
-    exit 0;
-}
+die "Usage: $0 <device> [--user user] [--pass pass] [--log file] [--threshold errors]\n"
+    if !$device && !$device_file;
 
-my @devices = @ARGV;
-push @devices, read_device_file($device_file) if $device_file;
+$username ||= 'admin';
+$password ||= 'password';
+$error_threshold ||= 100;
 
-die "No devices specified\n" unless @devices;
-
-my $log_fh;
-if ($logfile) {
-    open $log_fh, '>>', $logfile or die "Cannot open log file '$logfile': $!\n";
-    print $log_fh "\n" . ('=' x 80) . "\n";
-    print $log_fh "Health Check - " . scalar(localtime) . "\n";
-    print $log_fh ('=' x 80) . "\n";
-}
-
-foreach my $device (@devices) {
-    check_device_health($device);
-}
-
-close $log_fh if $log_fh;
-
-sub check_device_health {
-    my ($device) = @_;
-    my $start_time = time();
-    my $timestamp = scalar localtime;
+sub audit_interface_errors {
+    my ($host, $user, $pass, $log_fh, $threshold) = @_;
     
-    my $output = "\n[$timestamp] Device: $device\n";
-    $output .= "-" x 70 . "\n";
+    my $ssh = Net::SSH::Expect->new(
+        host        => $host,
+        user        => $user,
+        password    => $pass,
+        raw_pty     => 1,
+        timeout     => 25,
+    );
     
-    eval {
-        my $ssh = Net::SSH::Expect->new(
-            host => $device,
-            user => $username,
-            raw_pty => 1,
-            timeout => $timeout,
-        );
-        
-        $ssh->login() or die "SSH login failed for $device\n";
-        
-        # Try Cisco commands first
-        my $uptime_data = fetch_uptime($ssh, $device);
-        my $cpu_data = fetch_cpu_usage($ssh);
-        my $memory_data = fetch_memory($ssh);
-        
-        $output .= "Status: Connected\n";
-        $output .= $uptime_data;
-        $output .= $cpu_data;
-        $output .= $memory_data;
-        
-        $ssh->close();
-    };
-    
-    if ($@) {
-        my $error = $@;
-        $error =~ s/\n/ /g;
-        $output .= "Status: FAILED\n";
-        $output .= "Error: $error\n";
+    unless ($ssh) {
+        my $msg = "ERROR: Cannot create SSH connection to $host\n";
+        print $msg;
+        print $log_fh $msg if $log_fh;
+        return 0;
     }
     
-    my $elapsed = sprintf("%.2f", time() - $start_time);
-    $output .= "Query Time: ${elapsed}s\n";
-    
-    print $output;
-    print $log_fh $output if $log_fh;
-}
-
-sub fetch_uptime {
-    my ($ssh, $device) = @_;
-    
-    my $result = "Uptime: ";
-    
+    my $login_output;
     eval {
-        # Cisco IOS/XE
-        my $data = $ssh->exec("show version | include uptime");
-        if ($data && $data !~ /^\s*$/) {
-            $data =~ s/^.*uptime\s+is\s+//i;
-            $data =~ s/\s*$//;
-            return "Uptime: $data\n";
+        $login_output = $ssh->login();
+    };
+    if ($@) {
+        my $msg = "ERROR: SSH login failed for $host: $@\n";
+        print $msg;
+        print $log_fh $msg if $log_fh;
+        return 0;
+    }
+    
+    unless ($login_output =~ /[#>]/) {
+        my $msg = "ERROR: Did not reach prompt on $host\n";
+        print $msg;
+        print $log_fh $msg if $log_fh;
+        $ssh->close();
+        return 0;
+    }
+    
+    $ssh->send("show interfaces");
+    my $output = $ssh->read_all();
+    
+    unless ($output) {
+        my $msg = "ERROR: No output from 'show interfaces' on $host\n";
+        print $msg;
+        print $log_fh $msg if $log_fh;
+        $ssh->close();
+        return 0;
+    }
+    
+    my $header = sprintf("\n[%s] Interface Error Audit (threshold: %d)\n", $host, $threshold);
+    print $header;
+    print $log_fh $header if $log_fh;
+    
+    my %problem_interfaces;
+    my @lines = split /\n/, $output;
+    my $current_int;
+    my $total_errors = 0;
+    my $problem_count = 0;
+    
+    foreach my $line (@lines) {
+        if ($line =~ /^(\S+)\s+is\s+(up|down)/) {
+            $current_int = $1;
         }
         
-        # Juniper
-        $data = $ssh->exec("show system uptime");
-        if ($data && $data !~ /^\s*$/) {
-            my @lines = split /\n/, $data;
-            return "Uptime: " . $lines[0] . "\n";
-        }
-    };
-    
-    return "Uptime: Unable to retrieve\n";
-}
-
-sub fetch_cpu_usage {
-    my ($ssh) = @_;
-    
-    my $result = "CPU Usage: ";
-    
-    eval {
-        # Cisco IOS/XE
-        my $data = $ssh->exec("show processes cpu | include CPU");
-        if ($data && $data =~ /(\d+\%)/) {
-            return "CPU Usage: $1\n";
-        }
-        
-        # Juniper
-        $data = $ssh->exec("show system processes");
-        if ($data && $data =~ /CPU\s+(\d+)/) {
-            return "CPU Usage: $1%\n";
-        }
-    };
-    
-    return "CPU Usage: Unable to retrieve\n";
-}
-
-sub fetch_memory {
-    my ($ssh) = @_;
-    
-    my $result = "Memory: ";
-    
-    eval {
-        # Cisco IOS/XE
-        my $data = $ssh->exec("show memory | include Processor");
-        if ($data) {
-            my @parts = split /\s+/, $data;
-            if (@parts >= 5) {
-                my $used = $parts[2];
-                my $total = $parts[4];
-                my $pct = int(($used / $total) * 100);
-                return "Memory: $pct% used ($used/$total bytes)\n";
+        if ($current_int && $line =~ /(\d+)\s+input errors.*?(\d+)\s+CRC/) {
+            my $input_err = $1;
+            my $crc_err = $2;
+            my $errors = $input_err + $crc_err;
+            $total_errors += $errors;
+            
+            if ($errors > $threshold) {
+                $problem_interfaces{$current_int} = {
+                    input_errors => $input_err,
+                    crc_errors   => $crc_err,
+                    total        => $errors,
+                };
+                $problem_count++;
             }
         }
         
-        # Juniper
-        $data = $ssh->exec("show system memory");
-        if ($data && $data =~ /(\d+)%/) {
-            return "Memory: $1% used\n";
+        if ($current_int && $line =~ /(\d+)\s+runts.*?(\d+)\s+giants/) {
+            my $runts = $1;
+            my $giants = $2;
+            if (defined $problem_interfaces{$current_int}) {
+                $problem_interfaces{$current_int}->{runts} = $runts;
+                $problem_interfaces{$current_int}->{giants} = $giants;
+            }
         }
-    };
-    
-    return "Memory: Unable to retrieve\n";
-}
-
-sub read_device_file {
-    my ($file) = @_;
-    
-    open my $fh, '<', $file or die "Cannot read device file '$file': $!\n";
-    
-    my @devices;
-    while (<$fh>) {
-        chomp;
-        next if /^\s*$/ || /^\s*#/;
-        push @devices, $_;
     }
     
-    close $fh;
-    return @devices;
+    if ($problem_count > 0) {
+        my $msg = sprintf("ALERT: Found %d interfaces with errors above threshold\n", $problem_count);
+        print $msg;
+        print $log_fh $msg if $log_fh;
+        
+        foreach my $int (sort keys %problem_interfaces) {
+            my $data = $problem_interfaces{$int};
+            my $detail = sprintf("  %s: %d total errors (input: %d, CRC: %d, runts: %d, giants: %d)\n",
+                $int,
+                $data->{total},
+                $data->{input_errors} || 0,
+                $data->{crc_errors} || 0,
+                $data->{runts} || 0,
+                $data->{giants} || 0,
+            );
+            print $detail;
+            print $log_fh $detail if $log_fh;
+        }
+    } else {
+        my $msg = "OK: All interfaces within error threshold\n";
+        print $msg;
+        print $log_fh $msg if $log_fh;
+    }
+    
+    $ssh->close();
+    return 1;
 }
+
+sub main {
+    my @devices;
+    
+    if ($device_file) {
+        open my $fh, '<', $device_file or die "Cannot open device file: $!\n";
+        while (<$fh>) {
+            chomp;
+            next if /^#|^\s*$/;
+            push @devices, $_;
+        }
+        close $fh;
+    } else {
+        @devices = ($device);
+    }
+    
+    my $log_fh;
+    if ($logfile) {
+        open $log_fh, '>>', $logfile or warn "Cannot open logfile $logfile: $!\n";
+    }
+    
+    my $success_count = 0;
+    foreach my $dev (@devices) {
+        $dev =~ s/\s+//g;
+        next unless $dev;
+        $success_count += audit_interface_errors($dev, $username, $password, $log_fh, $error_threshold);
+    }
+    
+    my $total = scalar(@devices);
+    my $summary = sprintf("\n=== Summary: %d/%d devices audited successfully ===\n", $success_count, $total);
+    print $summary;
+    print $log_fh $summary if $log_fh;
+    
+    close $log_fh if $log_fh;
+}
+
+main();
 ```
