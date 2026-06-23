@@ -2,127 +2,157 @@
 #!/usr/bin/perl
 use strict;
 use warnings;
-use Expect;
+use Net::SSH::Expect;
 use Getopt::Long;
 use File::Spec;
-use POSIX qw(strftime);
 
-# Configuration Snapshot Capture Tool
-# Purpose: SSH to network devices, capture timestamped show command outputs for comparison and auditing
-# Usage: ./device_snapshot.pl --host 10.0.0.1 --user admin --pass secret --output ./snapshots
-# 
-# Useful for: configuration baselines, before/after change comparison, compliance documentation,
-# troubleshooting configuration drift
-# 
-# Prerequisites: Net::SSH::Expect module, SSH access, device credentials
+=head1 CONFIG COMPLIANCE AUDITOR
 
-my %opts = (timeout => 30, port => 22, output => './snapshots');
+Validates network device running configurations against a set of required keywords and settings.
+Useful for compliance checks, security audits, and operational standards validation.
+
+Usage: ./031_config_compliance_auditor.pl --host 192.168.1.1 --policy policy.txt [--username admin] [--password pass] [--log audit.log]
+
+Policy file format (one item per line):
+  syslog-server 10.0.0.1
+  logging buffered
+  ntp server 8.8.8.8
+  snmp-server community read-only
+  enable secret
+
+Prerequisites:
+  - Perl modules: Net::SSH::Expect
+  - SSH access to devices
+  - SSH key or username/password auth
+  - Policy file with required configuration keywords
+
+=cut
+
+my ($host, $username, $password, $policy_file, $log_file, $port, $timeout);
 
 GetOptions(
-    'host=s'      => \$opts{host},
-    'file=s'      => \$opts{file},
-    'user=s'      => \$opts{user},
-    'pass=s'      => \$opts{pass},
-    'timeout=i'   => \$opts{timeout},
-    'port=i'      => \$opts{port},
-    'output=s'    => \$opts{output},
-    'commands=s'  => \$opts{commands},
-) or die "Error in options\n";
+    'host=s'     => \$host,
+    'username=s' => \$username,
+    'password=s' => \$password,
+    'policy=s'   => \$policy_file,
+    'log=s'      => \$log_file,
+    'port=i'     => \$port,
+    'timeout=i'  => \$timeout,
+) or die "Error in command line arguments\n";
 
-unless (($opts{host} || $opts{file}) && $opts{user}) {
-    print "USAGE: $0 --host <device> --user <user> --pass <password> [--output <dir>]\n";
-    print "       $0 --file <device_list> --user <user> --pass <password> [--output <dir>]\n";
-    print "OPTIONS:\n";
-    print "  --output <dir>     Output directory (default: ./snapshots)\n";
-    print "  --commands <cmds>  Comma-separated commands (default: version,running-config,interfaces)\n";
-    print "  --timeout <sec>    SSH timeout (default: 30)\n";
+die "Host required: --host <IP or hostname>\n" unless $host;
+die "Policy file required: --policy <file>\n" unless $policy_file;
+die "Policy file not found: $policy_file\n" unless -f $policy_file;
+
+$port    ||= 22;
+$timeout ||= 10;
+$username ||= 'admin';
+$password ||= 'admin';
+
+my @log_messages;
+my $timestamp = scalar localtime;
+
+sub log_output {
+    my ($msg) = @_;
+    print "$msg\n";
+    push @log_messages, "[" . scalar(localtime) . "] $msg";
+}
+
+log_output("=== Config Compliance Audit: $host ($timestamp) ===");
+
+my $ssh;
+eval {
+    $ssh = Net::SSH::Expect->new(
+        host    => $host,
+        user    => $username,
+        password => $password,
+        port    => $port,
+        timeout => $timeout,
+    );
+    $ssh->login() or die "Login failed for $host";
+};
+if ($@) {
+    log_output("ERROR: Connection failed - $@");
+    write_log($log_file) if $log_file;
     exit 1;
 }
 
-mkdir $opts{output} unless -d $opts{output};
+log_output("Connected to $host");
 
-my @devices = $opts{host} ? ($opts{host}) : ();
-if ($opts{file}) {
-    open my $fh, '<', $opts{file} or die "Cannot open $opts{file}: $!\n";
-    while (<$fh>) { chomp; push @devices, $_ if $_ && !/^#/; }
-    close $fh;
+my $config = '';
+eval {
+    $ssh->send('terminal length 0');
+    $ssh->waitfor('>', 2);
+    $ssh->send('show running-config');
+    $config = $ssh->waitfor('>', $timeout);
+};
+if ($@) {
+    log_output("ERROR: Failed to retrieve config - $@");
+    $ssh->close();
+    write_log($log_file) if $log_file;
+    exit 1;
 }
 
-my @commands = $opts{commands}
-    ? split(/,/, $opts{commands})
-    : qw(show version show running-config show interfaces brief);
+$ssh->close();
+log_output("Retrieved running configuration");
 
-sub snapshot_device {
-    my ($device) = @_;
-    
-    my $ts = strftime("%Y%m%d_%H%M%S", localtime);
-    my $file = File::Spec->catfile($opts{output}, "${device}_${ts}.txt");
-    
-    print "[" . scalar(localtime) . "] Capturing: $device... ";
-    
-    open my $fh, '>', $file or die "Cannot write $file: $!\n";
-    
-    my $exp = Expect->new();
-    $exp->log_stdout(0);
-    
-    eval {
-        $exp->spawn("ssh", "-p", $opts{port}, "-o", "StrictHostKeyChecking=no",
-                    "-o", "ConnectTimeout=$opts{timeout}",
-                    "$opts{user}\@$device")
-            or die "SSH failed: $!";
-        
-        $exp->expect($opts{timeout},
-            [ 'assword:', sub { $_[0]->send("$opts{pass}\n"); exp_continue; } ],
-            [ 'yes/no',  sub { $_[0]->send("yes\n"); exp_continue; } ],
-            [ qr/[>#]/, sub { 1; } ],
-        ) or die "Auth timeout/failed";
-        
-        print $fh "Snapshot: $device\n";
-        print $fh "Time: " . scalar(localtime) . "\n";
-        print $fh "=" x 70 . "\n\n";
-        
-        foreach my $cmd (@commands) {
-            $exp->send("$cmd\n");
-            $exp->expect($opts{timeout}, [ qr/[>#]/ ]);
-            
-            print $fh ">>> $cmd\n";
-            print $fh "-" x 70 . "\n";
-            print $fh $exp->before() . "\n\n";
+my @required_items;
+open my $fh, '<', $policy_file or die "Cannot read policy file: $!\n";
+while (<$fh>) {
+    chomp;
+    next if /^\s*#/ or /^\s*$/;
+    push @required_items, $_;
+}
+close $fh;
+
+log_output("\nChecking " . scalar(@required_items) . " policy items...\n");
+
+my ($compliant, $non_compliant) = (0, 0);
+my @missing;
+
+foreach my $item (@required_items) {
+    my $found = 0;
+    foreach my $line (split /\n/, $config) {
+        if (index($line, $item) >= 0) {
+            $found = 1;
+            last;
         }
-        
-        $exp->send("exit\n");
-        $exp->soft_close();
-        close $fh;
-        
-        print "OK\n";
-        return 1;
-    };
-    
-    if ($@) {
-        print "FAILED ($@)\n";
-        print $fh "ERROR: $@\n";
-        close $fh;
-        return 0;
     }
     
-    return 0;
+    if ($found) {
+        log_output("  [OK] $item");
+        $compliant++;
+    } else {
+        log_output("  [MISSING] $item");
+        $non_compliant++;
+        push @missing, $item;
+    }
 }
 
-print "=" x 70 . "\n";
-print "Device Configuration Snapshot Tool\n";
-print "Output: $opts{output}\n";
-print "Devices: " . scalar(@devices) . "\n";
-print "Commands: " . join(", ", @commands) . "\n";
-print "=" x 70 . "\n\n";
+log_output("\n=== Summary ===");
+log_output("Device: $host");
+log_output("Compliant: $compliant");
+log_output("Non-Compliant: $non_compliant");
 
-my ($ok, $fail) = (0, 0);
-foreach my $device (@devices) {
-    snapshot_device($device) ? $ok++ : $fail++;
+if (@missing) {
+    log_output("\nRequired items not found:");
+    foreach (@missing) {
+        log_output("  - $_");
+    }
 }
 
-print "\n" . "=" x 70 . "\n";
-print "Results: $ok succeeded, $fail failed\n";
-print "=" x 70 . "\n";
+log_output("\nCompliance Status: " . 
+    ($non_compliant == 0 ? "PASS" : "FAIL"));
 
-exit ($fail > 0 ? 1 : 0);
+write_log($log_file) if $log_file;
+exit($non_compliant > 0 ? 1 : 0);
+
+sub write_log {
+    my ($file) = @_;
+    return unless $file;
+    open my $fh, '>', $file or warn "Cannot write log: $!\n";
+    print $fh join("\n", @log_messages) if $fh;
+    close $fh;
+    log_output("\nLog written to: $file");
+}
 ```
