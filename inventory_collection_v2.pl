@@ -1,173 +1,164 @@
+```perl
 #!/usr/bin/perl
-#
-# hardware_health.pl - Network Device Hardware Health Check
-#
-# PURPOSE:
-#   Polls Cisco IOS/IOS-XE devices for hardware environmental status:
-#   CPU utilization, memory usage, power supply and fan status, and
-#   temperature sensor readings. Flags any readings outside acceptable
-#   thresholds with a WARN or CRIT label.
+# Device Health Check Script - Collects CPU, Memory, Temperature, Uptime
+# Useful for quick fleet health assessment across network devices
 #
 # USAGE:
-#   Single device:   ./hardware_health.pl -h 192.168.1.1 -u admin -p secret
-#   Device file:     ./hardware_health.pl -f devices.txt -u admin -p secret
-#   With log:        ./hardware_health.pl -h 10.0.0.1 -u admin -p secret -l /var/log/hw_health.log
+#   device_health_check.pl -i 192.168.1.1 -u admin -p password [-l output.log]
+#   device_health_check.pl -f devices.txt -u admin -p password [-l output.log]
+#
+# REQUIREMENTS:
+#   - Net::SSH::Expect Perl module
+#   - SSH access to IOS/IOS-XE network devices
+#   - Valid SSH credentials
 #
 # PREREQUISITES:
-#   cpan Expect Getopt::Long
+#   Device file format (one device per line, # for comments):
+#   192.168.1.1
+#   core-router-02
+#   # 192.168.1.3   (commented out)
+#   switch-lab-04
 #
-# DEVICE FILE FORMAT (devices.txt):
-#   One IP or hostname per line; lines starting with # are ignored.
-#
-# EXIT CODES:
-#   0 = all devices OK
-#   1 = one or more warnings or criticals detected
-#   2 = one or more connection failures
+# FEATURES:
+#   - Handles connection timeouts and authentication failures
+#   - Outputs results to STDOUT and optional log file
+#   - Supports batch processing from file
+#   - Comprehensive error handling with graceful failure
 #
 
 use strict;
 use warnings;
-use Expect;
+use Net::SSH::Expect;
 use Getopt::Long;
-use POSIX qw(strftime);
+use Time::Piece;
 
-my ($host, $file, $user, $pass, $logfile, $timeout);
-$timeout = 30;
+my ($device_ip, $device_file, $username, $password, $logfile, $timeout, $help);
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'f|file=s'     => \$file,
-    'u|user=s'     => \$user,
-    'p|pass=s'     => \$pass,
-    'l|log=s'      => \$logfile,
-    't|timeout=i'  => \$timeout,
-) or die "Usage: $0 -h HOST|-f FILE -u USER -p PASS [-l LOGFILE] [-t TIMEOUT]\n";
+    'ip|i=s'      => \$device_ip,
+    'file|f=s'    => \$device_file,
+    'user|u=s'    => \$username,
+    'pass|p=s'    => \$password,
+    'log|l=s'     => \$logfile,
+    'timeout|t=i' => \$timeout,
+    'help|h'      => \$help,
+) or die "Error in command line arguments\n";
 
-die "Provide -h HOST or -f FILE\n"      unless $host || $file;
-die "Username (-u) required\n"          unless $user;
-die "Password (-p) required\n"          unless $pass;
+if ($help || (!$device_ip && !$device_file) || !$username || !$password) {
+    print "Usage: $0 -i <device_ip> -u <user> -p <pass> [-l logfile] [-t timeout]\n";
+    print "       $0 -f <device_file> -u <user> -p <pass> [-l logfile] [-t timeout]\n";
+    exit 1;
+}
+
+$timeout //= 10;
 
 my @devices;
-if ($file) {
-    open my $fh, '<', $file or die "Cannot open $file: $!\n";
-    while (<$fh>) { chomp; next if /^\s*#/ || /^\s*$/; push @devices, $_; }
+if ($device_ip) {
+    push @devices, $device_ip;
+} elsif ($device_file) {
+    die "Device file not found: $device_file\n" unless -f $device_file;
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        push @devices, $_;
+    }
     close $fh;
-} else {
-    @devices = ($host);
 }
 
-my $log_fh;
+my $logfh;
 if ($logfile) {
-    open $log_fh, '>>', $logfile or die "Cannot open log $logfile: $!\n";
+    open $logfh, '>>', $logfile or die "Cannot open logfile: $!\n";
 }
 
-my $ts        = strftime('%Y-%m-%d %H:%M:%S', localtime);
-my $exit_code = 0;
-
-sub out {
+sub log_output {
     my ($msg) = @_;
     print $msg;
-    print $log_fh $msg if $log_fh;
+    print $logfh $msg if $logfh;
 }
 
-sub check_device {
-    my ($device) = @_;
-
-    out("\n=== $device  [$ts] ===\n");
-
-    my $exp = Expect->new;
-    $exp->raw_pty(1);
-    $exp->log_stdout(0);
-
-    unless ($exp->spawn("ssh -o StrictHostKeyChecking=no -o ConnectTimeout=$timeout $user\@$device")) {
-        out("  [ERROR] Failed to spawn SSH for $device\n");
-        return 2;
+sub check_device_health {
+    my ($host) = @_;
+    
+    log_output "[*] Connecting to $host...\n";
+    
+    my $ssh;
+    eval {
+        $ssh = Net::SSH::Expect->new(
+            host     => $host,
+            user     => $username,
+            password => $password,
+            timeout  => $timeout,
+            raw_pty  => 1,
+        );
+        
+        my $login_result = $ssh->login();
+        die "SSH login failed or timed out\n" 
+            unless $login_result && $login_result !~ /Permission denied|Authentication failed|Timeout/i;
+    };
+    
+    if ($@) {
+        log_output "[!] Connection error on $host: $@";
+        return 0;
     }
-
-    my $result = $exp->expect($timeout,
-        [ qr/[Pp]assword:/         => sub { $exp->send("$pass\n"); exp_continue; } ],
-        [ qr/yes\/no/              => sub { $exp->send("yes\n");   exp_continue; } ],
-        [ qr/[>#]\s*$/             => sub { } ],
-        [ timeout                  => sub { out("  [ERROR] Timeout connecting to $device\n"); return 2; } ],
-        [ qr/[Pp]ermission denied/ => sub { out("  [ERROR] Auth failed for $device\n");      return 2; } ],
-    );
-
-    unless (defined $result) {
-        out("  [ERROR] Connection failed: $device\n");
-        return 2;
-    }
-
-    $exp->send("terminal length 0\n");
-    $exp->expect($timeout, qr/[>#]\s*$/);
-
-    my $device_exit = 0;
-
-    my %commands = (
-        cpu    => 'show processes cpu | include CPU utilization',
-        mem    => 'show processes memory | include Processor',
-        env    => 'show environment all',
-    );
-
-    for my $key (qw(cpu mem env)) {
-        $exp->send("$commands{$key}\n");
-        $exp->expect($timeout, qr/[>#]\s*$/);
-        my $out = $exp->before();
-
-        if ($key eq 'cpu') {
-            if ($out =~ /CPU utilization for five seconds:\s*(\d+)%.*one minute:\s*(\d+)%.*five minutes:\s*(\d+)%/) {
-                my ($s5, $m1, $m5) = ($1, $2, $3);
-                my $status = ($m5 >= 80) ? 'CRIT' : ($m5 >= 60) ? 'WARN' : 'OK';
-                $device_exit = 1 if $status ne 'OK';
-                out(sprintf("  CPU  [%s] 5s:%d%% 1m:%d%% 5m:%d%%\n", $status, $s5, $m1, $m5));
-            } else {
-                out("  CPU  [UNKNOWN] Could not parse CPU output\n");
+    
+    eval {
+        $ssh->exec("terminal length 0");
+        $ssh->read_all();
+        
+        # Collect uptime
+        my $version = $ssh->exec("show version | include uptime");
+        if ($version =~ /uptime is\s+(.+?)[\r\n]/) {
+            log_output "[+] $host - Uptime: $1\n";
+        }
+        
+        # Collect CPU utilization
+        my $cpu_out = $ssh->exec("show processes cpu sorted");
+        if ($cpu_out =~ /CPU processes:\s+([0-9.]+)%/) {
+            log_output "[+] $host - CPU: $1%\n";
+        }
+        
+        # Collect memory usage
+        my $mem_out = $ssh->exec("show memory | include Processor");
+        if ($mem_out =~ /(\d+)%/) {
+            log_output "[+] $host - Memory: $1%\n";
+        }
+        
+        # Collect temperature readings
+        my $temp_out = $ssh->exec("show environment temperature");
+        my @temp_lines = split /\n/, $temp_out;
+        my $temp_found = 0;
+        foreach my $line (@temp_lines) {
+            if ($line =~ /Temp|temp|TEMP/ && $line =~ /[0-9]/) {
+                $line =~ s/^\s+|\s+$//g;
+                log_output "[+] $host - Temp: $line\n" if length($line) > 5;
+                $temp_found = 1;
             }
         }
-
-        if ($key eq 'mem') {
-            if ($out =~ /Processor\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)/) {
-                my ($total, $used, $free) = ($1, $2, $3);
-                my $pct = ($total > 0) ? int($used / $total * 100) : 0;
-                my $status = ($pct >= 85) ? 'CRIT' : ($pct >= 70) ? 'WARN' : 'OK';
-                $device_exit = 1 if $status ne 'OK';
-                out(sprintf("  MEM  [%s] Used:%dKB Free:%dKB (%d%%)\n",
-                    $status, $used/1024, $free/1024, $pct));
-            } else {
-                out("  MEM  [UNKNOWN] Could not parse memory output\n");
-            }
-        }
-
-        if ($key eq 'env') {
-            my @lines = split /\n/, $out;
-            for my $line (@lines) {
-                if ($line =~ /FAIL|Critical|Absent|Shutdown/i && $line !~ /^\s*$/) {
-                    (my $clean = $line) =~ s/^\s+|\s+$//g;
-                    out("  ENV  [CRIT] $clean\n");
-                    $device_exit = 1;
-                } elsif ($line =~ /Warning/i) {
-                    (my $clean = $line) =~ s/^\s+|\s+$//g;
-                    out("  ENV  [WARN] $clean\n");
-                    $device_exit = 1 if $device_exit == 0;
-                } elsif ($line =~ /Temperature|Fan|Power/i && $line =~ /OK|Normal|Present/i) {
-                    (my $clean = $line) =~ s/^\s+|\s+$//g;
-                    out("  ENV  [OK]   $clean\n");
-                }
-            }
-        }
+        log_output "[+] $host - No temperature data available\n" unless $temp_found;
+        
+        $ssh->close();
+        log_output "[*] $host - Health check completed successfully\n";
+        return 1;
+    };
+    
+    if ($@) {
+        log_output "[!] Error executing commands on $host: $@";
+        eval { $ssh->close() if $ssh; };
+        return 0;
     }
-
-    $exp->send("exit\n");
-    $exp->soft_close();
-
-    out("  --- " . ($device_exit == 0 ? "ALL OK" : "ISSUES DETECTED") . " ---\n");
-    return $device_exit;
 }
 
-for my $dev (@devices) {
-    my $rc = check_device($dev);
-    $exit_code = $rc if $rc > $exit_code;
+my $timestamp = localtime->strftime('%Y-%m-%d %H:%M:%S');
+log_output "===== Device Health Check Started: $timestamp =====\n";
+
+my $success_count = 0;
+foreach my $device (@devices) {
+    $success_count += check_device_health($device);
 }
 
-out("\n[Done] Checked " . scalar(@devices) . " device(s) at $ts\n");
-close $log_fh if $log_fh;
-exit $exit_code;
+log_output "===== Health Check Completed: $success_count/" . scalar(@devices) . " devices successful =====\n";
+close $logfh if $logfh;
+
+exit($success_count == scalar(@devices) ? 0 : 1);
+```
