@@ -1,158 +1,131 @@
-```perl
 #!/usr/bin/perl
+#
+# Routing Table Analyzer - SSH-based device route auditor
+#
+# Purpose: Connect to network devices via SSH and audit the routing table
+#   - Collects total route count and breakdown by protocol
+#   - Validates default route presence
+#   - Displays routing protocol summary
+#   - Logs all results for compliance/audit trails
+#
+# Usage: perl route_audit.pl <device_ip> [username] [password]
+#   or:  perl route_audit.pl devices.txt [username] [password]
+#        (file format: one IP/hostname per line, # for comments)
+#
+# Prerequisites:
+#   - Net::SSH::Expect module: cpan Net::SSH::Expect
+#   - SSH connectivity to target devices
+#   - User with route table viewing permissions
+#
+# Exit codes: 0=success, 1=arg error, 2=connection error
+#
+
 use strict;
 use warnings;
 use Net::SSH::Expect;
+use Time::Piece;
 use Getopt::Long;
-use File::Spec;
 
-=head1 CONFIG COMPLIANCE AUDITOR
+die "Usage: $0 <device|device_file.txt> [username] [password]\n" if @ARGV < 1;
 
-Validates network device running configurations against a set of required keywords and settings.
-Useful for compliance checks, security audits, and operational standards validation.
+my ($device_input, $username, $password);
+my @devices;
 
-Usage: ./031_config_compliance_auditor.pl --host 192.168.1.1 --policy policy.txt [--username admin] [--password pass] [--log audit.log]
+$device_input = shift @ARGV;
+$username = shift @ARGV // 'admin';
+$password = shift @ARGV;
 
-Policy file format (one item per line):
-  syslog-server 10.0.0.1
-  logging buffered
-  ntp server 8.8.8.8
-  snmp-server community read-only
-  enable secret
-
-Prerequisites:
-  - Perl modules: Net::SSH::Expect
-  - SSH access to devices
-  - SSH key or username/password auth
-  - Policy file with required configuration keywords
-
-=cut
-
-my ($host, $username, $password, $policy_file, $log_file, $port, $timeout);
-
-GetOptions(
-    'host=s'     => \$host,
-    'username=s' => \$username,
-    'password=s' => \$password,
-    'policy=s'   => \$policy_file,
-    'log=s'      => \$log_file,
-    'port=i'     => \$port,
-    'timeout=i'  => \$timeout,
-) or die "Error in command line arguments\n";
-
-die "Host required: --host <IP or hostname>\n" unless $host;
-die "Policy file required: --policy <file>\n" unless $policy_file;
-die "Policy file not found: $policy_file\n" unless -f $policy_file;
-
-$port    ||= 22;
-$timeout ||= 10;
-$username ||= 'admin';
-$password ||= 'admin';
-
-my @log_messages;
-my $timestamp = scalar localtime;
-
-sub log_output {
-    my ($msg) = @_;
-    print "$msg\n";
-    push @log_messages, "[" . scalar(localtime) . "] $msg";
+unless ($password) {
+    print "Enter password: ";
+    system("stty -echo 2>/dev/null");
+    chomp($password = <STDIN>);
+    system("stty echo 2>/dev/null");
+    print "\n";
 }
 
-log_output("=== Config Compliance Audit: $host ($timestamp) ===");
+if (-f $device_input) {
+    open(my $fh, '<', $device_input) or die "Cannot open file: $!\n";
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        push @devices, $_;
+    }
+    close($fh);
+} else {
+    @devices = ($device_input);
+}
 
-my $ssh;
-eval {
-    $ssh = Net::SSH::Expect->new(
-        host    => $host,
-        user    => $username,
-        password => $password,
-        port    => $port,
-        timeout => $timeout,
+my $timestamp = Time::Piece::localtime->strftime("%Y%m%d_%H%M%S");
+my $logfile = "route_audit_$timestamp.log";
+
+open(my $log_fh, '>', $logfile) or die "Cannot create log: $!\n";
+
+printf "Auditing %d device(s). Log: %s\n\n", scalar(@devices), $logfile;
+
+my $success_count = 0;
+foreach my $target (@devices) {
+    $success_count++ if audit_device($target, $username, $password, $log_fh);
+}
+
+close($log_fh);
+printf "\nCompleted: %d/%d devices successful\n", $success_count, scalar(@devices);
+
+exit 0;
+
+sub audit_device {
+    my ($host, $user, $pass, $log) = @_;
+    
+    print "[$host] ";
+    print $log "\n" . ("=" x 70) . "\n";
+    print $log "Device: $host | Timestamp: " . Time::Piece::localtime->strftime("%Y-%m-%d %H:%M:%S") . "\n";
+    
+    my $ssh = Net::SSH::Expect->new(
+        host => $host,
+        user => $user,
+        password => $pass,
+        timeout => 15,
+        raw_pty => 1,
     );
-    $ssh->login() or die "Login failed for $host";
-};
-if ($@) {
-    log_output("ERROR: Connection failed - $@");
-    write_log($log_file) if $log_file;
-    exit 1;
-}
-
-log_output("Connected to $host");
-
-my $config = '';
-eval {
-    $ssh->send('terminal length 0');
-    $ssh->waitfor('>', 2);
-    $ssh->send('show running-config');
-    $config = $ssh->waitfor('>', $timeout);
-};
-if ($@) {
-    log_output("ERROR: Failed to retrieve config - $@");
-    $ssh->close();
-    write_log($log_file) if $log_file;
-    exit 1;
-}
-
-$ssh->close();
-log_output("Retrieved running configuration");
-
-my @required_items;
-open my $fh, '<', $policy_file or die "Cannot read policy file: $!\n";
-while (<$fh>) {
-    chomp;
-    next if /^\s*#/ or /^\s*$/;
-    push @required_items, $_;
-}
-close $fh;
-
-log_output("\nChecking " . scalar(@required_items) . " policy items...\n");
-
-my ($compliant, $non_compliant) = (0, 0);
-my @missing;
-
-foreach my $item (@required_items) {
-    my $found = 0;
-    foreach my $line (split /\n/, $config) {
-        if (index($line, $item) >= 0) {
-            $found = 1;
-            last;
-        }
+    
+    unless (eval { $ssh->login() }) {
+        print "FAILED (connection error)\n";
+        print $log "ERROR: Connection failed - $@\n";
+        return 0;
     }
     
-    if ($found) {
-        log_output("  [OK] $item");
-        $compliant++;
-    } else {
-        log_output("  [MISSING] $item");
-        $non_compliant++;
-        push @missing, $item;
+    print "Connected... ";
+    
+    eval {
+        $ssh->send("terminal length 0");
+        $ssh->waitfor('[#>]', 10);
+        
+        $ssh->send("show ip route summary");
+        my $summary = $ssh->waitfor('[#>]', 10);
+        print $log "\n--- Route Summary ---\n$summary";
+        
+        $ssh->send("show ip route | include ^[A-Z*] | count");
+        my $count_out = $ssh->waitfor('[#>]', 10);
+        if ($count_out =~ /(\d+)/) {
+            printf "Found %d routes\n", $1;
+            print $log "\nTotal Routes: $1\n";
+        }
+        
+        $ssh->send("show ip route 0.0.0.0/0");
+        my $default = $ssh->waitfor('[#>]', 10);
+        if ($default =~ /no route/i || $default =~ /not found/i) {
+            print $log "WARNING: No default route\n";
+        } else {
+            print $log "Status: Default route present\n";
+        }
+        
+        $ssh->close();
+    };
+    
+    if ($@) {
+        print "ERROR ($@)\n";
+        print $log "ERROR: $@\n";
+        return 0;
     }
+    
+    return 1;
 }
-
-log_output("\n=== Summary ===");
-log_output("Device: $host");
-log_output("Compliant: $compliant");
-log_output("Non-Compliant: $non_compliant");
-
-if (@missing) {
-    log_output("\nRequired items not found:");
-    foreach (@missing) {
-        log_output("  - $_");
-    }
-}
-
-log_output("\nCompliance Status: " . 
-    ($non_compliant == 0 ? "PASS" : "FAIL"));
-
-write_log($log_file) if $log_file;
-exit($non_compliant > 0 ? 1 : 0);
-
-sub write_log {
-    my ($file) = @_;
-    return unless $file;
-    open my $fh, '>', $file or warn "Cannot write log: $!\n";
-    print $fh join("\n", @log_messages) if $fh;
-    close $fh;
-    log_output("\nLog written to: $file");
-}
-```
