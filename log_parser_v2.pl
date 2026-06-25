@@ -1,154 +1,131 @@
-```perl
 #!/usr/bin/perl
-# =============================================================================
-# Device CPU/Memory Health Monitor
-# Purpose: Monitor CPU and memory utilization on network devices via SSH
-# Usage: device_cpu_memory_monitor.pl --device <host> [--user user] [--pass pass] [--logfile file]
-#        or: device_cpu_memory_monitor.pl --file devices.txt
-# Device file format: hostname|username|password (one per line, # for comments)
-# Prerequisites: Net::SSH::Expect perl module
-# Example: perl device_cpu_memory_monitor.pl --file devices.txt --threshold 80 --logfile health.log
-# =============================================================================
+=head1 NAME
+device_connectivity_test.pl - Batch SSH connectivity and system health checker
+
+=head1 SYNOPSIS
+device_connectivity_test.pl <device_ip> [--log <logfile>]
+device_connectivity_test.pl --file <device_list> [--log <logfile>] [--user <username>]
+
+=head1 DESCRIPTION
+Performs quick SSH connectivity tests and gathers basic system health metrics
+from network devices. Reports uptime, software version, and reachability status.
+Outputs results to STDOUT and optional log file for infrastructure monitoring.
+
+=head1 PREREQUISITES
+Net::SSH::Expect, SSH access to devices, valid credentials via environment
+variables NET_USER and NET_PASS or ~/.ssh config
+
+=head1 EXAMPLES
+device_connectivity_test.pl 10.1.1.1
+device_connectivity_test.pl --file devices.txt --log connectivity.log --user netadmin
+
+=cut
 
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long;
+use Getopt::Long qw(:config no_ignore_case);
 use Time::HiRes qw(time);
 
-my ($device, $file, $user, $pass, $logfile, $timeout, $threshold);
-
+my ($target_device, $device_file, $logfile, $username, $timeout);
 GetOptions(
-    'device=s'    => \$device,
-    'file=s'      => \$file,
-    'user=s'      => \$user,
-    'pass=s'      => \$pass,
-    'logfile=s'   => \$logfile,
-    'timeout=i'   => \$timeout,
-    'threshold=i' => \$threshold,
-    'help'        => sub { usage(); exit(0); }
-) or die "Error parsing command line options\n";
+    'device|d=s'  => \$target_device,
+    'file|f=s'    => \$device_file,
+    'log|l=s'     => \$logfile,
+    'user|u=s'    => \$username,
+    'timeout|t=i' => \$timeout,
+) or die "Error in command line arguments\n";
 
-$timeout   //= 12;
-$user      //= 'admin';
-$pass      //= 'admin';
-$threshold //= 80;
+$timeout ||= 20;
+$username ||= $ENV{NET_USER} || 'admin';
+my $password = $ENV{NET_PASS} || '';
 
-sub usage {
-    print "Usage: device_cpu_memory_monitor.pl [OPTIONS]\n\n";
-    print "Options:\n";
-    print "  --device <host>       Target device hostname/IP\n";
-    print "  --file <path>         File with device list (host|user|pass format)\n";
-    print "  --user <username>     SSH username (default: admin)\n";
-    print "  --pass <password>     SSH password (default: admin)\n";
-    print "  --logfile <path>      Log file path (optional)\n";
-    print "  --timeout <seconds>   SSH timeout in seconds (default: 12)\n";
-    print "  --threshold <percent> Alert threshold for CPU/mem (default: 80)\n";
-    print "  --help                Show this help message\n";
-}
+die "Specify --device or --file argument\n" unless ($target_device || $device_file);
 
-die "Error: Specify either --device or --file\n" unless $device || $file;
-
-my @targets = ();
-
-if ($device) {
-    push @targets, [$device, $user, $pass];
-} elsif ($file) {
-    open my $fh, '<', $file or die "Cannot open file $file: $!\n";
-    while (<$fh>) {
-        chomp;
-        next if /^#/ || /^\s*$/;
-        my ($h, $u, $p) = split /\|/;
-        die "Invalid line format: $_\n" unless $h;
-        push @targets, [$h, $u || $user, $p || $pass];
-    }
-    close $fh;
-    die "No valid targets in $file\n" unless @targets;
-}
-
-my $logfh;
+my $log_fh;
 if ($logfile) {
-    open $logfh, '>>', $logfile or warn "Cannot open logfile $logfile: $!\n";
+    open($log_fh, '>>', $logfile) or die "Cannot open log file $logfile: $!\n";
+    select($log_fh);
+    $| = 1;
+    select(STDOUT);
+    print_log("=== Connectivity Check Started at " . scalar(localtime) . " ===\n");
 }
 
-sub log_output {
+sub print_log {
     my ($msg) = @_;
-    print "$msg\n";
-    print $logfh "$msg\n" if $logfh;
+    print STDOUT $msg;
+    print $log_fh $msg if $log_fh;
 }
 
-my $timestamp = scalar(localtime);
-log_output("================== Device Health Monitor ==================");
-log_output("[$timestamp] Started - Threshold: ${threshold}%");
-log_output("Targets: " . scalar(@targets));
-log_output("============================================================");
-
-my ($checked, $alerts, $failed) = (0, 0, 0);
-
-foreach my $target (@targets) {
-    my ($host, $user, $pass) = @$target;
-    my $start = time();
+sub test_device {
+    my ($device_ip) = @_;
+    my $start_time = time();
+    my $ssh;
     
-    my $ssh = eval {
-        my $s = Net::SSH::Expect->new(
-            host     => $host,
-            user     => $user,
-            password => $pass,
-            timeout  => $timeout,
-            raw_pty  => 1
-        );
-        $s->login() or die "Authentication failed\n";
-        return $s;
-    };
-    
-    if (!$ssh) {
-        log_output("[$host] FAIL - Connection error: $@");
-        $failed++;
-        next;
-    }
-    
-    $checked++;
     eval {
-        $ssh->send("show processes cpu | include CPU");
-        $ssh->waitfor('\$|#|>', 2);
-        my $cpu_buf = $ssh->get_buffer();
-        my $cpu_util = 0;
-        if ($cpu_buf =~ /CPU utilization.*?(\d+)%/) {
-            $cpu_util = $1;
-        }
+        $ssh = Net::SSH::Expect->new(
+            host     => $device_ip,
+            user     => $username,
+            password => $password,
+            timeout  => $timeout,
+            raw_pty  => 1,
+        );
         
-        $ssh->send("show memory | include Processor");
-        $ssh->waitfor('\$|#|>', 2);
-        my $mem_buf = $ssh->get_buffer();
-        my $mem_util = 0;
-        if ($mem_buf =~ /(\d+)\s*K\s*free.*?(\d+)\s*K\s*total/) {
-            my ($free, $total) = ($1, $2);
-            $mem_util = int(100 * ($total - $free) / $total) if $total > 0;
-        }
-        
-        my $elapsed = sprintf("%.2f", time() - $start);
-        my $cpu_status = $cpu_util >= $threshold ? "ALERT" : "GOOD";
-        my $mem_status = $mem_util >= $threshold ? "ALERT" : "GOOD";
-        
-        if ($cpu_status eq "ALERT" || $mem_status eq "ALERT") {
-            $alerts++;
-        }
-        
-        log_output("[$host] CPU:$cpu_util% [$cpu_status] | MEM:$mem_util% [$mem_status] (${elapsed}s)");
-        
-        $ssh->send("exit");
-        $ssh->close();
+        $ssh->login() or die "SSH login failed";
     };
     
     if ($@) {
-        log_output("[$host] WARN - Command execution error: $@");
+        my $elapsed = sprintf("%.2f", time() - $start_time);
+        print_log("[FAIL] $device_ip - Connection error after ${elapsed}s: $@\n");
+        return 0;
     }
+    
+    my $uptime = "unknown";
+    my $version = "unknown";
+    
+    eval {
+        $ssh->send("show version");
+        $ssh->waitfor('.*[#>]', $timeout) or die "Command timeout";
+        my $output = $ssh->before();
+        
+        if ($output =~ /uptime is\s+(.+?)[\r\n]/i) {
+            $uptime = $1;
+        }
+        if ($output =~ /(?:IOS|Version|Software)\s+(?:XE\s+)?(\d+\.\d+[\.\d\w]+)/i) {
+            $version = $1;
+        }
+    };
+    
+    eval {
+        $ssh->close();
+    };
+    
+    my $elapsed = sprintf("%.2f", time() - $start_time);
+    print_log("[OK  ] $device_ip - Uptime: $uptime | Version: $version (${elapsed}s)\n");
+    return 1;
 }
 
-log_output("============================================================");
-log_output("[" . scalar(localtime) . "] Completed - Checked:$checked Failed:$failed Alerts:$alerts");
-log_output("============================================================");
+my $success_count = 0;
+my $fail_count = 0;
 
-close $logfh if $logfh;
-exit($failed > 0 ? 1 : 0);
-```
+if ($target_device) {
+    test_device($target_device) ? $success_count++ : $fail_count++;
+} elsif ($device_file) {
+    unless (-f $device_file) {
+        die "Device file not found: $device_file\n";
+    }
+    
+    open(my $fh, '<', $device_file) or die "Cannot open $device_file: $!\n";
+    while (my $line = <$fh>) {
+        chomp($line);
+        next if $line =~ /^\s*#/ || $line =~ /^\s*$/;
+        $line =~ s/^\s+|\s+$//g;
+        test_device($line) ? $success_count++ : $fail_count++;
+    }
+    close($fh);
+}
+
+print_log("\n=== Summary: $success_count passed, $fail_count failed ===\n");
+close($log_fh) if $log_fh;
+
+exit($fail_count > 0 ? 1 : 0);
