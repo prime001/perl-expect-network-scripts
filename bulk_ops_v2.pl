@@ -1,148 +1,177 @@
 #!/usr/bin/perl
-=head1 DEVICE HEALTH CHECK
+use strict;
+use warnings;
 
-PURPOSE:
-  Collects CPU, memory, temperature, and uptime metrics from network devices
-  via SSH using Net::SSH::Expect. Enables proactive health monitoring for
-  identifying devices approaching resource limits or thermal thresholds.
+=head1 NAME
+device_health_monitor.pl - Monitor network device environmental and system health
 
-USAGE:
-  perl 031_device_health_check.pl --host 192.168.1.1
-  perl 031_device_health_check.pl --file devices.txt --log health_report.log
-  perl 031_device_health_check.pl --host 192.168.1.1 --user netadmin --pass P@ssw0rd
+=head1 DESCRIPTION
+Connects to network devices via SSH and collects critical health metrics:
+- Device uptime and system information
+- Environmental sensors (temperature, power supplies, fans)
+- CPU and memory utilization
+- Overall device health status
 
-PREREQUISITES:
-  - Net::SSH::Expect module (cpan Net::SSH::Expect)
-  - SSH access enabled on target devices
-  - Administrative or operator-level credentials
-  - Device must support: show version, show processes cpu, show memory, show environment
+Outputs results to STDOUT and optional log file for trend analysis and alerting.
 
-TESTED ON:
-  - Cisco IOS/IOS-XE
-  - Arista EOS (basic support)
-  - Juniper (requires syntax adaptation)
+=head1 USAGE
+./device_health_monitor.pl <device_ip> [logfile]
+./device_health_monitor.pl -f devices.txt [logfile]
+
+=head1 PREREQUISITES
+Net::SSH::Expect module, SSH access to devices with credentials in environment vars:
+NETWORK_USER and NETWORK_PASS, or prompted interactively.
 
 =cut
 
-use strict;
-use warnings;
 use Net::SSH::Expect;
 use Getopt::Long;
-use Time::Localtime;
+use POSIX qw(strftime);
+use Fcntl qw(:flock);
 
-my ($host, $file, $log, $user, $pass, $help);
-
-GetOptions(
-    'host=s'  => \$host,
-    'file=s'  => \$file,
-    'log=s'   => \$log,
-    'user=s'  => \$user,
-    'pass=s'  => \$pass,
-    'help'    => \$help,
-) or die "Error in command line arguments\n";
-
-if ($help || (!$host && !$file)) {
-    print "Usage: $0 --host <ip> [--log <file>] [--user <user>] [--pass <pass>]\n";
-    print "       $0 --file <device_list> [--log <file>] [--user <user>] [--pass <pass>]\n";
-    exit 0;
-}
-
-$user //= 'admin';
-$pass //= 'admin';
+my ($device_file, $logfile);
+GetOptions('f|file=s' => \$device_file, 'l|log=s' => \$logfile) or die "Error in options\n";
 
 my @devices;
-if ($file) {
-    open my $fh, '<', $file or die "Cannot open $file: $!\n";
-    while (<$fh>) {
-        chomp;
-        next if /^#/ || /^\s*$/;
-        push @devices, $_;
-    }
+if ($device_file) {
+    open my $fh, '<', $device_file or die "Cannot open $device_file: $!\n";
+    @devices = grep { chomp; $_ && !/^#/ } <$fh>;
     close $fh;
+} elsif (@ARGV) {
+    $devices[0] = $ARGV[0];
+    $logfile = $ARGV[1] if $ARGV[1];
 } else {
-    push @devices, $host;
+    die "Usage: $0 <device> [logfile] OR $0 -f file.txt [logfile]\n";
 }
 
-open my $logfh, '>>', $log if $log;
+die "No devices to monitor\n" unless @devices;
 
-my $timestamp = scalar localtime;
-my $header_msg = "[" . $timestamp . "] Device Health Check Started\n";
-print $header_msg;
-print $logfh $header_msg if $logfh;
-
-print "-" x 110 . "\n";
-printf "%-20s | %-30s | %-10s | %-25s | %-10s\n", "Device", "Uptime", "CPU", "Memory", "Temp";
-print "-" x 110 . "\n";
+my $user = $ENV{NETWORK_USER} || 'admin';
+my $pass = $ENV{NETWORK_PASS} || prompt_password("SSH Password: ");
 
 foreach my $device (@devices) {
-    $device =~ s/\s+//g;
-    next unless $device;
+    chomp $device;
+    next if !$device || $device =~ /^\s*#/;
     
-    my $ssh = Net::SSH::Expect->new(
-        host     => $device,
-        user     => $user,
-        password => $pass,
-        timeout  => 30,
-        raw_pty  => 1,
+    my $health = check_device_health($device, $user, $pass);
+    print_health_report($health, $logfile);
+}
+
+sub check_device_health {
+    my ($host, $user, $pass) = @_;
+    my %health = (
+        host      => $host,
+        timestamp => strftime('%Y-%m-%d %H:%M:%S', localtime),
+        status    => 'UNKNOWN',
     );
     
-    my %health = (device => $device, uptime => "N/A", cpu => "N/A", memory => "N/A", temp => "N/A");
-    
+    my $ssh;
     eval {
-        $ssh->login();
+        $ssh = Net::SSH::Expect->new(
+            host    => $host,
+            user    => $user,
+            password => $pass,
+            timeout => 25,
+            raw_pty => 1,
+        );
+        $ssh->login() or die "Login failed\n";
         
-        $ssh->send("terminal length 0");
-        $ssh->waitfor('[#>]', 5);
+        $health{status} = 'OK';
+        $health{uptime} = extract_value($ssh->exec("show version"), 'uptime|System.*uptime', 1);
+        $health{model} = extract_value($ssh->exec("show version"), 'Model|Device ID', 1);
         
-        eval {
-            $ssh->send("show version");
-            my $out = $ssh->waitfor('[#>]', 10);
-            $health{uptime} = $1 if $out =~ /uptime is\s+(.+?)(?:\n|$)/;
-        };
+        my $env = $ssh->exec("show environment all") || $ssh->exec("show environment");
+        $health{temperature} = extract_value($env, 'temp|Ambient', 0);
+        $health{psu} = extract_value($env, 'Power.*?Status|PSU', 0);
+        $health{fan} = extract_value($env, 'Fan.*?Status', 0);
         
-        eval {
-            $ssh->send("show processes cpu sorted | include CPU");
-            my $out = $ssh->waitfor('[#>]', 10);
-            $health{cpu} = $1 . "%" if $out =~ /CPU utilization[^:]*:\s*(\d+)/;
-        };
+        my $mem = $ssh->exec("show memory") || $ssh->exec("show processes memory");
+        if ($mem =~ /(\d+)\s*%.*?[Uu]sed/) {
+            $health{memory_used} = $1 . '%';
+        }
         
-        eval {
-            $ssh->send("show memory | head -10");
-            my $out = $ssh->waitfor('[#>]', 10);
-            if ($out =~ /(\d+)\s*K\s+used.*?(\d+)\s*K\s+free/i) {
-                my $used = $1;
-                my $free = $2;
-                my $total = $used + $free;
-                my $pct = int(($used / $total) * 100);
-                $health{memory} = "${pct}% (${used}K/${total}K)";
-            }
-        };
-        
-        eval {
-            $ssh->send("show environment temperature 2>/dev/null || show environment");
-            my $out = $ssh->waitfor('[#>]', 10);
-            $health{temp} = $1 . "C" if $out =~ /(\d+)\s*degrees?/i;
-        };
+        my $cpu = $ssh->exec("show processes cpu") || $ssh->exec("show cpu");
+        if ($cpu =~ /(\d+(?:\.\d+)?)\s*%/) {
+            $health{cpu_usage} = $1 . '%';
+        }
         
         $ssh->close();
     };
     
     if ($@) {
-        $health{uptime} = "CONN_ERROR";
-        $health{cpu} = "FAILED";
+        $health{status} = 'FAILED';
+        $health{error} = $@;
     }
     
-    my $output = sprintf("%-20s | %-30s | %-10s | %-25s | %-10s\n",
-        $health{device}, $health{uptime}, $health{cpu}, $health{memory}, $health{temp});
-    
-    print $output;
-    print $logfh $output if $logfh;
+    return \%health;
 }
 
-print "-" x 110 . "\n";
-my $end_msg = "Device Health Check Completed\n";
-print $end_msg;
-print $logfh $end_msg if $logfh;
+sub extract_value {
+    my ($output, $pattern, $is_uptime) = @_;
+    return 'N/A' unless $output;
+    
+    foreach my $line (split /\n/, $output) {
+        if ($line =~ /$pattern/i) {
+            if ($is_uptime) {
+                return $line if $line =~ /\d+\s*(day|hour|min|year)/i;
+            } else {
+                if ($line =~ /:\s*(.+?)$/) {
+                    return $1;
+                } elsif ($line =~ /($pattern.*)/i) {
+                    return $1;
+                }
+            }
+        }
+    }
+    return 'N/A';
+}
 
-close $logfh if $logfh;
-exit 0;
+sub print_health_report {
+    my ($health, $logfile) = @_;
+    
+    my $report = "\n" . ('='x75) . "\n";
+    $report .= "DEVICE HEALTH REPORT\n";
+    $report .= "="x75 . "\n";
+    $report .= sprintf("Host: %-30s | Time: %s\n", $health->{host}, $health->{timestamp});
+    $report .= sprintf("Status: %-50s\n\n", $health->{status});
+    
+    if ($health->{status} eq 'OK') {
+        $report .= "System Information:\n";
+        $report .= sprintf("  Uptime........: %s\n", $health->{uptime});
+        $report .= sprintf("  Model..........: %s\n", $health->{model});
+        
+        $report .= "\nHealth Metrics:\n";
+        $report .= sprintf("  CPU Usage......: %s\n", $health->{cpu_usage} || 'N/A');
+        $report .= sprintf("  Memory Used....: %s\n", $health->{memory_used} || 'N/A');
+        $report .= sprintf("  Temperature....: %s\n", $health->{temperature});
+        $report .= sprintf("  PSU Status.....: %s\n", $health->{psu});
+        $report .= sprintf("  Fan Status.....: %s\n", $health->{fan});
+    } else {
+        $report .= "ERROR: " . ($health->{error} || 'Unknown error') . "\n";
+    }
+    
+    $report .= ('='x75) . "\n";
+    
+    print $report;
+    
+    if ($logfile) {
+        open my $fh, '>>', $logfile or warn "Cannot open log: $!\n";
+        flock($fh, LOCK_EX) if defined fileno($fh);
+        print $fh $report;
+        flock($fh, LOCK_UN) if defined fileno($fh);
+        close $fh;
+    }
+}
+
+sub prompt_password {
+    my ($prompt) = @_;
+    print $prompt;
+    system("stty -echo 2>/dev/null");
+    my $pwd = <STDIN>;
+    system("stty echo 2>/dev/null");
+    print "\n";
+    chomp $pwd;
+    return $pwd;
+}
+
+1;
