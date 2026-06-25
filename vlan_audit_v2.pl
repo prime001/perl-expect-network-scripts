@@ -1,145 +1,165 @@
-Here is the complete script content:
-
-```
+```perl
 #!/usr/bin/perl
-```
-
-Actually, the prompt says "Output ONLY the script content, no markdown fences, no explanation." — let me output it as raw text:
-
----
-
-#!/usr/bin/perl
-#
-# 027_vlan_audit.pl - STP Per-VLAN Topology Audit
-#
-# Purpose:
-#   Audits Spanning Tree Protocol state across all active VLANs on Cisco IOS/IOS-XE
-#   switches. Reports root bridge assignments, port STP states, topology change
-#   counters, and flags VLANs with active topology changes or non-standard root
-#   bridge assignments.
-#
-# Usage:
-#   ./027_vlan_audit.pl -h <host> [-u <user>] [-p <password>] [-l <logfile>]
-#   ./027_vlan_audit.pl --hostfile devices.txt [-u <user>] [-p <password>] [-l <logfile>]
-#
-# Prerequisites:
-#   cpan Net::SSH::Expect Getopt::Long
-#
-# Output:
-#   VLAN ID, root bridge MAC, root bridge priority, local port state summary,
-#   topology change count, and flag if TC active.
-
 use strict;
 use warnings;
 use Net::SSH::Expect;
-use Getopt::Long qw(:config no_ignore_case);
-use POSIX qw(strftime);
+use Getopt::Long;
+use Time::localtime;
 
-my ($host, $user, $password, $hostfile, $logfile, $help);
-$user     = $ENV{NET_USER}     // 'admin';
-$password = $ENV{NET_PASS}     // '';
+=head1 Device CPU and Memory Utilization Monitor
+
+Connects to Cisco IOS/IOS-XE devices via SSH and monitors CPU and memory utilization.
+Logs results to file and STDOUT, alerts when thresholds are exceeded.
+
+Usage:
+  ./device_health_monitor.pl --host 192.168.1.1 --user admin --password secret [--log output.log]
+
+Prerequisites:
+  - Net::SSH::Expect Perl module
+  - SSH access enabled on device
+  - Appropriate credentials
+
+=cut
+
+my ($host, $user, $password, $logfile, $cpu_threshold, $mem_threshold, $port, $timeout);
+$cpu_threshold = 80;
+$mem_threshold = 85;
+$port = 22;
+$timeout = 15;
 
 GetOptions(
-    'h|host=s'     => \$host,
-    'u|user=s'     => \$user,
-    'p|password=s' => \$password,
-    'H|hostfile=s' => \$hostfile,
-    'l|logfile=s'  => \$logfile,
-    'help'         => \$help,
-) or die "Error parsing arguments. Use --help.\n";
+    'host|h=s'        => \$host,
+    'user|u=s'        => \$user,
+    'password|p=s'    => \$password,
+    'log|l=s'         => \$logfile,
+    'cpu-threshold=i' => \$cpu_threshold,
+    'mem-threshold=i' => \$mem_threshold,
+    'port=i'          => \$port,
+    'timeout=i'       => \$timeout,
+    'help'            => sub { usage(); exit(0); }
+) or die "Error parsing command line arguments\n";
 
-if ($help || (!$host && !$hostfile)) {
-    print "Usage: $0 -h <host> | -H <hostfile> [-u user] [-p pass] [-l logfile]\n";
-    exit 0;
-}
+usage() unless $host && $user && $password;
 
-my @hosts = $host ? ($host) : do {
-    open my $fh, '<', $hostfile or die "Cannot open $hostfile: $!\n";
-    map { chomp; $_ } grep { /\S/ && !/^#/ } <$fh>;
-};
-
-my $log_fh;
+my $fh;
 if ($logfile) {
-    open $log_fh, '>>', $logfile or die "Cannot open logfile $logfile: $!\n";
+    open($fh, '>>', $logfile) or die "Cannot open log file $logfile: $!";
 }
 
-sub log_output {
+sub log_msg {
     my ($msg) = @_;
-    print $msg;
-    print $log_fh $msg if $log_fh;
+    my $ts = scalar(localtime);
+    my $output = "[$ts] $msg";
+    print "$output\n";
+    print $fh "$output\n" if $fh;
 }
 
-sub audit_device {
-    my ($target) = @_;
-    my $ts = strftime('%Y-%m-%d %H:%M:%S', localtime);
-    log_output("\n=== STP VLAN Audit: $target  [$ts] ===\n");
+sub usage {
+    print <<EOF;
+Device CPU and Memory Utilization Monitor
+Tracks CPU and memory usage on Cisco network devices
 
-    my $ssh = Net::SSH::Expect->new(
-        host        => $target,
-        user        => $user,
-        password    => $password,
-        raw_pty     => 1,
-        timeout     => 15,
-        ssh_option  => '-o StrictHostKeyChecking=no -o ConnectTimeout=10',
-    );
+Usage: $0 --host <ip> --user <user> --password <pass> [options]
 
-    eval { $ssh->login() };
+Required:
+  --host, -h          Device IP address or hostname
+  --user, -u          SSH username
+  --password, -p      SSH password
+
+Optional:
+  --log, -l <file>    Log file path
+  --cpu-threshold     CPU alert threshold (default: 80%)
+  --mem-threshold     Memory alert threshold (default: 85%)
+  --port              SSH port (default: 22)
+  --timeout           SSH timeout in seconds (default: 15)
+  --help              Show this message
+
+Example:
+  $0 --host 10.0.0.1 --user netadmin --password secret123 --log health.log
+
+EOF
+}
+
+sub connect_ssh {
+    my ($ip, $user, $pass, $p, $t) = @_;
+    my $ssh;
+    
+    eval {
+        $ssh = Net::SSH::Expect->new(
+            host     => $ip,
+            password => $pass,
+            user     => $user,
+            port     => $p,
+            timeout  => $t,
+            raw_pty  => 1,
+        );
+        $ssh->connect() or die "SSH connection refused";
+        $ssh->read_until('>', $t);
+    };
+    
     if ($@) {
-        log_output("  ERROR: Connection/auth failed for $target: $@\n");
-        return;
+        log_msg("ERROR: Cannot connect to $ip - $@");
+        return undef;
     }
-
-    $ssh->send('terminal length 0');
-    $ssh->waitfor('\$|#', 5);
-
-    $ssh->send('show spanning-tree summary');
-    my $summary = $ssh->waitfor('\$|#', 15);
-
-    my @vlans;
-    while ($summary =~ /VLAN(\d+)/g) {
-        push @vlans, $1;
-    }
-    while ($summary =~ /\b(\d{1,4})\b/g) {
-        push @vlans, $1 if $1 >= 1 && $1 <= 4094;
-    }
-    @vlans = do { my %seen; grep { !$seen{$_}++ } sort { $a <=> $b } @vlans };
-
-    if (!@vlans) {
-        log_output("  No active STP VLANs found on $target\n");
-        $ssh->close();
-        return;
-    }
-
-    log_output(sprintf("  %-8s %-20s %-10s %-10s %s\n",
-        'VLAN', 'Root Bridge MAC', 'Priority', 'TC Count', 'Flags'));
-    log_output("  " . "-" x 65 . "\n");
-
-    for my $vid (@vlans) {
-        $ssh->send("show spanning-tree vlan $vid");
-        my $out = $ssh->waitfor('\$|#', 10);
-        next unless defined $out && length $out;
-
-        my $root_mac  = ($out =~ /Root ID.*?Address\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})/si) ? $1 : 'unknown';
-        my $root_prio = ($out =~ /Root ID.*?Priority\s+(\d+)/si)                                  ? $1 : '?';
-        my $tc_count  = ($out =~ /Number of topology changes\s+(\d+)/i)                           ? $1 : '0';
-        my $tc_active = ($out =~ /topology change\s+active/i)                                     ? 1  : 0;
-
-        my @flags;
-        push @flags, 'TC-ACTIVE' if $tc_active;
-        push @flags, sprintf('TC=%s', $tc_count) if $tc_count > 100;
-        my $flag_str = @flags ? join(',', @flags) : 'ok';
-
-        log_output(sprintf("  %-8s %-20s %-10s %-10s %s\n",
-            "VLAN$vid", $root_mac, $root_prio, $tc_count, $flag_str));
-    }
-
-    $ssh->send('exit');
-    $ssh->close();
-    log_output("  Audited " . scalar(@vlans) . " VLAN(s).\n");
+    return $ssh;
 }
 
-for my $target (@hosts) {
-    audit_device($target);
+sub get_metrics {
+    my ($ssh, $host) = @_;
+    my ($cpu, $mem) = (undef, undef);
+    
+    eval {
+        $ssh->send('terminal length 0');
+        $ssh->read_until('>', $timeout);
+        
+        $ssh->send('show processes cpu | include CPU');
+        my $cpu_data = $ssh->read_until('>', $timeout);
+        
+        if ($cpu_data =~ /CPU utilization for five seconds:\s*(\d+)%/) {
+            $cpu = $1;
+        }
+        
+        $ssh->send('show memory statistics | include Processor');
+        my $mem_data = $ssh->read_until('>', $timeout);
+        
+        if ($mem_data =~ /Processor\s+\d+\s+(\d+)\s+\d+\s+(\d+)/) {
+            my ($used, $total) = ($1, $2);
+            $mem = int(($used / $total) * 100) if $total > 0;
+        }
+    };
+    
+    if ($@) {
+        log_msg("ERROR: Failed to retrieve metrics - $@");
+        return (undef, undef);
+    }
+    
+    return ($cpu, $mem);
 }
 
-close $log_fh if $log_fh;
+log_msg("Starting health check for $host");
+
+my $ssh = connect_ssh($host, $user, $password, $port, $timeout);
+exit(1) unless $ssh;
+
+my ($cpu, $mem) = get_metrics($ssh, $host);
+
+if (defined $cpu && defined $mem) {
+    log_msg("METRICS: $host CPU=$cpu% Memory=$mem%");
+    
+    my @issues;
+    push @issues, "CPU $cpu% exceeds threshold $cpu_threshold%" if $cpu >= $cpu_threshold;
+    push @issues, "Memory $mem% exceeds threshold $mem_threshold%" if $mem >= $mem_threshold;
+    
+    if (@issues) {
+        log_msg("ALERT: " . join(", ", @issues));
+    } else {
+        log_msg("STATUS: $host healthy - all metrics within thresholds");
+    }
+} else {
+    log_msg("ERROR: Unable to collect metrics from $host");
+}
+
+eval { $ssh->close(); };
+close($fh) if $fh;
+exit(0);
+```
